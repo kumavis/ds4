@@ -2855,6 +2855,91 @@ __global__ static void moe_gate_up_mid_decode_mxfp4_qwarp32_kernel(
     }
 }
 
+/* Zero-copy decode variant of moe_gate_up_mid_decode_mxfp4_qwarp32_kernel:
+ * line-for-line the same math and loop structure; only the expert base
+ * address comes from a per-slot pointer table (resident cache slots) instead
+ * of base + slot * gate_expert_bytes in the compact staging buffer.  selected
+ * holds compact slot indices (0..n_expert-1, route order). */
+__global__ static void moe_gate_up_mid_decode_mxfp4_qwarp32_ptrs_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char * const *gate_slots,
+        const char * const *up_slots,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    constexpr uint32_t rows_per_wave = 1u;
+    constexpr uint32_t waves_per_block = 8u;
+    constexpr uint32_t rows_per_block = rows_per_wave * waves_per_block;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    const uint32_t block_lane = lane >> 1u;
+    const uint32_t half = lane & 1u;
+    const uint32_t first_row = blockIdx.x * rows_per_block + wave * rows_per_wave;
+    const uint32_t pair = blockIdx.y;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    int32_t slot_i = selected[(uint64_t)tok * n_expert + slot];
+    if (slot_i < 0) slot_i = 0;
+    const char *gate_base = gate_slots[(uint32_t)slot_i];
+    const char *up_base = up_slots[(uint32_t)slot_i];
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    float gate[rows_per_wave] = {0.0f};
+    float up[rows_per_wave] = {0.0f};
+    const uint32_t mxfp4_blocks = xq_blocks * 8u;
+
+    for (uint32_t mb = block_lane; mb < mxfp4_blocks; mb += 16u) {
+        const cuda_block_q8_K *yb = xqb + (mb >> 3u);
+        #pragma unroll
+        for (uint32_t rr = 0; rr < rows_per_wave; rr++) {
+            const uint32_t row = first_row + rr;
+            if (row >= expert_mid_dim) continue;
+            const cuda_block_mxfp4 *gate_blocks =
+                (const cuda_block_mxfp4 *)(gate_base +
+                    (uint64_t)row * gate_row_bytes);
+            const cuda_block_mxfp4 *up_blocks =
+                (const cuda_block_mxfp4 *)(up_base +
+                    (uint64_t)row * gate_row_bytes);
+            const uint32_t subblock = mb & 7u;
+            gate[rr] += dev_dot_mxfp4_q8_K_half_block(
+                gate_blocks + mb, yb, subblock, half);
+            up[rr] += dev_dot_mxfp4_q8_K_half_block(
+                up_blocks + mb, yb, subblock, half);
+        }
+    }
+
+    #pragma unroll
+    for (uint32_t rr = 0; rr < rows_per_wave; rr++) {
+        const uint32_t row = first_row + rr;
+        if (row >= expert_mid_dim) continue;
+        gate[rr] = warp_sum_f32(gate[rr]);
+        up[rr] = warp_sum_f32(up[rr]);
+        if (lane == 0u) {
+            float g = gate[rr];
+            float u = up[rr];
+            if (clamp > 1.0e-6f) {
+                if (g > clamp) g = clamp;
+                if (u > clamp) u = clamp;
+                if (u < -clamp) u = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = g;
+                up_out[off] = u;
+            }
+            mid_out[off] = (g / (1.0f + expf(-g))) * u *
+                weights[(uint64_t)tok * n_expert + slot];
+        }
+    }
+}
+
 __global__ static void moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel(
         float *gate_out,
         float *up_out,
@@ -3152,6 +3237,66 @@ __global__ static void moe_down_mxfp4_sum6_qwarp32_kernel(
                 const cuda_block_mxfp4 *down_blocks =
                     (const cuda_block_mxfp4 *)(down_base +
                         (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+                        (uint64_t)row * down_row_bytes);
+                total[rr] += dev_dot_mxfp4_q8_K_half_block(
+                    down_blocks + mb, yb, mb & 7u, half);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (uint32_t rr = 0; rr < rows_per_wave; rr++) {
+        const uint32_t row = first_row + rr;
+        if (row >= out_dim) continue;
+        total[rr] = warp_sum_f32(total[rr]);
+        if (lane == 0u) token_out[row] = total[rr];
+    }
+}
+
+/* Zero-copy variant of moe_down_mxfp4_sum6_qwarp32_kernel: same math, same
+ * slot (route) order of the fused sum; the expert base comes from the
+ * per-slot pointer table instead of the compact staging buffer. */
+template <bool Batch>
+__global__ static void moe_down_mxfp4_sum6_qwarp32_ptrs_kernel(
+        float *out,
+        const char * const *down_slots,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    constexpr uint32_t rows_per_wave = 1u;
+    constexpr uint32_t waves_per_block = 8u;
+    constexpr uint32_t rows_per_block = rows_per_wave * waves_per_block;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    const uint32_t block_lane = lane >> 1u;
+    const uint32_t half = lane & 1u;
+    const uint32_t first_row = blockIdx.x * rows_per_block + wave * rows_per_wave;
+    const uint32_t tok = Batch ? blockIdx.y : 0u;
+    const int32_t *token_selected = selected + (uint64_t)tok * n_expert;
+    const cuda_block_q8_K *token_midq =
+        midq + (uint64_t)tok * n_expert * midq_blocks;
+    float *token_out = out + (uint64_t)tok * out_dim;
+    float total[rows_per_wave] = {0.0f};
+    const uint32_t mxfp4_blocks = midq_blocks * 8u;
+
+    #pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        int32_t slot_i = token_selected[slot];
+        if (slot_i < 0) slot_i = 0;
+        const char *down_base = down_slots[(uint32_t)slot_i];
+        const cuda_block_q8_K *xq = token_midq + (uint64_t)slot * midq_blocks;
+        for (uint32_t mb = block_lane; mb < mxfp4_blocks; mb += 16u) {
+            const cuda_block_q8_K *yb = xq + (mb >> 3u);
+            #pragma unroll
+            for (uint32_t rr = 0; rr < rows_per_wave; rr++) {
+                const uint32_t row = first_row + rr;
+                if (row >= out_dim) continue;
+                const cuda_block_mxfp4 *down_blocks =
+                    (const cuda_block_mxfp4 *)(down_base +
                         (uint64_t)row * down_row_bytes);
                 total[rr] += dev_dot_mxfp4_q8_K_half_block(
                     down_blocks + mb, yb, mb & 7u, half);
@@ -4281,6 +4426,53 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
         int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
         if (expert_i < 0) expert_i = 0;
         const unsigned char *dr = (const unsigned char *)down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
+        const float *mr = mid + ((uint64_t)tok * n_expert + slot) * expert_mid_dim;
+        for (uint32_t b = 0; b < nb; b++) {
+            const unsigned char *db = dr + (uint64_t)b * 84u;
+            float d, dmin;
+            q2_K_scale_broadcast_w32(db, &d, &dmin);
+            const uint64_t mbase = (uint64_t)b * 256u;
+#pragma unroll
+            for (uint32_t kk = 0; kk < 8u; kk++) {
+                const uint32_t i = lane + (kk << 5u);
+                acc += q2_K_dequant_256_scaled_w32(db, lane, kk, d, dmin) * mr[mbase + i];
+            }
+        }
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = acc;
+}
+
+/* Zero-copy single-token variant of moe_down_q2K_sum_rows_w32_kernel: same
+ * math and the same slot (route) order of the accumulation; the expert base
+ * comes from the per-slot pointer table.  Unlike the _ptrs_batch kernel it
+ * has no NULL-slot skip, so the control flow matches the compact kernel. */
+__global__ static void moe_down_q2K_sum_rows_w32_ptrs_kernel(
+        float *out,
+        const char * const *down_slots,
+        const float *mid,
+        const int32_t *selected,
+        uint32_t n_tokens,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint64_t down_row_bytes,
+        uint32_t n_expert) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= n_tokens) return;
+
+    float acc = 0.0f;
+    const uint32_t nb = expert_mid_dim >> 8u;
+#pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        int32_t slot_i = selected[(uint64_t)tok * n_expert + slot];
+        if (slot_i < 0) slot_i = 0;
+        const unsigned char *dr = (const unsigned char *)down_slots[(uint32_t)slot_i] + (uint64_t)row * down_row_bytes;
         const float *mr = mid + ((uint64_t)tok * n_expert + slot) * expert_mid_dim;
         for (uint32_t b = 0; b < nb; b++) {
             const unsigned char *db = dr + (uint64_t)b * 84u;

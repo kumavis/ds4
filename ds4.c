@@ -43489,6 +43489,34 @@ static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
     const bool ok = ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(&table, experts, priority, n) != 0;
     const bool ended = ds4_gpu_end_commands() != 0;
     return ended && ok;
+#elif defined(DS4_ROCM_BUILD)
+    /* The full layer is resident in the layer slot right now: copy the experts
+     * the prompt tail routed to into the decode cache (device to device), so
+     * decode does not start cold.  Residency only; outputs are unchanged.
+     * DS4_ROCM_V41_PREFILL_SEED=0 disables, _SEED_TOKENS sets the tail. */
+    static int enabled = -1;
+    static uint32_t seed_cap = 32u;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_ROCM_V41_PREFILL_SEED");
+        enabled = !(e && !strcmp(e, "0"));
+        const char *t = getenv("DS4_ROCM_V41_PREFILL_SEED_TOKENS");
+        if (t && atoi(t) > 0 && atoi(t) <= 1024) seed_cap = (uint32_t)atoi(t);
+    }
+    if (!g->streaming || !enabled || !count) return true;
+    const uint32_t budget = ds4_gpu_stream_expert_cache_configured_count();
+    uint32_t seed_tokens = budget / (DS4_N_LAYER * DS4_N_EXPERT_USED);
+    if (seed_tokens > seed_cap) seed_tokens = seed_cap;
+    if (!seed_tokens) return true;
+    const ds4_gpu_stream_expert_table table = graph_stream_expert_table_make(m, l, il,
+        routed_expert_row_bytes(l->ffn_gate_exps) * DS4_N_FF_EXP,
+        routed_expert_row_bytes(l->ffn_down_exps) * DS4_N_EMBD);
+    if (!ds4_gpu_stream_expert_cache_seed_from_layer_selected(&table, g->batch.selected,
+            count, seed_tokens, DS4_N_EXPERT_USED)) {
+        static bool warned = false;
+        if (!warned) fprintf(stderr, "ds4: V4.1 ROCm prefill seed skipped; decode starts colder\n");
+        warned = true;
+    }
+    return true;
 #else
     (void)g; (void)m; (void)l; (void)il; (void)count;
     return true;

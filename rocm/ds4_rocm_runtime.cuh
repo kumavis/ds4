@@ -4453,6 +4453,8 @@ static int cuda_stream_layer_expert_cache_seed_selected(
         g_stream_cache_stats.seed_calls++;
         g_stream_cache_stats.seed_unique += unique_count;
     }
+    /* The prompt tail is the best popularity prior the first decode has. */
+    if (ok) cuda_stream_pop_observe(layer, ids, (uint32_t)n_ids64, n_seed_tokens);
 
     if (ok && unique_count != 0 && !cuda_stream_selected_ensure_stream()) {
         ok = 0;

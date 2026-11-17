@@ -628,16 +628,126 @@ static int routed_moe_build_plan(
     return 1;
 }
 
-/* dspark-study: under SSD streaming, let a few MXFP4 rows (DSpark verify)
- * use the batch union/pointer-table path with the one-token decode kernels'
- * Indirect instantiations. DS4_ROCM_DSPARK_SSD_EXPERIMENT=1 only. */
+/* D1: under SSD streaming, a few MXFP4 rows (DSpark verification, at most
+ * one seed plus five drafts) take the batch union/pointer-table path
+ * (cuda_stream_batch_selected_prepare) and run the one-token decode kernels
+ * on the resident slots in place.  Before this the launcher had no MXFP4
+ * kernel that could address union slots for several rows and failed with
+ * "missing compact selected experts".  DS4_ROCM_DSPARK_SSD=0 restores that
+ * refusal (and the engine-level refusal in ds4.c). */
+#define DS4_ROCM_MXFP4_STREAM_MAX_ROWS 6u
 static int routed_moe_mxfp4_batch_stream_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        const char *env = getenv("DS4_ROCM_DSPARK_SSD_EXPERIMENT");
-        cached = env && env[0] == '1';
+        const char *env = getenv("DS4_ROCM_DSPARK_SSD");
+        cached = !(env && env[0] == '0');
     }
     return cached;
+}
+
+/* Down projection for the MXFP4 stream rows: 0 = one launch of the
+ * <Batch=true, Indirect=true> instantiation over (out_dim/8, rows); 1 = one
+ * launch per row of decode's own <false, true> instantiation on per-row views.
+ * Both read the same source; tests/test_mxfp4_stream_rows_rocm.c checks each
+ * bitwise against the one-token decode launches.
+ * DS4_ROCM_MXFP4_STREAM_DOWN_PER_ROW=0|1 overrides the default. */
+#ifndef DS4_ROCM_MXFP4_STREAM_DOWN_PER_ROW_DEFAULT
+#define DS4_ROCM_MXFP4_STREAM_DOWN_PER_ROW_DEFAULT 0
+#endif
+static int routed_moe_mxfp4_stream_down_per_row(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_MXFP4_STREAM_DOWN_PER_ROW");
+        cached = env && env[0] ? (env[0] != '0') :
+            DS4_ROCM_MXFP4_STREAM_DOWN_PER_ROW_DEFAULT;
+    }
+    return cached;
+}
+
+/* Routed MXFP4 experts for n_tokens rows whose experts are addressed through
+ * a slot pointer table (selected holds table indices).  xq must already hold
+ * the Q8_K rows of x.  Every (row, expert) pair runs the arithmetic of the
+ * one-token decode path (routed_moe_launch, n_tokens == 1, zero-copy):
+ *   gate/up  moe_gate_up_mid_decode_mxfp4_qwarp32_kernel<true>, one block row
+ *            per pair; a pair's lanes depend only on its own row and expert;
+ *   mid      q8_K_quantize_kernel per pair block;
+ *   down     moe_down_mxfp4_sum6_qwarp32_kernel over the row's six slots in
+ *            route order (decode's fold), see the down mode above.
+ * Launch only; the caller owns the stream-cache ordering (upload wait before,
+ * reuse event after). */
+static int routed_moe_mxfp4_ptrs_rows_launch(
+        float *out,
+        float *gate,
+        float *up,
+        float *mid,
+        const char *const *gate_ptrs,
+        const char *const *up_ptrs,
+        const char *const *down_ptrs,
+        const cuda_block_q8_K *xq,
+        cuda_block_q8_K *midq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_row_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        float clamp,
+        int down_per_row) {
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    const uint32_t pair_count = n_tokens * n_expert;
+    dim3 gate_grid((expert_mid_dim + 7u) / 8u, pair_count, 1);
+    moe_gate_up_mid_decode_mxfp4_qwarp32_kernel<true><<<gate_grid, 256>>>(
+            gate,
+            up,
+            mid,
+            (const char *)gate_ptrs,
+            (const char *)up_ptrs,
+            xq,
+            selected,
+            weights,
+            0,
+            gate_row_bytes,
+            xq_blocks,
+            expert_mid_dim,
+            n_expert,
+            0u,
+            clamp);
+    if (!cuda_ok(cudaGetLastError(), "routed_moe streaming rows mxfp4 gate/up launch")) return 0;
+    dim3 midq_grid(midq_blocks, pair_count, 1);
+    q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, mid, expert_mid_dim, pair_count);
+    if (!cuda_ok(cudaGetLastError(), "routed_moe streaming rows mxfp4 mid quantize launch")) return 0;
+    if (down_per_row) {
+        dim3 row_grid((out_dim + 7u) / 8u, 1, 1);
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            moe_down_mxfp4_sum6_qwarp32_kernel<false, true><<<row_grid, 256>>>(
+                    out + (uint64_t)t * out_dim,
+                    (const char *)down_ptrs,
+                    midq + (uint64_t)t * n_expert * midq_blocks,
+                    selected + (uint64_t)t * n_expert,
+                    0,
+                    down_row_bytes,
+                    midq_blocks,
+                    out_dim,
+                    n_expert);
+        }
+    } else {
+        dim3 batch_grid((out_dim + 7u) / 8u, n_tokens, 1);
+        moe_down_mxfp4_sum6_qwarp32_kernel<true, true><<<batch_grid, 256>>>(
+                out,
+                (const char *)down_ptrs,
+                midq,
+                selected,
+                0,
+                down_row_bytes,
+                midq_blocks,
+                out_dim,
+                n_expert);
+    }
+    return cuda_ok(cudaGetLastError(), "routed_moe streaming rows mxfp4 down launch");
 }
 
 static int routed_moe_full_table_is_cached(
@@ -773,7 +883,9 @@ static int routed_moe_launch(
         !batch_stream_split_selected &&
         n_tokens > 1u &&
         (iq2_gate_path || q2k_path ||
-         (mxfp4_path && n_tokens <= 8u && routed_moe_mxfp4_batch_stream_enabled())) &&
+         (mxfp4_path && g_ssd_streaming_mode &&
+          n_tokens <= DS4_ROCM_MXFP4_STREAM_MAX_ROWS &&
+          routed_moe_mxfp4_batch_stream_enabled())) &&
         n_expert <= DS4_ROCM_N_EXPERT_USED &&
         cuda_stream_batch_selected_prepare(model_map,
                                            model_size,
@@ -900,6 +1012,13 @@ static int routed_moe_launch(
         !cuda_u64_mul_checked(pair_count64, midq_blocks, &midq_count) ||
         !cuda_u64_mul_checked(xq_count, sizeof(cuda_block_q8_K), &xq_bytes) ||
         !cuda_u64_mul_checked(midq_count, sizeof(cuda_block_q8_K), &midq_bytes)) {
+        return 0;
+    }
+    if (mxfp4_path && batch_stream_selected &&
+        (down->bytes < xq_bytes || gate->bytes < midq_bytes)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "SSD streaming MXFP4 rows: Q8_K scratch too small "
+                        "(layer=%u tokens=%u)\n", layer_index, n_tokens);
+        (void)cuda_stream_batch_selected_mark_inflight();
         return 0;
     }
     if (!q2k_path && down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
@@ -1046,31 +1165,42 @@ static int routed_moe_launch(
             q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         }
+        if (!ok && (batch_stream_selected || batch_stream_split_selected)) {
+            /* Ordering: the reuse fence follows any work that may read the
+             * union slots, also when a launch failed. */
+            (void)cuda_stream_batch_selected_mark_inflight();
+            return 0;
+        }
+        if (ok && batch_stream_selected && mxfp4_path) {
+            /* D1: DSpark verify rows on streamed MXFP4 experts, read in place
+             * from the resident slots through the union pointer table. */
+            ok = routed_moe_mxfp4_ptrs_rows_launch(
+                    (float *)out->ptr,
+                    (float *)gate->ptr,
+                    (float *)up->ptr,
+                    (float *)mid->ptr,
+                    gate_slot_ptrs,
+                    up_slot_ptrs,
+                    down_slot_ptrs,
+                    xq,
+                    midq,
+                    (const int32_t *)selected_exec->ptr,
+                    (const float *)weights->ptr,
+                    gate_row_bytes,
+                    down_row_bytes,
+                    expert_in_dim,
+                    expert_mid_dim,
+                    out_dim,
+                    n_expert,
+                    n_tokens,
+                    clamp,
+                    routed_moe_mxfp4_stream_down_per_row());
+            const int inflight_ok = cuda_stream_batch_selected_mark_inflight();
+            return ok && inflight_ok;
+        }
         if (ok && (batch_stream_selected || batch_stream_split_selected)) {
             dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
-            if (mxfp4_path) {
-                /* Same kernel and per-(row, expert) arithmetic as one-token
-                 * decode; the slot table is indexed by the union index. */
-                dim3 mxgrid((expert_mid_dim + 7u) / 8u, pair_count, 1);
-                moe_gate_up_mid_decode_mxfp4_qwarp32_kernel<true><<<mxgrid, 256>>>(
-                        (float *)gate->ptr,
-                        (float *)up->ptr,
-                        (float *)mid->ptr,
-                        (const char *)gate_slot_ptrs,
-                        (const char *)up_slot_ptrs,
-                        xq,
-                        (const int32_t *)selected_exec->ptr,
-                        (const float *)weights->ptr,
-                        0,
-                        gate_row_bytes,
-                        xq_blocks,
-                        expert_mid_dim,
-                        n_expert,
-                        write_gate_up,
-                        clamp);
-                ok = cuda_ok(cudaGetLastError(),
-                             "routed_moe streaming batch mxfp4 gate/up launch");
-            } else if (batch_stream_split_selected) {
+            if (batch_stream_split_selected) {
                 if (stream_batch_resident_count != 0u) {
                     moe_gate_up_mid_qwarp32_ptrs_split_kernel<<<qgrid, 256>>>(
                             (float *)gate->ptr,
@@ -1148,21 +1278,7 @@ static int routed_moe_launch(
             }
             if (ok) {
                 dim3 dgrid((out_dim + 31u) / 32u, n_tokens, 1);
-                if (mxfp4_path) {
-                    dim3 mxgrid((out_dim + 7u) / 8u, n_tokens, 1);
-                    moe_down_mxfp4_sum6_qwarp32_kernel<true, true><<<mxgrid, 256>>>(
-                            (float *)out->ptr,
-                            (const char *)down_slot_ptrs,
-                            midq,
-                            (const int32_t *)selected_exec->ptr,
-                            0,
-                            down_row_bytes,
-                            midq_blocks,
-                            out_dim,
-                            n_expert);
-                    ok = cuda_ok(cudaGetLastError(),
-                                 "routed_moe streaming batch mxfp4 down launch");
-                } else if (iq2_iq2_path) {
+                if (iq2_iq2_path) {
                     moe_down_iq2_sum_qwarp32_ptrs_batch_kernel<<<dgrid, 256>>>(
                             (float *)out->ptr,
                             down_slot_ptrs,
@@ -1213,7 +1329,11 @@ static int routed_moe_launch(
                                  "routed_moe streaming batch down launch");
                 }
             }
-            if (ok) ok = cuda_stream_batch_selected_mark_inflight();
+            {
+                /* Record the reuse fence even after a failed launch. */
+                const int inflight_ok = cuda_stream_batch_selected_mark_inflight();
+                ok = ok && inflight_ok;
+            }
             return ok;
         }
         if (ok && use_sorted_pairs) {
@@ -3361,4 +3481,137 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens,
                              force_resident);
+}
+
+/* Test hook for tests/test_mxfp4_stream_rows_rocm.c (model-free).  Uploads
+ * n_union MXFP4 experts to separately allocated device slots, builds the
+ * slot pointer table, and runs on identical inputs:
+ *   (a) the streamed rows path: Q8_K of all rows, then
+ *       routed_moe_mxfp4_ptrs_rows_launch with the given down mode;
+ *   (b) the one-token decode launches of routed_moe_launch (n_tokens == 1,
+ *       zero-copy MXFP4), once per row on per-row views.
+ * Returns mid (n_tokens * n_expert * mid) and out (n_tokens * out_dim) of
+ * both.  Outputs are pre-filled with different patterns (NaN for (a), a
+ * large finite value for (b)) so an unwritten element always differs. */
+extern "C" int ds4_gpu_test_mxfp4_stream_rows(
+        const void *gate_host,
+        const void *up_host,
+        const void *down_host,
+        uint32_t n_union,
+        const float *x_host,
+        const int32_t *selected_host,
+        const float *weights_host,
+        uint32_t n_tokens,
+        uint32_t n_expert,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        float clamp,
+        int down_per_row,
+        float *mid_rows_host,
+        float *mid_ref_host,
+        float *out_rows_host,
+        float *out_ref_host) {
+    if (!gate_host || !up_host || !down_host || !x_host || !selected_host ||
+        !weights_host || n_union == 0u || n_union > 64u || n_tokens == 0u ||
+        n_tokens > DS4_ROCM_MXFP4_STREAM_MAX_ROWS ||
+        n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT_USED ||
+        expert_in_dim % CUDA_QK_K != 0u || expert_mid_dim % CUDA_QK_K != 0u ||
+        out_dim == 0u) return 0;
+    const uint64_t gate_row_bytes = (uint64_t)expert_in_dim / 32u * 17u;
+    const uint64_t down_row_bytes = (uint64_t)expert_mid_dim / 32u * 17u;
+    const uint64_t gate_expert_bytes = gate_row_bytes * expert_mid_dim;
+    const uint64_t down_expert_bytes = down_row_bytes * out_dim;
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    const uint32_t pairs = n_tokens * n_expert;
+    const size_t mid_bytes = (size_t)pairs * expert_mid_dim * sizeof(float);
+    const size_t out_bytes = (size_t)n_tokens * out_dim * sizeof(float);
+    int ok = 1;
+    char *slots[3][64] = {{0}};
+    const char *tables_host[3][64] = {{0}};
+    const char **tables[3] = {0};
+    float *x = NULL, *w = NULL, *scratch = NULL;
+    float *mid_a = NULL, *mid_b = NULL, *out_a = NULL, *out_b = NULL;
+    int32_t *sel = NULL;
+    cuda_block_q8_K *xq_a = NULL, *xq_b = NULL, *midq_a = NULL, *midq_b = NULL;
+    const void *src[3] = {gate_host, up_host, down_host};
+    const uint64_t eb[3] = {gate_expert_bytes, gate_expert_bytes, down_expert_bytes};
+    for (uint32_t k = 0; ok && k < 3u; k++) {
+        for (uint32_t u = 0; ok && u < n_union; u++) {
+            ok = cuda_ok(cudaMalloc((void **)&slots[k][u], (size_t)eb[k]), "test slot alloc") &&
+                 cuda_ok(cudaMemcpy(slots[k][u], (const char *)src[k] + (uint64_t)u * eb[k],
+                                    (size_t)eb[k], cudaMemcpyHostToDevice), "test slot upload");
+            tables_host[k][u] = slots[k][u];
+        }
+        ok = ok && cuda_ok(cudaMalloc((void **)&tables[k], n_union * sizeof(char *)), "test table alloc") &&
+             cuda_ok(cudaMemcpy((void *)tables[k], tables_host[k], n_union * sizeof(char *),
+                                cudaMemcpyHostToDevice), "test table upload");
+    }
+    ok = ok &&
+        cuda_ok(cudaMalloc((void **)&x, (size_t)n_tokens * expert_in_dim * sizeof(float)), "test x") &&
+        cuda_ok(cudaMalloc((void **)&w, pairs * sizeof(float)), "test w") &&
+        cuda_ok(cudaMalloc((void **)&sel, pairs * sizeof(int32_t)), "test sel") &&
+        cuda_ok(cudaMalloc((void **)&scratch, mid_bytes), "test scratch") &&
+        cuda_ok(cudaMalloc((void **)&mid_a, mid_bytes), "test mid a") &&
+        cuda_ok(cudaMalloc((void **)&mid_b, mid_bytes), "test mid b") &&
+        cuda_ok(cudaMalloc((void **)&out_a, out_bytes), "test out a") &&
+        cuda_ok(cudaMalloc((void **)&out_b, out_bytes), "test out b") &&
+        cuda_ok(cudaMalloc((void **)&xq_a, (size_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K)), "test xq a") &&
+        cuda_ok(cudaMalloc((void **)&xq_b, (size_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K)), "test xq b") &&
+        cuda_ok(cudaMalloc((void **)&midq_a, (size_t)pairs * midq_blocks * sizeof(cuda_block_q8_K)), "test midq a") &&
+        cuda_ok(cudaMalloc((void **)&midq_b, (size_t)pairs * midq_blocks * sizeof(cuda_block_q8_K)), "test midq b");
+    ok = ok &&
+        cuda_ok(cudaMemcpy(x, x_host, (size_t)n_tokens * expert_in_dim * sizeof(float), cudaMemcpyHostToDevice), "test x up") &&
+        cuda_ok(cudaMemcpy(w, weights_host, pairs * sizeof(float), cudaMemcpyHostToDevice), "test w up") &&
+        cuda_ok(cudaMemcpy(sel, selected_host, pairs * sizeof(int32_t), cudaMemcpyHostToDevice), "test sel up") &&
+        cuda_ok(cudaMemset(mid_a, 0xff, mid_bytes), "test poison") &&
+        cuda_ok(cudaMemset(out_a, 0xff, out_bytes), "test poison") &&
+        cuda_ok(cudaMemset(mid_b, 0x7e, mid_bytes), "test poison") &&
+        cuda_ok(cudaMemset(out_b, 0x7e, out_bytes), "test poison");
+    /* (a) streamed rows path, as routed_moe_launch's batch-stream branch. */
+    if (ok) {
+        q8_K_quantize_kernel<<<dim3(xq_blocks, n_tokens, 1), 256>>>(xq_a, x, expert_in_dim, n_tokens);
+        ok = cuda_ok(cudaGetLastError(), "test x quantize") &&
+             routed_moe_mxfp4_ptrs_rows_launch(out_a, scratch, scratch, mid_a,
+                                               tables[0], tables[1], tables[2],
+                                               xq_a, midq_a, sel, w,
+                                               gate_row_bytes, down_row_bytes,
+                                               expert_in_dim, expert_mid_dim, out_dim,
+                                               n_expert, n_tokens, clamp, down_per_row);
+    }
+    /* (b) one-token decode launches (routed_moe_launch, n_tokens == 1,
+     * mxfp4_path && zero_copy_selected), one row at a time. */
+    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+        cuda_block_q8_K *xq_t = xq_b + (uint64_t)t * xq_blocks;
+        cuda_block_q8_K *midq_t = midq_b + (uint64_t)t * n_expert * midq_blocks;
+        float *mid_t = mid_b + (uint64_t)t * n_expert * expert_mid_dim;
+        q8_K_quantize_kernel<<<dim3(xq_blocks, 1, 1), 256>>>(
+                xq_t, x + (uint64_t)t * expert_in_dim, expert_in_dim, 1u);
+        moe_gate_up_mid_decode_mxfp4_qwarp32_kernel<true><<<
+                dim3((expert_mid_dim + 7u) / 8u, n_expert, 1), 256>>>(
+                scratch, scratch, mid_t,
+                (const char *)tables[0], (const char *)tables[1], xq_t,
+                sel + (uint64_t)t * n_expert, w + (uint64_t)t * n_expert,
+                0, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, 0u, clamp);
+        q8_K_quantize_kernel<<<dim3(midq_blocks, n_expert, 1), 256>>>(
+                midq_t, mid_t, expert_mid_dim, n_expert);
+        moe_down_mxfp4_sum6_qwarp32_kernel<false, true><<<
+                dim3((out_dim + 7u) / 8u, 1u, 1), 256>>>(
+                out_b + (uint64_t)t * out_dim, (const char *)tables[2], midq_t,
+                sel + (uint64_t)t * n_expert, 0, down_row_bytes, midq_blocks,
+                out_dim, n_expert);
+        ok = cuda_ok(cudaGetLastError(), "test decode reference launch");
+    }
+    ok = ok && cuda_ok(cudaDeviceSynchronize(), "test sync") &&
+        cuda_ok(cudaMemcpy(mid_rows_host, mid_a, mid_bytes, cudaMemcpyDeviceToHost), "test mid a down") &&
+        cuda_ok(cudaMemcpy(mid_ref_host, mid_b, mid_bytes, cudaMemcpyDeviceToHost), "test mid b down") &&
+        cuda_ok(cudaMemcpy(out_rows_host, out_a, out_bytes, cudaMemcpyDeviceToHost), "test out a down") &&
+        cuda_ok(cudaMemcpy(out_ref_host, out_b, out_bytes, cudaMemcpyDeviceToHost), "test out b down");
+    void *frees[] = {x, w, sel, scratch, mid_a, mid_b, out_a, out_b, xq_a, xq_b, midq_a, midq_b,
+                     (void *)tables[0], (void *)tables[1], (void *)tables[2]};
+    for (size_t i = 0; i < sizeof(frees) / sizeof(frees[0]); i++) if (frees[i]) (void)cudaFree(frees[i]);
+    for (uint32_t k = 0; k < 3u; k++)
+        for (uint32_t u = 0; u < n_union; u++) if (slots[k][u]) (void)cudaFree(slots[k][u]);
+    return ok;
 }

@@ -2964,13 +2964,16 @@ static bool ds4_dspark_rocm_gfx1151_fast_path(void) {
 #endif
 }
 
-/* dspark-study: DS4_ROCM_DSPARK_SSD_EXPERIMENT=1 lets V4.1 DSpark run with
- * SSD streaming on ROCm. Unqualified; for measurement only. */
-static DS4_MAYBE_UNUSED bool ds41_dspark_ssd_experiment(void) {
+/* D1: single-host ROCm V4.1 DSpark with SSD streaming.  Verification rows
+ * take the launcher's batch union path (MXFP4 included) and the drafter is
+ * pinned resident.  On by default; DS4_ROCM_DSPARK_SSD=0 restores the old
+ * refusal of --dspark with --ssd-streaming, the full automatic cache size,
+ * and the launcher's MXFP4 multi-row error. */
+static DS4_MAYBE_UNUSED bool ds41_dspark_ssd_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        const char *env = getenv("DS4_ROCM_DSPARK_SSD_EXPERIMENT");
-        cached = env && env[0] == '1';
+        const char *env = getenv("DS4_ROCM_DSPARK_SSD");
+        cached = !(env && env[0] == '0');
     }
     return cached == 1;
 }
@@ -43291,7 +43294,7 @@ static bool ds41_draft_slots(ds41_gpu_graph *g, uint32_t pos,
 static bool ds41_draft_init(ds41_gpu_graph *g,
                             const ds4_dspark_weights *dw,
                             const ds4_model *dm) {
-    if ((g->streaming && !ds41_dspark_ssd_experiment()) ||
+    if ((g->streaming && !ds41_dspark_ssd_enabled()) ||
         !dw->n_stages || !dw->block_size ||
         dw->block_size > DS4_DSPARK_MAX_BLOCK_SIZE ||
         !dw->target_layer_count || dw->missing_tensors ||
@@ -71264,6 +71267,33 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
     }
 #endif
 
+#if defined(DS4_ROCM_BUILD) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    /* D1: the resident DSpark drafter (support model, pinned through the aux
+     * range cache) is charged against the automatic cache target, so the
+     * default command passes the start-up admission instead of failing by
+     * about the drafter's size.  Interim until the drafter borrows the idle
+     * prefill staging (plan D4).  An explicit cache size is not changed. */
+    uint64_t dspark_cache_charge = 0;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        ds41_dspark_ssd_enabled()) {
+        dspark_cache_charge = ds41_engine_support_bytes(e);
+        if (dspark_cache_charge) {
+            if (effective_cache_bytes < dspark_cache_charge + per_expert_bytes) {
+                fprintf(stderr,
+                        "ds4: SSD streaming auto cache has no room for the DSpark drafter\n");
+                return false;
+            }
+            const uint32_t before = cache_experts;
+            effective_cache_bytes -= dspark_cache_charge;
+            effective_cache_bytes -= effective_cache_bytes % per_expert_bytes;
+            cache_experts = (uint32_t)(effective_cache_bytes / per_expert_bytes);
+            fprintf(stderr,
+                    "ds4: SSD streaming auto cache charged %.2f GiB for the resident "
+                    "DSpark drafter: %u -> %u experts\n",
+                    ds4_bytes_to_gib(dspark_cache_charge), before, cache_experts);
+        }
+    }
+#endif
     e->ssd_streaming_cache_experts = cache_experts;
     e->ssd_streaming_cache_bytes = effective_cache_bytes;
     fprintf(stderr,
@@ -74023,11 +74053,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
 #ifdef DS4_ROCM_BUILD
-        /* Study switch (dspark-study): admit single-host DSpark with SSD
-         * streaming. Off by default; the resident rule is unchanged. */
+        /* Single-host DSpark, resident or (D1) with SSD streaming; the
+         * resident rule is unchanged.  DS4_ROCM_DSPARK_SSD=0 refuses
+         * streaming again. */
         const bool resident_dspark = opt->dspark && opt->mtp_path &&
             opt->mtp_path[0] &&
-            (!opt->ssd_streaming || ds41_dspark_ssd_experiment()) &&
+            (!opt->ssd_streaming || ds41_dspark_ssd_enabled()) &&
             !opt->cuda_tensor_parallel &&
             (!gpu_cfg || gpu_cfg->n_gpus <= 1);
 #endif

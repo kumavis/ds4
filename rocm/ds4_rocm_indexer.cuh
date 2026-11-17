@@ -1199,6 +1199,17 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                  cur_stride);
         return cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
     }
+    /* Prototype (perf branch): the single-lane insertion sort below is
+     * O(n_comp * top_k) and is hit on every V4.1 decode step while
+     * n_comp < 512 (top_k == n_comp).  The 1024-lane bitonic kernel orders by
+     * (score desc, index asc), which is exactly the stable insertion order,
+     * so the selected list is identical for finite scores. */
+    if (n_comp <= 1024u && getenv("DS4_ROCM_INDEXER_TOPK_LEGACY") == NULL) {
+        indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                     (const float *)scores->ptr,
+                                                     n_comp, n_tokens, top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk small bitonic launch");
+    }
     indexer_topk_kernel<<<n_tokens, 1>>>((uint32_t *)selected->ptr,
                                          (const float *)scores->ptr,
                                          n_comp, n_tokens, top_k);

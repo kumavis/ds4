@@ -2035,6 +2035,372 @@ static int cuda_stream_read_job_upload(
     return 1;
 }
 
+/*
+ * Optional replica of the model file on a second drive.
+ *
+ * DS4_ROCM_STREAM_REPLICA=/path/to/copy.gguf opens a second O_DIRECT fd on a
+ * byte-identical copy of the model (same size, same offsets) and spreads the
+ * read pool's work over both drives.  Only the read source changes, so the
+ * uploaded bytes, and therefore all results, are identical.
+ *
+ * DS4_ROCM_STREAM_REPLICA_POLICY:
+ *   split   (default) each job is cut in two halves (64 KiB-aligned) and each
+ *           half goes to the drive with fewer bytes in flight.  One expert
+ *           miss (3 jobs) then uses both drives evenly.
+ *   eft     whole jobs, each to the drive with fewer bytes in flight
+ *   matrix  whole jobs, alternating drives
+ *   chunk   DS4_ROCM_STREAM_REPLICA_CHUNK_KB pieces (default 1024, at most
+ *           16 per job), each to the drive with fewer bytes in flight
+ * DS4_ROCM_STREAM_REPLICA_WEIGHT (default 1.0) is the replica drive's speed
+ * relative to the primary for the in-flight comparison.
+ *
+ * The replica is checked when the first model fd is set: its size must equal
+ * the primary's and 8 sampled 64 KiB blocks must match, otherwise it is
+ * refused (logged, not used).  It is used only while the current model fd is
+ * that primary file (an MTP/draft file set later reads from its own fd).
+ * Without DS4_ROCM_STREAM_REPLICA none of this runs and the pool behaves
+ * exactly as before.
+ */
+enum {
+    DS4_ROCM_REPLICA_SPLIT = 1,
+    DS4_ROCM_REPLICA_EFT = 2,
+    DS4_ROCM_REPLICA_MATRIX = 3,
+    DS4_ROCM_REPLICA_CHUNK = 4,
+    DS4_ROCM_REPLICA_MAX_PIECES = 16,
+    DS4_ROCM_REPLICA_PIECE_ALIGN = 65536
+};
+
+typedef struct cuda_stream_replica_task {
+    uint32_t job;
+    uint64_t rel;
+    uint64_t bytes;
+} cuda_stream_replica_task;
+
+static int g_stream_replica_env_parsed;
+static const char *g_stream_replica_path;
+static int g_stream_replica_fd = -1;
+static int g_stream_replica_refused;
+static int g_stream_replica_primary_set;
+static dev_t g_stream_replica_primary_dev;
+static ino_t g_stream_replica_primary_ino;
+static int g_stream_replica_match;
+static int g_stream_replica_policy = DS4_ROCM_REPLICA_SPLIT;
+static uint64_t g_stream_replica_chunk = 1048576u;
+static double g_stream_replica_weight = 1.0;
+static uint64_t g_stream_replica_rr;
+/* Under g_stream_read_mutex. */
+static uint64_t g_stream_replica_inflight[2];
+static uint64_t g_stream_replica_drive_bytes[2];
+static uint64_t g_stream_replica_drive_tasks[2];
+static uint64_t g_stream_replica_drive_us[2];
+static uint64_t g_stream_replica_fallbacks;
+static cuda_stream_replica_task
+    g_stream_replica_tasks[DS4_ROCM_STREAM_READ_MAX_JOBS * DS4_ROCM_REPLICA_MAX_PIECES];
+static uint32_t g_stream_replica_task_count;
+static uint32_t g_stream_replica_left[DS4_ROCM_STREAM_READ_MAX_JOBS];
+static int g_stream_replica_failed[DS4_ROCM_STREAM_READ_MAX_JOBS];
+static int g_stream_read_active_replica;
+
+static const char *cuda_stream_replica_policy_name(void) {
+    switch (g_stream_replica_policy) {
+    case DS4_ROCM_REPLICA_EFT: return "eft";
+    case DS4_ROCM_REPLICA_MATRIX: return "matrix";
+    case DS4_ROCM_REPLICA_CHUNK: return "chunk";
+    default: return "split";
+    }
+}
+
+static void cuda_stream_replica_print(void) {
+    if (g_stream_replica_fd < 0) return;
+    const uint64_t total = g_stream_replica_drive_bytes[0] + g_stream_replica_drive_bytes[1];
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "stream replica policy=%s primary=%.2f GiB/%llu tasks/%.0f ms "
+            "replica=%.2f GiB/%llu tasks/%.0f ms replica_share=%.1f%% fallbacks=%llu\n",
+            cuda_stream_replica_policy_name(),
+            (double)g_stream_replica_drive_bytes[0] / 1073741824.0,
+            (unsigned long long)g_stream_replica_drive_tasks[0],
+            (double)g_stream_replica_drive_us[0] / 1000.0,
+            (double)g_stream_replica_drive_bytes[1] / 1073741824.0,
+            (unsigned long long)g_stream_replica_drive_tasks[1],
+            (double)g_stream_replica_drive_us[1] / 1000.0,
+            total ? 100.0 * (double)g_stream_replica_drive_bytes[1] / (double)total : 0.0,
+            (unsigned long long)g_stream_replica_fallbacks);
+}
+
+static int cuda_stream_replica_env(void) {
+    if (!g_stream_replica_env_parsed) {
+        g_stream_replica_env_parsed = 1;
+        const char *path = getenv("DS4_ROCM_STREAM_REPLICA");
+        g_stream_replica_path = (path && path[0]) ? path : NULL;
+        const char *pol = getenv("DS4_ROCM_STREAM_REPLICA_POLICY");
+        if (pol && pol[0]) {
+            if (!strcmp(pol, "split")) g_stream_replica_policy = DS4_ROCM_REPLICA_SPLIT;
+            else if (!strcmp(pol, "eft")) g_stream_replica_policy = DS4_ROCM_REPLICA_EFT;
+            else if (!strcmp(pol, "matrix")) g_stream_replica_policy = DS4_ROCM_REPLICA_MATRIX;
+            else if (!strcmp(pol, "chunk")) g_stream_replica_policy = DS4_ROCM_REPLICA_CHUNK;
+            else {
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX "unknown DS4_ROCM_STREAM_REPLICA_POLICY=%s, using split\n",
+                        pol);
+            }
+        }
+        const char *chunk = getenv("DS4_ROCM_STREAM_REPLICA_CHUNK_KB");
+        if (chunk && chunk[0]) {
+            const unsigned long kb = strtoul(chunk, NULL, 10);
+            if (kb >= 64u && kb <= 1048576u) {
+                g_stream_replica_chunk =
+                    cuda_round_up((uint64_t)kb * 1024u, DS4_ROCM_REPLICA_PIECE_ALIGN);
+            }
+        }
+        const char *w = getenv("DS4_ROCM_STREAM_REPLICA_WEIGHT");
+        if (w && w[0]) {
+            const double v = strtod(w, NULL);
+            if (v > 0.01 && v < 100.0) g_stream_replica_weight = v;
+        }
+    }
+    return g_stream_replica_path != NULL;
+}
+
+static void cuda_stream_replica_refuse(const char *why) {
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "refusing DS4_ROCM_STREAM_REPLICA=%s: %s; reading the primary only\n",
+            g_stream_replica_path ? g_stream_replica_path : "", why);
+    if (g_stream_replica_fd >= 0) (void)close(g_stream_replica_fd);
+    g_stream_replica_fd = -1;
+    g_stream_replica_refused = 1;
+    g_stream_replica_match = 0;
+}
+
+/* Called with every model fd that becomes current (ds4_gpu_set_model_fd). */
+static void cuda_stream_replica_attach(int fd) {
+    g_stream_replica_match = 0;
+    if (!cuda_stream_replica_env() || g_stream_replica_refused || fd < 0) return;
+#if defined(__linux__) && defined(O_DIRECT)
+    struct stat st;
+    if (fstat(fd, &st) != 0) return;
+    if (!g_stream_replica_primary_set) {
+        /* The first model fd is the file the replica must mirror. */
+        g_stream_replica_primary_set = 1;
+        g_stream_replica_primary_dev = st.st_dev;
+        g_stream_replica_primary_ino = st.st_ino;
+        struct stat rst;
+        const int check_fd = open(g_stream_replica_path, O_RDONLY);
+        if (check_fd < 0 || fstat(check_fd, &rst) != 0) {
+            if (check_fd >= 0) (void)close(check_fd);
+            cuda_stream_replica_refuse(strerror(errno ? errno : ENOENT));
+            return;
+        }
+        if (rst.st_size != st.st_size) {
+            char why[160];
+            snprintf(why, sizeof(why), "size %lld differs from the primary's %lld",
+                     (long long)rst.st_size, (long long)st.st_size);
+            (void)close(check_fd);
+            cuda_stream_replica_refuse(why);
+            return;
+        }
+        if (rst.st_dev == st.st_dev && rst.st_ino == st.st_ino) {
+            (void)close(check_fd);
+            cuda_stream_replica_refuse("it is the primary file itself");
+            return;
+        }
+        /* Sampled identity: catches a wrong or truncated copy, not bit rot. */
+        enum { SAMPLE = 65536, NSAMPLE = 8 };
+        char *a = (char *)malloc(SAMPLE);
+        char *b = (char *)malloc(SAMPLE);
+        int same = a && b;
+        const uint64_t size = (uint64_t)st.st_size;
+        for (uint32_t i = 0; same && i < NSAMPLE; i++) {
+            uint64_t off = size > SAMPLE ?
+                cuda_round_down((size - SAMPLE) / (NSAMPLE - 1u) * i, 4096u) : 0;
+            const uint64_t n = size - off < SAMPLE ? size - off : SAMPLE;
+            same = cuda_pread_full(fd, a, n, off) &&
+                   cuda_pread_full(check_fd, b, n, off) &&
+                   memcmp(a, b, (size_t)n) == 0;
+        }
+        free(a);
+        free(b);
+        (void)close(check_fd);
+        if (!same) {
+            cuda_stream_replica_refuse("sampled blocks differ from the primary");
+            return;
+        }
+        g_stream_replica_fd = open(g_stream_replica_path, O_RDONLY | O_DIRECT);
+        if (g_stream_replica_fd < 0) {
+            cuda_stream_replica_refuse("O_DIRECT open failed");
+            return;
+        }
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "stream replica %s policy=%s chunk=%llu KiB weight=%.2f\n",
+                g_stream_replica_path, cuda_stream_replica_policy_name(),
+                (unsigned long long)(g_stream_replica_chunk / 1024u),
+                g_stream_replica_weight);
+        atexit(cuda_stream_replica_print);
+    }
+    g_stream_replica_match = g_stream_replica_fd >= 0 &&
+        st.st_dev == g_stream_replica_primary_dev &&
+        st.st_ino == g_stream_replica_primary_ino;
+#else
+    (void)fd;
+#endif
+}
+
+/*
+ * Build the task list for a job set.  Returns 1 if this set is read through
+ * the replica path (tasks), 0 for the original one-job-per-worker path.
+ * Called with g_stream_read_mutex held, after cuda_stream_read_jobs_prepare.
+ */
+static int cuda_stream_replica_build_tasks(cuda_stream_read_job *jobs, uint32_t count) {
+    g_stream_replica_task_count = 0;
+    if (!g_stream_replica_match || g_stream_replica_fd < 0 ||
+        g_model_fd < 0 || g_model_direct_fd < 0 || g_model_direct_align <= 1 ||
+        g_model_file_size == 0 || cuda_stream_read_direct_disabled() ||
+        DS4_ROCM_REPLICA_PIECE_ALIGN % g_model_direct_align != 0 ||
+        count > DS4_ROCM_STREAM_READ_MAX_JOBS) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        const uint64_t bytes = jobs[i].bytes;
+        uint64_t piece = bytes;
+        if (g_stream_replica_policy == DS4_ROCM_REPLICA_SPLIT) {
+            piece = cuda_round_up((bytes + 1u) / 2u, DS4_ROCM_REPLICA_PIECE_ALIGN);
+        } else if (g_stream_replica_policy == DS4_ROCM_REPLICA_CHUNK) {
+            piece = g_stream_replica_chunk;
+            const uint64_t min_piece = cuda_round_up(
+                    (bytes + DS4_ROCM_REPLICA_MAX_PIECES - 1u) / DS4_ROCM_REPLICA_MAX_PIECES,
+                    DS4_ROCM_REPLICA_PIECE_ALIGN);
+            if (piece < min_piece) piece = min_piece;
+        }
+        if (piece == 0) piece = 1;
+        g_stream_replica_left[i] = 0;
+        g_stream_replica_failed[i] = 0;
+        uint64_t rel = 0;
+        do {
+            uint64_t n = bytes - rel;
+            if (n > piece) n = piece;
+            cuda_stream_replica_task *t = &g_stream_replica_tasks[g_stream_replica_task_count++];
+            t->job = i;
+            t->rel = rel;
+            t->bytes = n;
+            g_stream_replica_left[i]++;
+            rel += n;
+        } while (rel < bytes);
+    }
+    return 1;
+}
+
+/* Choose a drive for a task; g_stream_read_mutex held. */
+static int cuda_stream_replica_pick(uint64_t bytes) {
+    int d;
+    if (g_stream_replica_policy == DS4_ROCM_REPLICA_MATRIX) {
+        d = (int)(g_stream_replica_rr++ & 1u);
+    } else {
+        const double e0 = (double)(g_stream_replica_inflight[0] + bytes);
+        const double e1 = (double)(g_stream_replica_inflight[1] + bytes) /
+                          g_stream_replica_weight;
+        if (e0 < e1) d = 0;
+        else if (e1 < e0) d = 1;
+        else d = (int)(g_stream_replica_rr++ & 1u);
+    }
+    g_stream_replica_inflight[d] += bytes;
+    return d;
+}
+
+static void cuda_stream_replica_run_task(uint32_t worker_id,
+                                         const cuda_stream_replica_task task,
+                                         int drive) {
+    cuda_stream_read_job *job = &g_stream_read_active_jobs[task.job];
+    void *stage = NULL;
+    uint64_t stage_bytes = 0;
+    cudaStream_t stream = NULL;
+    if (worker_id < DS4_ROCM_STREAM_READ_WORKERS) {
+        stage = g_stream_read_stage_raw[worker_id];
+        stage_bytes = g_stream_read_stage_bytes[worker_id];
+        stream = g_stream_read_upload_streams[worker_id];
+    }
+    const int profile = g_stream_read_profile_enabled == 1;
+    const double read_t0 = cuda_wall_sec();
+    int ok = 0;
+    int errnum = 0;
+    int direct = 0;
+    int fallback = 0;
+    void *host_buf = stage;
+    if (!stage || !stream || task.bytes == 0 || !job->dst) {
+        errnum = EINVAL;
+    } else {
+        const uint64_t off = job->offset + task.rel;
+        const uint64_t aligned_off = cuda_round_down(off, g_model_direct_align);
+        const uint64_t delta = off - aligned_off;
+        const uint64_t read_size = cuda_round_up(delta + task.bytes, g_model_direct_align);
+        if (read_size <= stage_bytes &&
+            aligned_off <= g_model_file_size &&
+            read_size <= g_model_file_size - aligned_off) {
+            const int fd = drive ? g_stream_replica_fd : g_model_direct_fd;
+            if (cuda_pread_full(fd, stage, read_size, aligned_off) ||
+                (drive && (fallback = 1) &&
+                 cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off))) {
+                host_buf = (char *)stage + delta;
+                direct = 1;
+                ok = 1;
+            }
+        }
+        if (!ok && task.bytes <= stage_bytes &&
+            cuda_pread_full(g_model_fd, stage, task.bytes, off)) {
+            host_buf = stage;
+            ok = 1;
+        }
+        if (!ok) errnum = errno ? errno : EIO;
+    }
+    const double upload_t0 = cuda_wall_sec();
+    if (ok) {
+        cudaError_t err = cudaMemcpyAsync(job->dst + task.rel, host_buf,
+                                          (size_t)task.bytes,
+                                          cudaMemcpyHostToDevice, stream);
+        if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming read-worker upload failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            ok = 0;
+            errnum = EIO;
+        } else if (!direct) {
+            cuda_model_drop_file_pages(job->offset + task.rel, task.bytes);
+        }
+    }
+    const double t_end = cuda_wall_sec();
+
+    pthread_mutex_lock(&g_stream_read_mutex);
+    g_stream_replica_inflight[drive] -= task.bytes;
+    g_stream_replica_drive_bytes[drive] += task.bytes;
+    g_stream_replica_drive_tasks[drive]++;
+    g_stream_replica_drive_us[drive] += cuda_stream_read_profile_us(upload_t0 - read_t0);
+    if (fallback) g_stream_replica_fallbacks++;
+    if (profile) {
+        g_stream_read_profile_bytes += task.bytes;
+        g_stream_read_profile_read_us += cuda_stream_read_profile_us(upload_t0 - read_t0);
+        g_stream_read_profile_upload_us += cuda_stream_read_profile_us(t_end - upload_t0);
+    }
+    if (!ok) {
+        g_stream_replica_failed[task.job] = 1;
+        job->errnum = errnum ? errnum : EIO;
+    }
+    if (g_stream_replica_left[task.job] > 0 && --g_stream_replica_left[task.job] == 0) {
+        job->ok = g_stream_replica_failed[task.job] ? 0 : 1;
+        /* Every piece was uploaded by its worker; nothing is left in a stage. */
+        job->uploaded = job->ok;
+        job->direct = 1;
+        job->host_raw = NULL;
+        job->host_buf = NULL;
+        if (profile) g_stream_read_profile_jobs++;
+        if (!job->ok) g_stream_read_active_ok = 0;
+    }
+    g_stream_read_active_done++;
+    if (g_stream_read_active_done >= g_stream_read_active_count) {
+        pthread_cond_signal(&g_stream_read_done_cond);
+    }
+    pthread_mutex_unlock(&g_stream_read_mutex);
+}
+
 static void *cuda_stream_read_worker(void *arg) {
     const uint32_t worker_id = arg ? *(const uint32_t *)arg : 0u;
     (void)cudaSetDevice(0);
@@ -2048,6 +2414,14 @@ static void *cuda_stream_read_worker(void *arg) {
         if (g_stream_read_pool_stop) {
             pthread_mutex_unlock(&g_stream_read_mutex);
             break;
+        }
+        if (g_stream_read_active_replica) {
+            const cuda_stream_replica_task task =
+                g_stream_replica_tasks[g_stream_read_active_next++];
+            const int drive = cuda_stream_replica_pick(task.bytes);
+            pthread_mutex_unlock(&g_stream_read_mutex);
+            cuda_stream_replica_run_task(worker_id, task, drive);
+            continue;
         }
         const uint32_t idx = g_stream_read_active_next++;
         cuda_stream_read_job *job = &g_stream_read_active_jobs[idx];
@@ -2275,7 +2649,9 @@ static int cuda_stream_read_jobs_start(cuda_stream_read_job *jobs, uint32_t coun
     }
     cuda_stream_read_profile_note_jobs(jobs, count);
     g_stream_read_active_jobs = jobs;
-    g_stream_read_active_count = count;
+    g_stream_read_active_replica = cuda_stream_replica_build_tasks(jobs, count);
+    g_stream_read_active_count = g_stream_read_active_replica ?
+        g_stream_replica_task_count : count;
     g_stream_read_active_next = 0;
     g_stream_read_active_done = 0;
     g_stream_read_active_ok = 1;
@@ -6452,6 +6828,7 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
         }
 #endif
     }
+    cuda_stream_replica_attach(fd);
     return 1;
 }
 

@@ -1047,8 +1047,9 @@ __global__ static void v41_hc_ordered_prefetch_kernel(float *out,
     }
 }
 
-/* C1 (DS4_ROCM_C1_HC_PROJ, default 1): the same projection with every lane's
- * 640-element chunk loaded STEP elements at a time (more loads in flight).
+/* C1 (DS4_ROCM_C1_HC_PROJ: 0 old kernel, 1 step 64, 2 step 128 (default),
+ * 3 step 32): the same projection with every lane's 640-element chunk
+ * loaded STEP elements at a time (more loads in flight).
  * Each lane still accumulates its chunk in the same element order with the
  * same fused multiply-adds, and lane 0 adds the 32 lane partials in the
  * same order, so the result is bitwise the old kernel's.  0 = old kernel. */
@@ -1087,8 +1088,8 @@ static int c1_hc_proj_mode(void) {
     static int mode = -1;
     if (mode < 0) {
         const char *e = getenv("DS4_ROCM_C1_HC_PROJ");
-        mode = e && e[0] ? atoi(e) : 1;
-        if (mode < 0 || mode > 3) mode = 1;
+        mode = e && e[0] ? atoi(e) : 2;
+        if (mode < 0 || mode > 3) mode = 2;
     }
     return mode;
 }
@@ -1433,11 +1434,12 @@ __global__ static void v41_q8_f32_blocks4_kernel(float *out,
     if (lane == 0u) out[row] = ROUND_BF16 ? v41_bf16(acc) : acc;
 }
 
-/* C1 (DS4_ROCM_C1_Q8_PIPE, default 1): v41_q8_f32_blocks4_kernel with the
- * loads of U consecutive lane iterations issued before their arithmetic.
- * Lane ownership, the per-block 4-element dot, the order of the acc updates
- * and the wave reduction are unchanged, so the output is bitwise the same.
- * 0 restores the original kernel. */
+/* C1 experiment (DS4_ROCM_C1_Q8_PIPE, default 0 = original kernel):
+ * v41_q8_f32_blocks4_kernel with the loads of U consecutive lane iterations
+ * issued before their arithmetic.  Same source-level order, but under
+ * -ffast-math the compiler reassociates it differently: NOT bitwise equal
+ * (tools/c1/c1_exact.cpp) and no faster (the original already reads at
+ * 200-213 GB/s), so it stays off. */
 template<bool ROUND_BF16, uint32_t U>
 __global__ static void c1_q8_f32_blocks4_pipe_kernel(float *out,
         const unsigned char *weights, const float *input,
@@ -1490,8 +1492,8 @@ static int c1_q8_pipe_mode(void) {
     static int mode = -1;
     if (mode < 0) {
         const char *e = getenv("DS4_ROCM_C1_Q8_PIPE");
-        mode = e && e[0] ? atoi(e) : 1;
-        if (mode < 0 || mode > 2) mode = 1;
+        mode = e && e[0] ? atoi(e) : 0;  /* not bitwise: off (see C1.md) */
+        if (mode < 0 || mode > 2) mode = 0;
     }
     return mode;
 }
@@ -3154,6 +3156,45 @@ __global__ static void rms_norm_weight_bf16_kernel(float *out, const float *x, c
     }
 }
 
+/* C1 (DS4_ROCM_C1_NORM, default 1; 0 = old kernels): one-row RMS norms with
+ * each thread's PER = n/256 inputs loaded before its in-order sum of squares.
+ * Same per-thread order, same shared-memory tree, same output expression:
+ * bitwise equal (tools/c1/c1_exact.cpp), and the loads overlap instead of
+ * running as n/256 dependent round trips. */
+static int c1_norm_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DS4_ROCM_C1_NORM");
+        mode = e && e[0] ? (atoi(e) != 0) : 1;
+    }
+    return mode;
+}
+
+template <uint32_t PER>
+__global__ static void c1_rms_norm_weight_bf16_pre_kernel(float *out, const float *x, const float *w, uint32_t n, float eps) {
+    const float *xr = x;
+    float *orow = out;
+    float v[PER];
+#pragma unroll
+    for (uint32_t k = 0; k < PER; k++) v[k] = xr[threadIdx.x + k * 256u];
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t k = 0; k < PER; k++) sum += v[k] * v[k];
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+#pragma unroll
+    for (uint32_t k = 0; k < PER; k++) {
+        const uint32_t i = threadIdx.x + k * 256u;
+        orow[i] = v41_bf16(v[k] * scale * w[i]);
+    }
+}
+
 extern "C" int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
     uint64_t weight_bytes = 0;
     if (!model_map || !cuda_u64_mul_checked(n, sizeof(float), &weight_bytes) ||
@@ -3164,6 +3205,20 @@ extern "C" int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, 
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
+    if (rows == 1u && c1_norm_mode()) {
+        if (n == 5120u) {
+            c1_rms_norm_weight_bf16_pre_kernel<20u><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, eps);
+            return cuda_ok(cudaGetLastError(), "C1 norm BF16 launch");
+        }
+        if (n == 1280u) {
+            c1_rms_norm_weight_bf16_pre_kernel<5u><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, eps);
+            return cuda_ok(cudaGetLastError(), "C1 norm BF16 launch");
+        }
+        if (n == 512u) {
+            c1_rms_norm_weight_bf16_pre_kernel<2u><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, eps);
+            return cuda_ok(cudaGetLastError(), "C1 norm BF16 launch");
+        }
+    }
     rms_norm_weight_bf16_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "V4.1 norm BF16 launch");
 }

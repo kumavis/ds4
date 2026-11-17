@@ -41200,6 +41200,40 @@ static uint32_t ds41_engram_host_capacity(uint32_t prefill, uint32_t carry) {
 #ifndef DS41_DRAFT_WINDOW
 #define DS41_DRAFT_WINDOW 128u
 #endif
+/* D3 online DSpark scheduler state (SSD streaming); see ds41_sched_* near
+ * ds41_draft_scheduled_prefix_len.  Zeroed with the drafter and kept across
+ * ds41_draft_reset: the costs describe the machine and the expert cache, not
+ * the token frontier. */
+#define DS41_SCHED_MAXW 8u
+#define DS41_SCHED_RING 64u
+typedef struct { double v, w; } ds41_ewma;
+typedef struct {
+    bool init, drafted_last;
+    /* Costs (ms): plain one-token step inside this session, drafter, and a
+     * decayed weighted least-squares fit of verify+commit ms on verified rows. */
+    ds41_ewma plain_ms, draft_ms;
+    double vs_w, vs_x, vs_xx, vs_y, vs_xy;
+    uint32_t plain_n, draft_n, verify_n;
+    /* Acceptance: per draft position, a logit offset added to the confidence
+     * head (online Platt shift) and decayed observed/predicted rates. */
+    double conf_bias[DS41_SCHED_MAXW];
+    ds41_ewma acc_obs[DS41_SCHED_MAXW], acc_pred[DS41_SCHED_MAXW];
+    /* Recent drafted rounds' raw confidence logits (the empirical
+     * distribution behind the draft / don't-draft decision). */
+    float ring[DS41_SCHED_RING][DS41_SCHED_MAXW];
+    uint32_t ring_head, ring_len;
+    /* Read counters per round (audit; read jobs / 3 ~ expert misses). */
+    ds41_ewma miss_plain, miss_row, wait_plain, wait_row;
+    /* Decision state and audit. */
+    double rate_plain, rate_draft, rho, last_entry_rate;
+    double clock_ms, last_plain_at, last_draft_at;
+    double pred_tokens, real_tokens;     /* drafted rounds with k > 0 */
+    double draft_round_ms, draft_round_tokens, plain_round_ms;
+    uint64_t rounds, plain_steps, draft_rounds, probe_plain, probe_draft;
+    uint64_t warm_plain, warm_draft, switches, momentum, last_plain_round;
+    uint64_t width_hist[DS41_SCHED_MAXW + 2u]; /* [0] no draft, [1] drafted k=0, [k+1] */
+    bool mode_draft;
+} ds41_sched;
 typedef struct {
     const ds4_dspark_weights *w;
     const ds4_model *m;
@@ -41214,6 +41248,7 @@ typedef struct {
     ds4_gpu_tensor *tokens, *conf, *parts, *logits, *x, *xn;
     ds4_gpu_tensor *saved, *pool_kv, *pool_score;
     ds4_gpu_tensor *rows_logits, *rows_x, *rows_tmp;
+    ds41_sched sched;
 } ds41_draft;
 
 static void ds41_draft_free(ds41_draft *d) {
@@ -77223,7 +77258,14 @@ static void ds4_format_len_hist(
     }
 }
 
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+static void ds41_sched_print_session(const ds4_session *s);
+#endif
+
 static void ds4_session_print_dspark_stats(const ds4_session *s) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    ds41_sched_print_session(s);
+#endif
     if (!s || !ds4_dspark_stats_enabled()) return;
     const ds4_dspark_spec_stats *st = &s->dspark_stats;
     if (st->cycles == 0 && st->propose_ms == 0.0) return;
@@ -89470,6 +89512,435 @@ static uint32_t ds41_draft_scheduled_prefix_len(
     return selected;
 }
 
+/* =========================================================================
+ * D3: online cost model and scheduler for DSpark under SSD streaming.
+ *
+ * Under SSD streaming a verified row brings expert misses (about 30 x 18.8 MB
+ * per row on MXFP4) whose cost depends on the cache state and on the read
+ * path, so the fixed resident cycle table above and the 64-cycle acceptance
+ * backoff in ds41_draft_adapt cannot know what a round costs.  This scheduler
+ * measures it online, per session (all times are wall ms, so read waits are
+ * included):
+ *
+ *   P     plain one-token step inside this session (EWMA)
+ *   D     drafter proposal (EWMA)
+ *   V(r)  verify + commit of r = k + 1 rows = alpha + beta * r, a decayed
+ *         weighted least-squares fit, slope ridge-shrunk toward a prior
+ *   p_i   acceptance of draft i given drafts < i accepted:
+ *         sigmoid(confidence_i + b_i), b_i an online logistic offset fitted
+ *         to the observed acceptance at verified positions
+ *
+ * Before the drafter runs (draft or plain step):
+ *   rate_plain = 1 / P.
+ *   rate_draft = sum_j w_j E_j / sum_j w_j (D + C_j) over the recent drafted
+ *   rounds' confidences (recency weights w_j), where (E_j, C_j) is what the
+ *   post-draft rule would pick for round j at today's costs.
+ *   Draft iff rate_draft >= (1 + margin) * rate_plain, or (momentum) the last
+ *   drafted round alone predicts that, so a region that turns
+ *   speculation-friendly is followed at once.  Otherwise a plain step.
+ * After the drafter ran (its cost is sunk), pick k maximising
+ *   E(k) - rho * C(k),  E(k) = 1 + sum_{i<=k} prod_{j<=i} p_j,
+ *   C(0) = P,  C(k) = V(k + 1),  rho = max(rate_plain, rate_draft):
+ * extra committed tokens must repay their extra time at the long-run rate.
+ * Greedy decoding takes the argmax over prefixes (every prefix commits the
+ * target's own greedy tokens); sampled decoding stops at the first
+ * non-improving extension (causal, as Algorithm 1).
+ *
+ * Warm-up: the first WARM eligible rounds are plain steps (P), the next ones
+ * draft until 4 rounds of history exist, and until 3 verify samples exist a
+ * drafted round verifies the prefix whose calibrated survival stays >= 0.5;
+ * a cost without samples uses a prior scaled from P (alpha = 0.9 P,
+ * beta = 0.5 P).
+ * Drift: every estimate is an EWMA with a half-life in samples.
+ * Exploration, bounded by EXPLORE of decode time: while plain, a draft probe
+ * once D / EXPLORE ms of decode passed since the last draft; while drafting,
+ * a plain probe once (P - 1 / rate_draft) / EXPLORE ms passed since the last
+ * plain sample, and at least 8 rounds apart.  There is no random stream.
+ *
+ * Knobs (environment):
+ *   DS4_DSPARK_SCHED=online|old    online is the default for --ssd-streaming
+ *       sessions on the gfx1151 cost-scheduled path; old = the fork's
+ *       resident table + 64-cycle backoff.  Resident (non-streaming) sessions,
+ *       --dspark-confidence and the TP verifier keep the old policy.
+ *   DS4_DSPARK_SCHED_HALFLIFE=16   EWMA half-life in samples (2..1024)
+ *   DS4_DSPARK_SCHED_EXPLORE=0.01  exploration budget (fraction of decode time)
+ *   DS4_DSPARK_SCHED_MARGIN=0.03   regression margin: predicted drafting rate
+ *                                  must beat plain decoding by this fraction
+ *   DS4_DSPARK_SCHED_MAX_WIDTH=5   max drafts verified per round
+ *   DS4_DSPARK_SCHED_WARM=2        plain warm-up steps
+ *   DS4_DSPARK_SCHED_MOMENTUM=1    follow a single confident round (0 = off)
+ *   DS4_DSPARK_SCHED_FORCE=plain|draft  diagnostics: never / always draft
+ *       (a forced draft still picks k by the post-draft rule)
+ *   DS4_DSPARK_SCHED_PRINT=N       print the model state every N rounds
+ *   DS4_DSPARK_SCHED_TRACE=1       one DS41_SCHED line per round
+ *   DS4_DSPARK_FIXED_WIDTH=k       still caps k afterwards (both policies)
+ * The model state is printed at session end next to the DSpark stats.
+ * ========================================================================= */
+typedef struct {
+    bool online, trace, momentum;
+    int force;                 /* 0 none, 1 plain, 2 draft */
+    double halflife, decay, explore, margin;
+    uint32_t max_width, warm, print_every;
+} ds41_sched_params;
+
+static double ds41_sched_env_double(const char *name, double def,
+                                    double lo, double hi) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return def;
+    char *end = NULL;
+    const double v = strtod(env, &end);
+    if (end == env || !isfinite(v) || v < lo || v > hi) return def;
+    return v;
+}
+
+static const ds41_sched_params *ds41_sched_params_get(void) {
+    static ds41_sched_params p;
+    static bool ready = false;
+    if (ready) return &p;
+    const char *mode = getenv("DS4_DSPARK_SCHED");
+    p.online = !(mode && strcmp(mode, "old") == 0);
+    const char *trace = getenv("DS4_DSPARK_SCHED_TRACE");
+    p.trace = trace && trace[0] && strcmp(trace, "0") != 0;
+    const char *force = getenv("DS4_DSPARK_SCHED_FORCE");
+    p.force = force && strcmp(force, "plain") == 0 ? 1 :
+              force && strcmp(force, "draft") == 0 ? 2 : 0;
+    p.halflife = ds41_sched_env_double("DS4_DSPARK_SCHED_HALFLIFE", 16.0, 2.0, 1024.0);
+    p.decay = pow(0.5, 1.0 / p.halflife);
+    p.explore = ds41_sched_env_double("DS4_DSPARK_SCHED_EXPLORE", 0.01, 0.001, 0.5);
+    p.margin = ds41_sched_env_double("DS4_DSPARK_SCHED_MARGIN", 0.03, -0.5, 1.0);
+    p.max_width = (uint32_t)ds41_sched_env_double("DS4_DSPARK_SCHED_MAX_WIDTH",
+                                                  5.0, 1.0, (double)DS41_SCHED_MAXW);
+    p.warm = (uint32_t)ds41_sched_env_double("DS4_DSPARK_SCHED_WARM", 2.0, 1.0, 64.0);
+    p.momentum = ds41_sched_env_double("DS4_DSPARK_SCHED_MOMENTUM", 1.0, 0.0, 1.0) != 0.0;
+    p.print_every = (uint32_t)ds41_sched_env_double("DS4_DSPARK_SCHED_PRINT", 0.0, 0.0, 1e9);
+    ready = true;
+    return &p;
+}
+
+static void ds41_ewma_add(ds41_ewma *e, double x, double decay) {
+    e->v = e->v * decay + x;
+    e->w = e->w * decay + 1.0;
+}
+
+static double ds41_ewma_get(const ds41_ewma *e, double fallback) {
+    return e->w > 1e-9 ? e->v / e->w : fallback;
+}
+
+static double ds41_sched_plain(const ds41_sched *m) {
+    /* Only reached without a plain sample under DS4_DSPARK_SCHED_FORCE=draft. */
+    return ds41_ewma_get(&m->plain_ms, 120.0);
+}
+
+static double ds41_sched_draft(const ds41_sched *m) {
+    return ds41_ewma_get(&m->draft_ms, 40.0);
+}
+
+static void ds41_sched_verify_fit(const ds41_sched *m, double *alpha,
+                                  double *beta) {
+    const double P = ds41_sched_plain(m);
+    const double alpha0 = 0.9 * P, beta0 = 0.5 * P, ridge = 1.0;
+    if (m->vs_w <= 1e-9) {
+        *alpha = alpha0;
+        *beta = beta0;
+        return;
+    }
+    const double mx = m->vs_x / m->vs_w, my = m->vs_y / m->vs_w;
+    const double var = m->vs_xx / m->vs_w - mx * mx;
+    const double cov = m->vs_xy / m->vs_w - mx * my;
+    double b = (cov * m->vs_w + ridge * beta0) /
+               ((var > 0.0 ? var : 0.0) * m->vs_w + ridge);
+    if (b < 0.0) b = 0.0;
+    if (b > 4.0 * P) b = 4.0 * P;
+    double a = my - b * mx;
+    if (a < 0.0) a = 0.0;
+    *alpha = a;
+    *beta = b;
+}
+
+static double ds41_sched_accept_p(const ds41_sched *m, uint32_t i, float logit) {
+    if (!isfinite(logit) || i >= DS41_SCHED_MAXW) return 0.0;
+    const double z = (double)logit + m->conf_bias[i];
+    double p = 1.0 / (1.0 + exp(-z));
+    if (p < 0.001) p = 0.001;
+    if (p > 0.999) p = 0.999;
+    return p;
+}
+
+/* Post-draft rule; returns k and the predicted tokens / post-draft ms. */
+static uint32_t ds41_sched_choose(const ds41_sched *m, const float *conf,
+        uint32_t count, uint32_t kmax, double rho, double P, double alpha,
+        double beta, bool causal, double *e_out, double *c_out) {
+    double survive = 1.0, expected = 1.0;
+    double best_gain = 1.0 - rho * P, best_e = 1.0, best_c = P;
+    uint32_t best = 0;
+    if (count > kmax) count = kmax;
+    if (count > DS41_SCHED_MAXW) count = DS41_SCHED_MAXW;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!isfinite(conf[i])) break;
+        survive *= ds41_sched_accept_p(m, i, conf[i]);
+        expected += survive;
+        const double cost = alpha + beta * (double)(i + 2u);
+        const double gain = expected - rho * cost;
+        if (gain > best_gain) {
+            best = i + 1u;
+            best_gain = gain;
+            best_e = expected;
+            best_c = cost;
+        } else if (causal) {
+            break;
+        }
+    }
+    if (e_out) *e_out = best_e;
+    if (c_out) *c_out = best_c;
+    return best;
+}
+
+static double ds41_sched_expected(const ds41_sched *m, const float *conf,
+                                  uint32_t k) {
+    double survive = 1.0, expected = 1.0;
+    for (uint32_t i = 0; i < k && i < DS41_SCHED_MAXW; i++) {
+        survive *= ds41_sched_accept_p(m, i, conf[i]);
+        expected += survive;
+    }
+    return expected;
+}
+
+/* Recency-weighted drafting rate over the confidence history at rho. */
+static double ds41_sched_ring_rate(const ds41_sched *m,
+        const ds41_sched_params *sp, uint32_t block, double rho, double P,
+        double D, double alpha, double beta, bool causal) {
+    double num = 0.0, den = 0.0, w = 1.0;
+    for (uint32_t n = 0; n < m->ring_len; n++) {
+        const uint32_t at = (m->ring_head + DS41_SCHED_RING - 1u - n) % DS41_SCHED_RING;
+        double e = 1.0, c = P;
+        (void)ds41_sched_choose(m, m->ring[at], block, sp->max_width, rho, P,
+                                alpha, beta, causal, &e, &c);
+        num += w * e;
+        den += w * (D + c);
+        w *= sp->decay;
+    }
+    return den > 0.0 ? num / den : 0.0;
+}
+
+static void ds41_sched_refresh(ds41_sched *m, const ds41_sched_params *sp,
+                               uint32_t block, bool causal) {
+    const double P = ds41_sched_plain(m), D = ds41_sched_draft(m);
+    double alpha, beta;
+    ds41_sched_verify_fit(m, &alpha, &beta);
+    m->rate_plain = 1.0 / P;
+    double rho = m->rate_plain, rate = 0.0;
+    for (int it = 0; it < 4 && m->ring_len; it++) {
+        rate = ds41_sched_ring_rate(m, sp, block, rho, P, D, alpha, beta, causal);
+        const double next = rate > m->rate_plain ? rate : m->rate_plain;
+        if (fabs(next - rho) < 1e-6 * rho) break;
+        rho = next;
+    }
+    m->rate_draft = rate;
+    m->rho = rho;
+    m->last_entry_rate = 0.0;
+    if (m->ring_len) {
+        const uint32_t at = (m->ring_head + DS41_SCHED_RING - 1u) % DS41_SCHED_RING;
+        double e = 1.0, c = P;
+        (void)ds41_sched_choose(m, m->ring[at], block, sp->max_width, rho, P,
+                                alpha, beta, causal, &e, &c);
+        m->last_entry_rate = e / (D + c);
+    }
+}
+
+/* Draft (true) or plain step (false) for the next round. */
+static bool ds41_sched_decide(ds41_sched *m, const ds41_sched_params *sp,
+                              uint32_t block, bool causal, const char **why) {
+    if (!m->init) {
+        m->init = true;
+        m->mode_draft = true;
+    }
+    ds41_sched_refresh(m, sp, block, causal);
+    if (sp->force == 1) { *why = "force_plain"; return false; }
+    if (sp->force == 2) { *why = "force_draft"; return true; }
+    if (m->plain_n < sp->warm) {
+        m->warm_plain++;
+        *why = "warm_plain";
+        return false;
+    }
+    if (m->ring_len < 4u) {
+        m->warm_draft++;
+        *why = "warm_draft";
+        return true;
+    }
+    const double bar = (1.0 + sp->margin) * m->rate_plain;
+    bool want = m->rate_draft >= bar;
+    if (want != m->mode_draft) {
+        m->switches++;
+        m->mode_draft = want;
+    }
+    bool momentum = false;
+    if (!want && sp->momentum && m->drafted_last && m->last_entry_rate >= bar) {
+        want = true;
+        momentum = true;
+    }
+    if (want) {
+        const double P = ds41_sched_plain(m);
+        double loss = m->rate_draft > 0.0 ? P - 1.0 / m->rate_draft : P;
+        if (loss < 0.05 * P) loss = 0.05 * P;
+        if (!momentum && m->rounds >= m->last_plain_round + 8u &&
+            m->clock_ms - m->last_plain_at >= loss / sp->explore) {
+            m->probe_plain++;
+            *why = "probe_plain";
+            return false;
+        }
+        if (momentum) m->momentum++;
+        *why = momentum ? "momentum" : "draft";
+        return true;
+    }
+    if (m->clock_ms - m->last_draft_at >= ds41_sched_draft(m) / sp->explore) {
+        m->probe_draft++;
+        *why = "probe_draft";
+        return true;
+    }
+    *why = "plain";
+    return false;
+}
+
+static void ds41_sched_note_draft(ds41_sched *m, const ds41_sched_params *sp,
+                                  double ms, const float *conf, uint32_t block) {
+    ds41_ewma_add(&m->draft_ms, ms, sp->decay);
+    m->draft_n++;
+    m->draft_rounds++;
+    float *slot = m->ring[m->ring_head];
+    for (uint32_t i = 0; i < DS41_SCHED_MAXW; i++)
+        slot[i] = i < block ? conf[i] : -INFINITY;
+    m->ring_head = (m->ring_head + 1u) % DS41_SCHED_RING;
+    if (m->ring_len < DS41_SCHED_RING) m->ring_len++;
+}
+
+static void ds41_sched_note_plain(ds41_sched *m, const ds41_sched_params *sp,
+                                  double ms, double misses, double wait_ms) {
+    ds41_ewma_add(&m->plain_ms, ms, sp->decay);
+    ds41_ewma_add(&m->miss_plain, misses, sp->decay);
+    ds41_ewma_add(&m->wait_plain, wait_ms, sp->decay);
+    m->plain_n++;
+}
+
+static void ds41_sched_note_verify(ds41_sched *m, const ds41_sched_params *sp,
+        uint32_t k, uint32_t matched, double ms, const float *conf,
+        double pred_tokens, double misses, double wait_ms) {
+    const double rows = (double)(k + 1u), d = sp->decay;
+    m->vs_w = m->vs_w * d + 1.0;
+    m->vs_x = m->vs_x * d + rows;
+    m->vs_xx = m->vs_xx * d + rows * rows;
+    m->vs_y = m->vs_y * d + ms;
+    m->vs_xy = m->vs_xy * d + rows * ms;
+    m->verify_n++;
+    ds41_ewma_add(&m->miss_row, misses / rows, d);
+    ds41_ewma_add(&m->wait_row, wait_ms / rows, d);
+    /* Labels exist for draft i <= matched (i < k): accepted iff i < matched. */
+    for (uint32_t i = 0; i < k && i <= matched && i < DS41_SCHED_MAXW; i++) {
+        if (!isfinite(conf[i])) break;
+        const double a = i < matched ? 1.0 : 0.0;
+        const double p = ds41_sched_accept_p(m, i, conf[i]);
+        double b = m->conf_bias[i] + 0.05 * (a - p);
+        m->conf_bias[i] = b < -4.0 ? -4.0 : b > 4.0 ? 4.0 : b;
+        ds41_ewma_add(&m->acc_obs[i], a, d);
+        ds41_ewma_add(&m->acc_pred[i], 1.0 / (1.0 + exp(-(double)conf[i])), d);
+    }
+    m->pred_tokens += pred_tokens;
+    m->real_tokens += 1.0 + matched;
+}
+
+static void ds41_sched_print(const ds41_sched *m, const char *what) {
+    double alpha, beta;
+    ds41_sched_verify_fit(m, &alpha, &beta);
+    char acc[256], hist[192];
+    size_t off = 0;
+    acc[0] = 0;
+    for (uint32_t i = 0; i < 5u && off < sizeof(acc); i++) {
+        const int n = snprintf(acc + off, sizeof(acc) - off, "%s%.2f/%.2f/%+.2f",
+            i ? "," : "", ds41_ewma_get(&m->acc_obs[i], NAN),
+            ds41_ewma_get(&m->acc_pred[i], NAN), m->conf_bias[i]);
+        if (n < 0) break;
+        off += (size_t)n;
+    }
+    off = 0;
+    hist[0] = 0;
+    for (uint32_t i = 0; i < DS41_SCHED_MAXW + 2u && off < sizeof(hist); i++) {
+        if (!m->width_hist[i]) continue;
+        const int n = snprintf(hist + off, sizeof(hist) - off, "%s%s%u:%llu",
+            off ? "," : "", i == 0 ? "p" : i == 1 ? "d" : "", i < 2 ? 0u : i - 1u,
+            (unsigned long long)m->width_hist[i]);
+        if (n < 0) break;
+        off += (size_t)n;
+    }
+    fprintf(stderr,
+        "ds4: DSpark sched %s rounds=%llu plain_steps=%llu draft_rounds=%llu "
+        "warm=%llu,%llu probe_plain=%llu probe_draft=%llu momentum=%llu switches=%llu "
+        "mode=%s P_ms=%.1f(n=%u) D_ms=%.1f(n=%u) V_ms=%.1f+%.1f*rows(n=%u) "
+        "rate_plain=%.3f rate_draft=%.3f rho=%.3f tok/s "
+        "pred_tokens=%.1f real_tokens=%.0f "
+        "drafted_round_ms=%.1f drafted_round_tokens=%.2f plain_step_ms=%.1f "
+        "miss_plain=%.1f miss_row=%.1f wait_plain_ms=%.1f wait_row_ms=%.1f "
+        "accept_obs/pred/bias=%s widths=%s\n",
+        what, (unsigned long long)m->rounds, (unsigned long long)m->plain_steps,
+        (unsigned long long)m->draft_rounds,
+        (unsigned long long)m->warm_plain, (unsigned long long)m->warm_draft,
+        (unsigned long long)m->probe_plain, (unsigned long long)m->probe_draft,
+        (unsigned long long)m->momentum, (unsigned long long)m->switches,
+        m->mode_draft ? "draft" : "plain",
+        ds41_sched_plain(m), m->plain_n, ds41_sched_draft(m), m->draft_n,
+        alpha, beta, m->verify_n,
+        1000.0 * m->rate_plain, 1000.0 * m->rate_draft, 1000.0 * m->rho,
+        m->pred_tokens, m->real_tokens,
+        m->draft_rounds ? m->draft_round_ms / (double)m->draft_rounds : 0.0,
+        m->draft_rounds ? m->draft_round_tokens / (double)m->draft_rounds : 0.0,
+        m->plain_steps ? m->plain_round_ms / (double)m->plain_steps : 0.0,
+        ds41_ewma_get(&m->miss_plain, NAN), ds41_ewma_get(&m->miss_row, NAN),
+        ds41_ewma_get(&m->wait_plain, NAN), ds41_ewma_get(&m->wait_row, NAN),
+        acc, hist[0] ? hist : "none");
+}
+
+static void ds41_sched_print_session(const ds4_session *s) {
+    if (!s || !ds4_session_is_ds41(s) || !s->ds41_graph.draft) return;
+    const ds41_sched *m = &s->ds41_graph.draft->sched;
+    if (m->rounds) ds41_sched_print(m, "final");
+}
+
+static void ds41_sched_finish_round(ds41_sched *m, const ds41_sched_params *sp,
+        const ds4_session *s, uint32_t pos, const char *why, bool proposed,
+        uint32_t k, uint32_t matched, uint32_t kept, double pred,
+        double draft_ms, double post_ms, double total_ms, double misses,
+        double wait_ms) {
+    m->rounds++;
+    m->clock_ms += total_ms;
+    m->width_hist[!proposed ? 0u : k == 0 ? 1u :
+                  (k + 1u < DS41_SCHED_MAXW + 2u ? k + 1u : DS41_SCHED_MAXW + 1u)]++;
+    if (proposed) {
+        m->last_draft_at = m->clock_ms;
+        m->draft_round_ms += total_ms;
+        m->draft_round_tokens += kept;
+    } else {
+        m->plain_steps++;
+        m->plain_round_ms += total_ms;
+    }
+    m->drafted_last = proposed;
+    if (k == 0) {
+        m->last_plain_at = m->clock_ms;
+        m->last_plain_round = m->rounds;
+    }
+    if (sp->trace) {
+        double alpha, beta;
+        ds41_sched_verify_fit(m, &alpha, &beta);
+        fprintf(stderr, "DS41_SCHED v=1 session=%p pos=%u why=%s proposed=%d "
+            "k=%u accepted=%u kept=%u pred=%.3f draft_ms=%.3f post_ms=%.3f "
+            "total_ms=%.3f misses=%.1f wait_ms=%.3f P=%.2f D=%.2f "
+            "alpha=%.2f beta=%.2f rate_plain=%.4f rate_draft=%.4f rho=%.4f\n",
+            (const void *)s, pos, why, (int)proposed, k, matched, kept, pred,
+            draft_ms, post_ms, total_ms, misses, wait_ms,
+            ds41_sched_plain(m), ds41_sched_draft(m), alpha, beta,
+            1000.0 * m->rate_plain, 1000.0 * m->rate_draft, 1000.0 * m->rho);
+    }
+    if (sp->print_every && m->rounds % sp->print_every == 0u)
+        ds41_sched_print(m, "state");
+}
+
 static void ds41_draft_adapt(ds41_draft *d, bool proposed, uint32_t drafted,
                              uint32_t accepted, bool tp) {
     if (!d || !proposed || ds41_draft_adapt_off()) return;
@@ -89588,18 +90059,42 @@ static int ds41_session_spec(ds4_session *s, int first_token,
      * expected throughput.  Do not let a short, low-acceptance prefix suppress
      * the next 64 independent decisions; that coarse backoff is retained only
      * for the explicit fixed-threshold policy. */
-    /* Honor measured-region backoff before entering the proposal graph. */
+    /* D3: under SSD streaming the online cost model decides; the resident
+     * table and the 64-cycle backoff remain for every other configuration
+     * and under DS4_DSPARK_SCHED=old. */
     /* D8 diagnostic: DS4_D8_NO_PROPOSE=1 keeps the session and all of its
      * per-step drafter bookkeeping but never drafts, so every step is an
-     * ordinary step inside a DSpark session (same tokens as plain decode). */
+     * ordinary step inside a DSpark session (same tokens as plain decode).
+     * It applies under both schedulers. */
     static int d8_no_propose = -1;
     if (d8_no_propose < 0) d8_no_propose = d8_env_flag("DS4_D8_NO_PROPOSE");
-    const bool proposed = !d8_no_propose && ds41_draft_should_propose(
-        draftable, cost_scheduled, tp_verify, d->skip_left,
-        ds41_draft_adapt_off());
-    if (draftable && !proposed && !d8_no_propose) {
-        d->skip_left--;
-        if (stats) s->dspark_stats.scheduler_skips++;
+    const ds41_sched_params *sp = ds41_sched_params_get();
+    const bool online = cost_scheduled && g->streaming && !tp_verify &&
+        sp->online;
+    ds41_sched *sm = &d->sched;
+    const char *sched_why = "-";
+    uint64_t pc_w0 = 0, pc_j0 = 0;
+    if (online && ds4_rocm_perf_counters)
+        ds4_rocm_perf_counters(NULL, NULL, &pc_w0, &pc_j0);
+    double sched_pred = 1.0;
+    bool proposed;
+    if (online) {
+        proposed = draftable && !d8_no_propose &&
+            ds41_sched_decide(sm, sp, B < DS41_SCHED_MAXW ? B : DS41_SCHED_MAXW,
+                              exact, &sched_why);
+        if (!draftable) sched_why = "undraftable";
+        else if (d8_no_propose) sched_why = "d8_no_propose";
+        if (draftable && !proposed && !d8_no_propose && stats)
+            s->dspark_stats.scheduler_skips++;
+    } else {
+        /* Honor measured-region backoff before entering the proposal graph. */
+        proposed = !d8_no_propose && ds41_draft_should_propose(
+            draftable, cost_scheduled, tp_verify, d->skip_left,
+            ds41_draft_adapt_off());
+        if (draftable && !proposed && !d8_no_propose) {
+            d->skip_left--;
+            if (stats) s->dspark_stats.scheduler_skips++;
+        }
     }
     if (proposed) {
         const double tp = now_sec();
@@ -89610,10 +90105,35 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         }
         propose_seconds = now_sec() - tp;
         if (stats) s->dspark_stats.propose_ms += propose_seconds * 1000.0;
-        k = cost_scheduled ?
-            ds41_draft_scheduled_prefix_len(confidence, B, tp_verify) :
-            dspark_confident_prefix_len(confidence, B,
-                                        e->dspark_confidence_threshold);
+        if (online) {
+            const uint32_t nb = B < DS41_SCHED_MAXW ? B : DS41_SCHED_MAXW;
+            ds41_sched_note_draft(sm, sp, propose_seconds * 1000.0,
+                                  confidence, nb);
+            double alpha, beta;
+            ds41_sched_verify_fit(sm, &alpha, &beta);
+            const double P = ds41_sched_plain(sm);
+            const double rho = sm->rho > 0.0 ? sm->rho : 1.0 / P;
+            k = ds41_sched_choose(sm, confidence, nb, sp->max_width, rho, P,
+                                  alpha, beta, exact, NULL, NULL);
+            if (sm->verify_n < 3u && sp->force != 1) {
+                /* Warm-up: the verify cost is still the prior, so verify the
+                 * prefix whose calibrated survival stays >= 0.5 (at least
+                 * one draft) to obtain V(r) samples at several widths. */
+                double survive = 1.0;
+                uint32_t warm_k = 0;
+                while (warm_k < nb && warm_k < sp->max_width) {
+                    survive *= ds41_sched_accept_p(sm, warm_k, confidence[warm_k]);
+                    if (warm_k && survive < 0.5) break;
+                    warm_k++;
+                }
+                if (warm_k > k) k = warm_k;
+            }
+        } else {
+            k = cost_scheduled ?
+                ds41_draft_scheduled_prefix_len(confidence, B, tp_verify) :
+                dspark_confident_prefix_len(confidence, B,
+                                            e->dspark_confidence_threshold);
+        }
         if (cost_trace) trace_caps[0] = k;
         const uint32_t width_limit = ds41_draft_width_limit(B);
         if (k > width_limit) k = width_limit;
@@ -89630,6 +90150,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
             if (ignore_eos && ds4_token_is_stop_for_think_mode(
                     e, drafts[i], think_mode)) { k = i; break; }
         }
+        if (online) sched_pred = ds41_sched_expected(sm, confidence, k);
     }
     if (stats) {
         s->dspark_stats.cycles++;
@@ -89648,10 +90169,23 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         fprintf(stderr, "\n");
     }
     if (k == 0) {
-        const double target_started = cost_trace ? now_sec() : 0.0;
+        const double target_started = now_sec();
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
-        ds41_draft_adapt(d, proposed, 0, 0, tp_verify);
+        if (online) {
+            const double done = now_sec();
+            uint64_t pc_w1 = pc_w0, pc_j1 = pc_j0;
+            if (ds4_rocm_perf_counters)
+                ds4_rocm_perf_counters(NULL, NULL, &pc_w1, &pc_j1);
+            ds41_sched_note_plain(sm, sp, (done - target_started) * 1000.0,
+                (double)(pc_j1 - pc_j0) / 3.0, (double)(pc_w1 - pc_w0) / 1000.0);
+            ds41_sched_finish_round(sm, sp, s, pos, sched_why, proposed, 0, 0,
+                1u, sched_pred, propose_seconds * 1000.0,
+                (done - target_started) * 1000.0, (done - t0) * 1000.0,
+                (double)(pc_j1 - pc_j0) / 3.0, (double)(pc_w1 - pc_w0) / 1000.0);
+        } else {
+            ds41_draft_adapt(d, proposed, 0, 0, tp_verify);
+        }
         if (stats) {
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
             s->dspark_stats.total_ms += (now_sec() - t0) * 1000.0;
@@ -89680,7 +90214,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         payload_set_err(err, errlen, "tp: V4.1 verify send failed");
         return -1;
     }
-    const double tv = (stats || cost_trace) ? now_sec() : 0.0;
+    const double tv = (stats || cost_trace || online) ? now_sec() : 0.0;
     bool ok = ds41_draft_verify(g, &e->model, &e->weights,
                                 tokens, n, rows);
     if (tp_verify && e->tp.vocab_split) {
@@ -89697,9 +90231,9 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         }
         free(peer);
     }
-    const double verified_at = cost_trace ? now_sec() : 0.0;
+    const double verified_at = (cost_trace || online) ? now_sec() : 0.0;
     if (stats) s->dspark_stats.verify_ms +=
-        ((cost_trace ? verified_at : now_sec()) - tv) * 1000.0;
+        ((cost_trace || online ? verified_at : now_sec()) - tv) * 1000.0;
     if (!ok) {
         if (tp_verify)
             (void)ds4_tp_send_verify_commit(e->tp.ctx,
@@ -89757,7 +90291,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         payload_set_err(err, errlen, "DeepSeek V4.1 draft rollback failed");
         return -1;
     }
-    const double committed_at = cost_trace ? now_sec() : 0.0;
+    const double committed_at = (cost_trace || online) ? now_sec() : 0.0;
     if (replacement >= 0) {
         if (ds4_session_eval(s, replacement, err, errlen) != 0) return -1;
         accepted[matched + 1u] = replacement;
@@ -89774,7 +90308,23 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         fprintf(stderr, "ds4: DSpark V4.1 cycle pos=%u drafted=%u accepted=%u replacement=%d\n",
                 pos, k, matched, replacement);
     const uint32_t kept = 1u + matched + (replacement >= 0);
-    ds41_draft_adapt(d, true, k, matched, tp_verify);
+    if (online) {
+        const double done = now_sec();
+        uint64_t pc_w1 = pc_w0, pc_j1 = pc_j0;
+        if (ds4_rocm_perf_counters)
+            ds4_rocm_perf_counters(NULL, NULL, &pc_w1, &pc_j1);
+        const double misses = (double)(pc_j1 - pc_j0) / 3.0;
+        const double wait_ms = (double)(pc_w1 - pc_w0) / 1000.0;
+        ds41_sched_note_verify(sm, sp, k, matched,
+            (committed_at - tv) * 1000.0, confidence, sched_pred,
+            misses, wait_ms);
+        ds41_sched_finish_round(sm, sp, s, pos, sched_why, true, k, matched,
+            kept, sched_pred, propose_seconds * 1000.0,
+            (committed_at - tv) * 1000.0, (done - t0) * 1000.0,
+            misses, wait_ms);
+    } else {
+        ds41_draft_adapt(d, true, k, matched, tp_verify);
+    }
     if (cost_trace) {
         const double done = now_sec();
         ds41_draft_trace_cycle(s, pos, g->ctx - pos, tp_verify, exact,

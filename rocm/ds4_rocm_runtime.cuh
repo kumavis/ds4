@@ -4575,6 +4575,105 @@ static int cuda_stream_selected_apply(
     return 1;
 }
 
+/* DS4_ROCM_MOE_COMPACT_SELECTED=1 restores the old single-token decode path
+ * that copies the selected experts into the compact staging buffer. */
+static int cuda_stream_selected_compact_forced(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_MOE_COMPACT_SELECTED");
+        cached = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+/*
+ * Zero-copy single-token decode: finish the pending selected load (wait for
+ * the missing-expert reads and their uploads) without compacting, and hand
+ * the per-slot pointer tables built by cuda_stream_selected_prepare_ptrs to
+ * the expert kernels.  Slot i of the tables is route position i, and
+ * selected_exec is the identity slot table, so the kernels see the same
+ * bytes in the same order as the compact path; only the addressing differs.
+ *
+ * Ordering guarantees (all must hold for the kernels to read valid bytes):
+ *  1. Missing-expert bytes are in their slots before the kernels are
+ *     enqueued: cuda_stream_read_jobs_wait plus
+ *     cuda_stream_selected_upload_read_jobs complete every upload with a
+ *     host-side stream synchronize before this function returns.
+ *  2. The pointer tables are on the device before the kernels read them:
+ *     prepare_ptrs records g_stream_selected_upload_ready_event after the
+ *     three H2D copies and the caller makes stream 0 wait on it
+ *     (cuda_stream_selected_wait_upload_ready) before the first launch.
+ *  3. Slot reuse: the caller records g_stream_selected_reuse_event on
+ *     stream 0 right after the last routed kernel of the layer
+ *     (cuda_stream_selected_mark_inflight).  Every path that can hand a slot
+ *     to another expert goes through cuda_stream_resident_evict_at /
+ *     cuda_stream_resident_alloc / cuda_stream_resident_cache_release, and
+ *     each of those first does a host cudaEventSynchronize on that event
+ *     (cuda_stream_resident_reclaim_wait).  Stream 0 is in order, so when
+ *     the event of layer L has completed, every earlier zero-copy kernel has
+ *     finished reading its slots; no upload into a recycled slot can be
+ *     issued before that.  Slots selected by the layer being loaded are
+ *     never victims (cuda_stream_selected_is_current), and its own kernels
+ *     are enqueued only after all of its allocations.
+ *  4. The single device pointer table (and its pinned stage) is rewritten
+ *     only in the next cuda_stream_selected_load, which starts with
+ *     cuda_stream_selected_reuse_wait on the same event.
+ * Returns 0 (caller falls back to the compact path) when no pending
+ * pointer-table load matches this call.
+ */
+static int cuda_stream_selected_apply_ptrs(
+        const void *model_map,
+        uint32_t layer,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        const ds4_gpu_tensor **selected_exec,
+        const char **gate_w,
+        const char **up_w,
+        const char **down_w,
+        const char ***gate_ptrs,
+        const char ***up_ptrs,
+        const char ***down_ptrs) {
+    if (!g_ssd_streaming_mode ||
+        cuda_stream_selected_compact_forced() ||
+        !selected_exec || !gate_w || !up_w || !down_w ||
+        !gate_ptrs || !up_ptrs || !down_ptrs ||
+        g_stream_selected_cache.loaded ||
+        !g_stream_selected_cache.gate_ptrs ||
+        !g_stream_selected_cache.up_ptrs ||
+        !g_stream_selected_cache.down_ptrs ||
+        !g_stream_selected_cache.slot_ids ||
+        (g_stream_selected_pending.resident_mask |
+         g_stream_selected_pending.missing_mask) == 0 ||
+        !cuda_stream_selected_pending_matches(model_map,
+                                              layer,
+                                              n_total_expert,
+                                              n_selected,
+                                              gate_expert_bytes,
+                                              down_expert_bytes)) {
+        return 0;
+    }
+    if (g_stream_selected_cache.model_map != model_map ||
+        g_stream_selected_cache.layer != layer ||
+        g_stream_selected_cache.n_selected != n_selected) {
+        return 0;
+    }
+    /* Guarantee 1: reads done and uploaded (host-synchronous); no compaction. */
+    if (!cuda_stream_selected_finish_pending_missing(0)) return -1;
+    *selected_exec = &g_stream_selected_cache.slot_tensor;
+    /* The staging buffers are not read on this path; they are returned only
+     * so a code path that unexpectedly used them would read valid memory. */
+    *gate_w = g_stream_selected_cache.gate;
+    *up_w = g_stream_selected_cache.up;
+    *down_w = g_stream_selected_cache.down;
+    *gate_ptrs = g_stream_selected_cache.gate_ptrs;
+    *up_ptrs = g_stream_selected_cache.up_ptrs;
+    *down_ptrs = g_stream_selected_cache.down_ptrs;
+    g_routed_moe_selected_override_n = 0;
+    return 1;
+}
+
 static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     const char *owned = cuda_model_image_ptr(model_map, offset);
     if (owned) return owned;

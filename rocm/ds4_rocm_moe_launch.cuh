@@ -695,8 +695,49 @@ static int routed_moe_launch(
      * selected-expert state to the default stream. Keep the asynchronous
      * read overlap, then use the deterministic compact table below. */
     int split_selected = 0;
+    /* Zero-copy single-token decode (IQ2_XXS/Q2_K and MXFP4 experts): the
+     * expert kernels read the resident cache slots through the per-slot
+     * pointer tables instead of a compacted copy.  Only the kernel paths
+     * below that have a pointer-table twin are eligible; everything else,
+     * and DS4_ROCM_MOE_COMPACT_SELECTED=1, keeps the compact copy.  See
+     * cuda_stream_selected_apply_ptrs for the ordering guarantees.  When it
+     * is taken, compact_selected is also set: it still means "single-token
+     * selected-expert path", which owns the upload wait and the reuse event
+     * recorded after the routed kernels. */
+    const int zero_copy_eligible =
+        !stream_full_layer &&
+        n_tokens == 1u &&
+        n_expert <= DS4_ROCM_N_EXPERT_USED &&
+        (iq2_path || mxfp4_path) &&
+        !q4k_path &&
+        down->bytes >= (uint64_t)(expert_in_dim / CUDA_QK_K) * sizeof(cuda_block_q8_K) &&
+        gate->bytes >= (uint64_t)n_expert * (expert_mid_dim / CUDA_QK_K) * sizeof(cuda_block_q8_K);
+    int zero_copy_selected = 0;
+    if (zero_copy_eligible) {
+        zero_copy_selected =
+            cuda_stream_selected_apply_ptrs(model_map,
+                                            layer_index,
+                                            n_total_expert,
+                                            n_expert,
+                                            gate_expert_bytes,
+                                            down_expert_bytes,
+                                            &selected_exec,
+                                            &gate_w,
+                                            &up_w,
+                                            &down_w,
+                                            &gate_slot_ptrs,
+                                            &up_slot_ptrs,
+                                            &down_slot_ptrs);
+        if (zero_copy_selected < 0) return 0;
+        static int logged_zero_copy = 0;
+        if (zero_copy_selected && !logged_zero_copy) {
+            logged_zero_copy = 1;
+            fprintf(stderr, "ds4: ROCm decode MoE reads selected experts in place (zero-copy)\n");
+        }
+    }
     const int compact_selected =
         split_selected ||
+        zero_copy_selected ||
         (!stream_full_layer &&
         n_tokens == 1u &&
         cuda_stream_selected_apply(model_map,
@@ -1603,6 +1644,23 @@ static int routed_moe_launch(
                         n_expert,
                         write_gate_up,
                         clamp);
+                } else if (mxfp4_path && zero_copy_selected) {
+                    dim3 mxgrid((expert_mid_dim + 7u) / 8u, pair_count, 1);
+                    moe_gate_up_mid_decode_mxfp4_qwarp32_ptrs_kernel<<<mxgrid, 256>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_slot_ptrs,
+                        up_slot_ptrs,
+                        xq,
+                        (const int32_t *)selected_exec->ptr,
+                        (const float *)weights->ptr,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        write_gate_up,
+                        clamp);
                 } else if (mxfp4_path) {
                     dim3 mxgrid((expert_mid_dim + 7u) / 8u, pair_count, 1);
                     moe_gate_up_mid_decode_mxfp4_qwarp32_kernel<<<mxgrid, 256>>>(
@@ -1620,6 +1678,39 @@ static int routed_moe_launch(
                         expert_mid_dim,
                         n_expert,
                         write_gate_up,
+                        clamp);
+                } else if (use_decode_lut_gate && zero_copy_selected) {
+                    moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_slot_ptrs,
+                        up_slot_ptrs,
+                        xq,
+                        (const int32_t *)selected_exec->ptr,
+                        (const float *)weights->ptr,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        write_gate_up,
+                        0xffffffffu,
+                        clamp);
+                } else if (zero_copy_selected) {
+                    moe_gate_up_mid_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_slot_ptrs,
+                        up_slot_ptrs,
+                        xq,
+                        (const int32_t *)selected_exec->ptr,
+                        (const float *)weights->ptr,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        0xffffffffu,
                         clamp);
                 } else if (use_decode_lut_gate) {
                     moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
@@ -1768,6 +1859,17 @@ static int routed_moe_launch(
                     out_dim,
                     down_row_bytes,
                     n_expert);
+            } else if (zero_copy_selected) {
+                moe_down_q2K_sum_rows_w32_ptrs_kernel<<<dgrid, threads>>>(
+                    (float *)out->ptr,
+                    down_slot_ptrs,
+                    (const float *)mid->ptr,
+                    (const int32_t *)selected_exec->ptr,
+                    n_tokens,
+                    expert_mid_dim,
+                    out_dim,
+                    down_row_bytes,
+                    n_expert);
             } else {
                 moe_down_q2K_sum_rows_w32_kernel<<<dgrid, threads>>>(
                     (float *)out->ptr,
@@ -1883,7 +1985,17 @@ static int routed_moe_launch(
                         n_expert);
                 } else if (mxfp4_path) {
                     dim3 mxgrid((out_dim + 7u) / 8u, n_tokens, 1);
-                    if (n_tokens == 1u) {
+                    if (n_tokens == 1u && zero_copy_selected) {
+                        moe_down_mxfp4_sum6_qwarp32_ptrs_kernel<false><<<mxgrid, 256>>>(
+                            (float *)out->ptr,
+                            down_slot_ptrs,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert);
+                    } else if (n_tokens == 1u) {
                         moe_down_mxfp4_sum6_qwarp32_kernel<false><<<mxgrid, 256>>>(
                             (float *)out->ptr,
                             down_w,
@@ -2070,7 +2182,16 @@ static int routed_moe_launch(
             moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
-        if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();
+        if (zero_copy_selected) {
+            /* Ordering guarantee 3 (cuda_stream_selected_apply_ptrs): record
+             * the reuse event after the last kernel that reads the resident
+             * slots, even if a later launch failed, so no slot is recycled
+             * while an enqueued kernel can still read it. */
+            const int inflight_ok = cuda_stream_selected_mark_inflight();
+            ok = ok && inflight_ok;
+        } else if (ok && compact_selected) {
+            ok = cuda_stream_selected_mark_inflight();
+        }
         return ok;
     }
 

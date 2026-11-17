@@ -29,3 +29,7 @@ digest() { d=$(ls -dt /data/ds4-bench/runs/*-"$1" | head -1)
   echo "$(printf '%s\n' "$l" | md5sum | cut -c1-12) $(printf '%s\n' "$l" | grep -c .)"; }
 args() { case $1 in code) echo "$E/p-code.txt --nothink";; *) echo "$E/p-$1.txt";; esac; }
 TR="DS4_D9_ROUND_TRACE=1 DS4_D8_STEP_TRACE=1 DS4_ROCM_DSPARK_PHASE_TRACE=1"
+# erun VAR=val ... TAG NTOK PROMPT [flags]: run with extra environment (a
+# subshell, so nothing leaks into later runs); stops the queue on failure.
+erun() { local e=(); while [[ $# -gt 0 && $1 == *=* ]]; do e+=("$1"); shift; done
+  ( export "${e[@]}"; run "$@" ) || exit 1; }

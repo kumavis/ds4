@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# D9 queue 1 (build 1): smoke, plain gate, per-position probe runs (the
+# drafter's full proposal at every position of the plain trajectory), traced
+# old-scheduler runs, a drafter profile, Q2 probe/old.
+set -u; . "$(dirname "$0")/common.sh"
+echo "$(date -Is) Q1b start $(git -C $DS4_DIR rev-parse --short HEAD)" >> $LOG
+mx; P=$E/p-code.txt
+erun $TR DS4_D9_PROBE=1 DS4_DSPARK_SCHED=old DS4_NOTE="d9 smoke probe" d9-smoke-probe-8 8 $P --nothink --dspark --mtp-model $DSP
+erun $TR DS4_DSPARK_SCHED=model DS4_NOTE="d9 smoke model" d9-smoke-model-8 8 $P --nothink --dspark --mtp-model $DSP
+erun $TR DS4_D9_PROBE=1 DS4_DSPARK_SCHED=old DS4_NOTE="d9 smoke probe" d9-smoke-probe-64 64 $P --nothink --dspark --mtp-model $DSP
+erun $TR DS4_DSPARK_SCHED=model DS4_NOTE="d9 smoke model" d9-smoke-model-64 64 $P --nothink --dspark --mtp-model $DSP
+for p in code prose json translate list; do
+  read -r -a A <<< "$(args $p)"
+  erun $TR DS4_D9_PROBE=1 DS4_DSPARK_SCHED=old DS4_REF_TAG=int-mx-$p-plain-r1 \
+    DS4_NOTE="d9 probe $p (draft every position, plain step)" \
+    d9-probe-mx-$p 512 "${A[@]}" --dspark --mtp-model $DSP
+done
+for p in code prose json translate list; do
+  read -r -a A <<< "$(args $p)"
+  erun $TR DS4_DSPARK_SCHED=old DS4_REF_TAG=int-mx-$p-plain-r1 \
+    DS4_NOTE="d9 traced old $p" d9-trace-old-mx-$p 512 "${A[@]}" --dspark --mtp-model $DSP
+done
+read -r -a A <<< "$(args code)"
+erun $TR DS4_DSPARK_SCHED=old DS4_ROCM_DSPARK_V41_PROPOSE_PROFILE=100000 DS4_D8_PROPOSE_DETAIL=1 \
+  DS4_NOTE="d9 drafter profile code" d9-drafter-prof-mx-code 512 "${A[@]}" --dspark --mtp-model $DSP
+q2
+erun $TR DS4_D9_PROBE=1 DS4_DSPARK_SCHED=old DS4_NOTE="d9 probe Q2 code" \
+  d9-probe-q2-code 512 "${A[@]}" --dspark --mtp-model $DSP
+erun $TR DS4_DSPARK_SCHED=old DS4_NOTE="d9 traced old Q2 code" \
+  d9-trace-old-q2-code 512 "${A[@]}" --dspark --mtp-model $DSP
+echo "$(date -Is) QUEUE DONE" >> $LOG

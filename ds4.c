@@ -90052,8 +90052,8 @@ static void ds41_draft_trace_cycle(const ds4_session *s,
  * Draft or plain step (before the drafter): an EWMA (HALFLIFE rounds) of the
  *   per-round advantage over plain decoding in tokens,
  *     adv = (tokens - 1) - (D + C(k) - P) / P,
- *   with tokens the committed count (SIGNAL=realized) or E(k)
- *   (SIGNAL=predicted).  When it falls below GATE the next SKIP rounds are
+ *   with tokens E(k) (SIGNAL=predicted, default) or the committed count
+ *   (SIGNAL=realized).  When it falls below GATE the next SKIP rounds are
  *   plain steps; then one probe proposal restarts the EWMA from that round
  *   alone; a failed probe doubles SKIP up to SKIP_MAX.
  * Nothing reads a clock, so a run repeats exactly.  Defaults depend on the
@@ -90079,19 +90079,22 @@ static const ds41_model_params *ds41_model_params_get(const ds4_weights *w) {
         break;
     }
     /* Defaults: D9 fit (D9.md, "Cost model"). */
-    const double defP = mxfp4 ? 118.0 : 111.0;
-    const double defVA = mxfp4 ? 78.0 : 100.0;
-    const double defVB = mxfp4 ? 51.0 : 36.0;
+    /* MXFP4: pooled over code/prose/json/translate/list; other expert
+     * types (IQ2_XXS/Q2_K): Q2 code.  verify ms = VA + VB * rows folds the
+     * fitted 1.37-1.64 ms per expert miss at the mean misses per row. */
+    const double defP = mxfp4 ? 118.0 : 87.0;
+    const double defVA = mxfp4 ? 77.0 : 66.0;
+    const double defVB = mxfp4 ? 49.0 : 41.0;
     p.P = ds41_sched_env_double("DS4_DSPARK_MODEL_P", defP, 1.0, 10000.0);
     p.D = ds41_sched_env_double("DS4_DSPARK_MODEL_D", 20.0, 0.0, 10000.0);
     p.VA = ds41_sched_env_double("DS4_DSPARK_MODEL_VA", defVA, 0.0, 10000.0);
     p.VB = ds41_sched_env_double("DS4_DSPARK_MODEL_VB", defVB, 0.0, 10000.0);
-    p.kappa = ds41_sched_env_double("DS4_DSPARK_MODEL_KAPPA", 1.2, 0.1, 10.0);
+    p.kappa = ds41_sched_env_double("DS4_DSPARK_MODEL_KAPPA", 1.1, 0.1, 10.0);
     p.cal_scale = ds41_sched_env_double("DS4_DSPARK_MODEL_CAL_SCALE", 1.0, 0.0, 10.0);
     p.eta = ds41_sched_env_double("DS4_DSPARK_MODEL_ETA", 0.0, 0.0, 1.0);
-    const double hl = ds41_sched_env_double("DS4_DSPARK_MODEL_HALFLIFE", 4.0, 0.5, 1024.0);
+    const double hl = ds41_sched_env_double("DS4_DSPARK_MODEL_HALFLIFE", 1.0, 0.5, 1024.0);
     p.decay = pow(0.5, 1.0 / hl);
-    p.gate = ds41_sched_env_double("DS4_DSPARK_MODEL_GATE", 0.0, -10.0, 10.0);
+    p.gate = ds41_sched_env_double("DS4_DSPARK_MODEL_GATE", -0.1, -10.0, 10.0);
     p.skip = (uint32_t)ds41_sched_env_double("DS4_DSPARK_MODEL_SKIP", 8.0, 0.0, 4096.0);
     p.skip_max = (uint32_t)ds41_sched_env_double("DS4_DSPARK_MODEL_SKIP_MAX", 64.0, 0.0, 65536.0);
     if (p.skip_max < p.skip) p.skip_max = p.skip;
@@ -90107,7 +90110,7 @@ static const ds41_model_params *ds41_model_params_get(const ds4_weights *w) {
         bias = *end == ',' ? end + 1 : end;
     }
     const char *sig = getenv("DS4_DSPARK_MODEL_SIGNAL");
-    p.predicted = sig && strcmp(sig, "predicted") == 0;
+    p.predicted = !(sig && strcmp(sig, "realized") == 0);
     fprintf(stderr, "ds4: DSpark model scheduler (%s defaults) P=%.1f D=%.1f "
             "V=%.1f+%.1f*rows kappa=%.3f cal=%.3f bias=%.3f,%.3f,%.3f,%.3f,%.3f "
             "eta=%.3f halflife=%.2f gate=%.3f skip=%u..%u max_width=%u signal=%s\n",

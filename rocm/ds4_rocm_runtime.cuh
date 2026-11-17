@@ -366,6 +366,20 @@ static pthread_cond_t g_stream_read_done_cond = PTHREAD_COND_INITIALIZER;
 static int g_stream_read_pool_started;
 static uint32_t g_stream_read_pool_workers;
 static int g_stream_read_pool_stop;
+struct cuda_stream_read_task {
+    uint32_t job;
+    uint64_t rel;
+    uint64_t bytes;
+};
+static void *g_stream_read_stage2_raw[DS4_ROCM_STREAM_READ_WORKERS];
+static uint64_t g_stream_read_stage2_bytes[DS4_ROCM_STREAM_READ_WORKERS];
+static cudaEvent_t g_stream_read_upload_events[DS4_ROCM_STREAM_READ_WORKERS][2];
+static int g_stream_read_upload_pending[DS4_ROCM_STREAM_READ_WORKERS][2];
+static uint32_t g_stream_read_stage_next[DS4_ROCM_STREAM_READ_WORKERS];
+static int g_stream_read_async_upload = -1;
+static uint64_t g_stream_read_chunk_bytes;
+static std::vector<cuda_stream_read_task> g_stream_read_tasks;
+static int g_stream_read_active_tasks;
 static struct cuda_stream_read_job *g_stream_read_active_jobs;
 static uint32_t g_stream_read_active_count;
 static uint32_t g_stream_read_active_next;
@@ -748,16 +762,35 @@ static void cuda_stream_layer_expert_cache_release(void) {
 static void cuda_stream_read_stage_release(void) {
     cuda_stream_read_pool_shutdown();
     for (uint32_t i = 0; i < DS4_ROCM_STREAM_READ_WORKERS; i++) {
+        for (uint32_t b = 0; b < 2u; b++) {
+            if (g_stream_read_upload_pending[i][b]) {
+                (void)cudaEventSynchronize(g_stream_read_upload_events[i][b]);
+                g_stream_read_upload_pending[i][b] = 0;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < DS4_ROCM_STREAM_READ_WORKERS; i++) {
         if (g_stream_read_stage_raw[i]) {
             (void)cudaFreeHost(g_stream_read_stage_raw[i]);
             g_stream_read_stage_raw[i] = NULL;
             g_stream_read_stage_bytes[i] = 0;
+        }
+        if (g_stream_read_stage2_raw[i]) {
+            (void)cudaFreeHost(g_stream_read_stage2_raw[i]);
+            g_stream_read_stage2_raw[i] = NULL;
+            g_stream_read_stage2_bytes[i] = 0;
         }
     }
     for (uint32_t i = 0; i < DS4_ROCM_STREAM_READ_WORKERS; i++) {
         if (g_stream_read_upload_streams[i]) {
             (void)cudaStreamDestroy(g_stream_read_upload_streams[i]);
             g_stream_read_upload_streams[i] = NULL;
+        }
+        for (uint32_t b = 0; b < 2u; b++) {
+            if (g_stream_read_upload_events[i][b]) {
+                (void)cudaEventDestroy(g_stream_read_upload_events[i][b]);
+                g_stream_read_upload_events[i][b] = NULL;
+            }
         }
     }
 }
@@ -1964,6 +1997,8 @@ typedef struct cuda_stream_read_job {
     int uploaded;
     int errnum;
     int direct;
+    uint32_t chunks_left;   /* task mode: tasks of this job not yet finished */
+    int chunk_failed;
 } cuda_stream_read_job;
 
 struct cuda_stream_batch_selected_pending {
@@ -2228,6 +2263,168 @@ static int cuda_stream_read_job_upload(
     return 1;
 }
 
+/*
+ * Task mode (the default): the pool hands out tasks rather than jobs.  A task
+ * is a job, or one chunk of it when DS4_ROCM_STREAM_READ_CHUNK_KB is set, so
+ * a single expert miss can engage more than three workers.  With the async
+ * upload (DS4_ROCM_STREAM_READ_ASYNC_UPLOAD, default on) each worker has two
+ * pinned stage buffers: it enqueues the H2D copy of one, records an event on
+ * its own upload stream and reads the next task into the other, waiting on a
+ * buffer's event only before reusing that buffer.  The job-set waiter waits
+ * on every outstanding upload event before it returns, so callers still see
+ * uploaded data exactly as before.  DS4_ROCM_STREAM_READ_ASYNC_UPLOAD=0 with
+ * no chunking runs the original synchronous worker loop.
+ */
+static int cuda_stream_read_task_mode(void) {
+    if (g_stream_read_async_upload < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_READ_ASYNC_UPLOAD");
+        g_stream_read_async_upload =
+            (env != NULL && strcmp(env, "0") == 0) ? 0 : 1;
+        const char *chunk = getenv("DS4_ROCM_STREAM_READ_CHUNK_KB");
+        g_stream_read_chunk_bytes = 0;
+        if (chunk && chunk[0]) {
+            char *end = NULL;
+            errno = 0;
+            const unsigned long kb = strtoul(chunk, &end, 10);
+            if (end != chunk && errno == 0 && kb >= 256u && kb <= 1048576u) {
+                g_stream_read_chunk_bytes = cuda_round_up((uint64_t)kb * 1024u, 65536u);
+            }
+        }
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming reader async_upload=%d chunk=%llu KiB\n",
+                g_stream_read_async_upload,
+                (unsigned long long)(g_stream_read_chunk_bytes / 1024u));
+    }
+    return g_stream_read_async_upload || g_stream_read_chunk_bytes != 0;
+}
+
+/* Read [file_off, file_off+bytes) into stage; *buf_out points at the data. */
+static int cuda_stream_read_range(void *stage,
+                                  uint64_t stage_bytes,
+                                  uint64_t file_off,
+                                  uint64_t bytes,
+                                  void **buf_out,
+                                  int *direct_out,
+                                  int *errnum_out) {
+    *buf_out = stage;
+    *direct_out = 0;
+    *errnum_out = 0;
+    if (!stage || bytes == 0 || g_model_fd < 0) {
+        *errnum_out = EINVAL;
+        return 0;
+    }
+#if defined(__linux__) && defined(O_DIRECT)
+    if (!cuda_stream_read_direct_disabled() &&
+        g_model_direct_fd >= 0 &&
+        g_model_direct_align > 1 &&
+        g_model_file_size != 0) {
+        const uint64_t aligned_off = cuda_round_down(file_off, g_model_direct_align);
+        const uint64_t delta = file_off - aligned_off;
+        const uint64_t read_size =
+            cuda_round_up(delta + bytes, g_model_direct_align);
+        if (read_size <= stage_bytes &&
+            aligned_off <= g_model_file_size &&
+            read_size <= g_model_file_size - aligned_off &&
+            cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)) {
+            *buf_out = (char *)stage + delta;
+            *direct_out = 1;
+            return 1;
+        }
+    }
+#endif
+    if (bytes <= stage_bytes && cuda_pread_full(g_model_fd, stage, bytes, file_off)) {
+        return 1;
+    }
+    *errnum_out = errno ? errno : EIO;
+    return 0;
+}
+
+static void cuda_stream_read_worker_task(uint32_t worker_id,
+                                         cuda_stream_read_job *job,
+                                         const cuda_stream_read_task &task,
+                                         uint32_t buf) {
+    const int profile = g_stream_read_profile_enabled == 1;
+    const int async = g_stream_read_async_upload == 1;
+    void *stage = buf ? g_stream_read_stage2_raw[worker_id] :
+                        g_stream_read_stage_raw[worker_id];
+    const uint64_t stage_bytes = buf ? g_stream_read_stage2_bytes[worker_id] :
+                                       g_stream_read_stage_bytes[worker_id];
+    cudaStream_t stream = g_stream_read_upload_streams[worker_id];
+    int ok = 1;
+    int errnum = 0;
+    if (async && g_stream_read_upload_pending[worker_id][buf]) {
+        /* The previous upload out of this buffer must land before reuse. */
+        cudaError_t err =
+            cudaEventSynchronize(g_stream_read_upload_events[worker_id][buf]);
+        g_stream_read_upload_pending[worker_id][buf] = 0;
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            ok = 0;
+            errnum = EIO;
+        }
+    }
+    const double read_t0 = profile ? cuda_wall_sec() : 0.0;
+    void *host_buf = NULL;
+    int direct = 0;
+    if (ok) {
+        ok = cuda_stream_read_range(stage, stage_bytes,
+                                    job->offset + task.rel, task.bytes,
+                                    &host_buf, &direct, &errnum);
+    }
+    const double upload_t0 = profile ? cuda_wall_sec() : 0.0;
+    if (ok) {
+        cudaError_t err = stream ?
+            cudaMemcpyAsync(job->dst + task.rel, host_buf, (size_t)task.bytes,
+                            cudaMemcpyHostToDevice, stream) :
+            cudaErrorInvalidValue;
+        if (err == cudaSuccess) {
+            if (async) {
+                err = cudaEventRecord(g_stream_read_upload_events[worker_id][buf], stream);
+                if (err == cudaSuccess) g_stream_read_upload_pending[worker_id][buf] = 1;
+            } else {
+                err = cudaStreamSynchronize(stream);
+            }
+        }
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming read-worker upload failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            ok = 0;
+            errnum = EIO;
+        }
+        if (ok && !direct) cuda_model_drop_file_pages(job->offset + task.rel, task.bytes);
+    }
+    const double t_end = profile ? cuda_wall_sec() : 0.0;
+
+    pthread_mutex_lock(&g_stream_read_mutex);
+    if (profile) {
+        g_stream_read_profile_bytes += task.bytes;
+        g_stream_read_profile_read_us += cuda_stream_read_profile_us(upload_t0 - read_t0);
+        g_stream_read_profile_upload_us += cuda_stream_read_profile_us(t_end - upload_t0);
+    }
+    if (!ok) {
+        job->chunk_failed = 1;
+        job->errnum = errnum ? errnum : EIO;
+    }
+    if (job->chunks_left > 0 && --job->chunks_left == 0) {
+        job->ok = job->chunk_failed ? 0 : 1;
+        /* Uploaded by the worker (async ones are waited for by the waiter);
+         * page-cache drops are already done per chunk. */
+        job->uploaded = job->ok;
+        job->direct = 1;
+        job->host_raw = NULL;
+        job->host_buf = NULL;
+        if (profile) g_stream_read_profile_jobs++;
+        if (!job->ok) g_stream_read_active_ok = 0;
+    }
+    g_stream_read_active_done++;
+    if (g_stream_read_active_done >= g_stream_read_active_count) {
+        pthread_cond_signal(&g_stream_read_done_cond);
+    }
+    pthread_mutex_unlock(&g_stream_read_mutex);
+}
+
 static void *cuda_stream_read_worker(void *arg) {
     const uint32_t worker_id = arg ? *(const uint32_t *)arg : 0u;
     (void)cudaSetDevice(0);
@@ -2241,6 +2438,16 @@ static void *cuda_stream_read_worker(void *arg) {
         if (g_stream_read_pool_stop) {
             pthread_mutex_unlock(&g_stream_read_mutex);
             break;
+        }
+        if (g_stream_read_active_tasks && worker_id < DS4_ROCM_STREAM_READ_WORKERS) {
+            const cuda_stream_read_task task =
+                g_stream_read_tasks[g_stream_read_active_next++];
+            cuda_stream_read_job *job = &g_stream_read_active_jobs[task.job];
+            const uint32_t buf = g_stream_read_stage_next[worker_id];
+            if (g_stream_read_async_upload == 1) g_stream_read_stage_next[worker_id] = buf ^ 1u;
+            pthread_mutex_unlock(&g_stream_read_mutex);
+            cuda_stream_read_worker_task(worker_id, job, task, buf);
+            continue;
         }
         const uint32_t idx = g_stream_read_active_next++;
         cuda_stream_read_job *job = &g_stream_read_active_jobs[idx];
@@ -2331,6 +2538,26 @@ static int cuda_stream_read_upload_streams_ensure(void) {
             return 0;
         }
     }
+    if (cuda_stream_read_task_mode() && g_stream_read_async_upload == 1) {
+        for (uint32_t i = 0; i < workers; i++) {
+            for (uint32_t b = 0; b < 2u; b++) {
+                if (g_stream_read_upload_events[i][b]) continue;
+                cudaError_t err = cudaEventCreateWithFlags(
+                        &g_stream_read_upload_events[i][b],
+                        cudaEventDisableTiming);
+                if (err != cudaSuccess) {
+                    fprintf(stderr,
+                            DS4_GPU_LOG_PREFIX "streaming read upload event creation failed: %s\n",
+                            cudaGetErrorString(err));
+                    (void)cudaGetLastError();
+                    g_stream_read_upload_events[i][b] = NULL;
+                    /* Fall back to synchronous uploads. */
+                    g_stream_read_async_upload = 0;
+                    return 1;
+                }
+            }
+        }
+    }
     return 1;
 }
 
@@ -2405,6 +2632,9 @@ static int cuda_stream_read_jobs_prepare(cuda_stream_read_job *jobs, uint32_t co
     if (!jobs || count == 0) return 1;
     if (count > DS4_ROCM_STREAM_READ_MAX_JOBS) return 0;
 
+    const int task_mode = cuda_stream_read_task_mode();
+    const uint64_t chunk = g_stream_read_chunk_bytes;
+    if (task_mode) g_stream_read_tasks.clear();
     uint64_t max_bytes = 0;
     for (uint32_t i = 0; i < count; i++) {
         jobs[i].ok = 0;
@@ -2413,7 +2643,26 @@ static int cuda_stream_read_jobs_prepare(cuda_stream_read_job *jobs, uint32_t co
         jobs[i].direct = 0;
         jobs[i].host_raw = NULL;
         jobs[i].host_buf = NULL;
-        if (jobs[i].bytes > max_bytes) max_bytes = jobs[i].bytes;
+        jobs[i].chunks_left = 0;
+        jobs[i].chunk_failed = 0;
+        if (task_mode) {
+            if (jobs[i].bytes == 0 || !jobs[i].dst) {
+                /* Fails exactly like the job loop did (EINVAL). */
+                jobs[i].chunks_left = 1;
+                g_stream_read_tasks.push_back({i, 0, jobs[i].bytes});
+                continue;
+            }
+            for (uint64_t rel = 0; rel < jobs[i].bytes;) {
+                uint64_t n = jobs[i].bytes - rel;
+                if (chunk != 0 && n > chunk) n = chunk;
+                g_stream_read_tasks.push_back({i, rel, n});
+                jobs[i].chunks_left++;
+                if (n > max_bytes) max_bytes = n;
+                rel += n;
+            }
+        } else if (jobs[i].bytes > max_bytes) {
+            max_bytes = jobs[i].bytes;
+        }
     }
     /* Slack so direct reads can align their offset and length. */
     if (g_model_direct_align > 1u &&
@@ -2423,6 +2672,27 @@ static int cuda_stream_read_jobs_prepare(cuda_stream_read_job *jobs, uint32_t co
 
     const uint32_t workers = g_stream_read_pool_started ?
         g_stream_read_pool_workers : cuda_stream_read_worker_count();
+    for (uint32_t i = 0; task_mode && g_stream_read_async_upload == 1 && i < workers; i++) {
+        if (g_stream_read_stage2_bytes[i] < max_bytes) {
+            if (g_stream_read_stage2_raw[i]) {
+                (void)cudaFreeHost(g_stream_read_stage2_raw[i]);
+                g_stream_read_stage2_raw[i] = NULL;
+                g_stream_read_stage2_bytes[i] = 0;
+            }
+            cudaError_t err = cudaMallocHost(&g_stream_read_stage2_raw[i],
+                                             (size_t)max_bytes);
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX "streaming read pinned allocation failed "
+                        "(%.2f MiB): %s\n",
+                        (double)max_bytes / 1048576.0,
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return 0;
+            }
+            g_stream_read_stage2_bytes[i] = max_bytes;
+        }
+    }
     for (uint32_t i = 0; i < workers; i++) {
         if (g_stream_read_stage_bytes[i] < max_bytes) {
             if (g_stream_read_stage_raw[i]) {
@@ -2468,7 +2738,9 @@ static int cuda_stream_read_jobs_start(cuda_stream_read_job *jobs, uint32_t coun
     }
     cuda_stream_read_profile_note_jobs(jobs, count);
     g_stream_read_active_jobs = jobs;
-    g_stream_read_active_count = count;
+    g_stream_read_active_tasks = cuda_stream_read_task_mode();
+    g_stream_read_active_count = g_stream_read_active_tasks ?
+        (uint32_t)g_stream_read_tasks.size() : count;
     g_stream_read_active_next = 0;
     g_stream_read_active_done = 0;
     g_stream_read_active_ok = 1;
@@ -2491,6 +2763,25 @@ static int cuda_stream_read_jobs_wait(cuda_stream_read_job *jobs, uint32_t count
     }
     while (g_stream_read_active_done < g_stream_read_active_count) {
         pthread_cond_wait(&g_stream_read_done_cond, &g_stream_read_mutex);
+    }
+    if (g_stream_read_active_tasks && g_stream_read_async_upload == 1) {
+        /* Every task is read and its upload enqueued; the workers are idle
+         * until the next job set, so their upload events are stable here. */
+        for (uint32_t w = 0; w < g_stream_read_pool_workers; w++) {
+            for (uint32_t b = 0; b < 2u; b++) {
+                if (!g_stream_read_upload_pending[w][b]) continue;
+                cudaError_t err = cudaEventSynchronize(g_stream_read_upload_events[w][b]);
+                g_stream_read_upload_pending[w][b] = 0;
+                if (err != cudaSuccess) {
+                    fprintf(stderr,
+                            DS4_GPU_LOG_PREFIX "streaming read upload wait failed: %s\n",
+                            cudaGetErrorString(err));
+                    (void)cudaGetLastError();
+                    g_stream_read_active_ok = 0;
+                    for (uint32_t i = 0; i < count; i++) jobs[i].uploaded = 0;
+                }
+            }
+        }
     }
     const int pool_ok = g_stream_read_active_ok;
     g_stream_read_active_jobs = NULL;

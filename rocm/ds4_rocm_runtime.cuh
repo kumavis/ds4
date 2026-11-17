@@ -131,6 +131,7 @@ struct cuda_stream_resident_expert {
     char *down;
     uint64_t bytes;
     uint64_t last_used;
+    uint64_t serial;    /* unique per admission; identifies eviction-heap nodes */
     int pooled;
 };
 
@@ -316,6 +317,34 @@ static cuda_stream_cache_layer_stats
 static int g_stream_cache_stats_enabled = -1;
 static int g_stream_cache_layer_stats_enabled = -1;
 static int g_stream_evict_past_layers_first_enabled = -1;
+/*
+ * Popularity-EMA eviction (DS4_ROCM_STREAM_EVICT=pop, the default; =lru keeps
+ * the original linear-scan LRU).  Every (layer, expert) key carries
+ *   p = (P*p + count) / (P + T)
+ * updated once per routed pass of T rows, P = DS4_ROCM_STREAM_EVICT_POP_PRIOR
+ * pseudo-tokens (default 96), p0 = 6/384.  The decay of all keys is kept in a
+ * single global scale (p = s * g), so an observation only raises the s of the
+ * routed keys and the order of all keys is the order of s.  Victims come from
+ * a lazy min-heap over (s, last_used): touches never update the heap; a node
+ * whose recorded key is stale is re-pushed when it surfaces (keys only grow,
+ * so a node that is current when it reaches the top is the true minimum).
+ * ds4 has no cache-conditional routing, so this changes residency only.
+ */
+struct cuda_stream_evict_node {
+    double s;
+    uint64_t last_used;
+    uint64_t serial;
+    cuda_stream_resident_key key;
+};
+static int g_stream_evict_policy = -1;          /* 0 = lru, 1 = popularity */
+static double g_stream_pop_prior = 96.0;
+static double g_stream_pop_scale = 1.0;
+static std::vector<double> g_stream_pop_s;
+static uint32_t g_stream_pop_last_layer = UINT32_MAX;
+static uint64_t g_stream_pop_passes;
+static uint64_t g_stream_resident_serial;
+static std::vector<cuda_stream_evict_node> g_stream_evict_heap;
+static std::vector<cuda_stream_evict_node> g_stream_evict_stash;
 static int32_t g_routed_moe_selected_override[DS4_ROCM_N_EXPERT_USED];
 static uint32_t g_routed_moe_selected_override_n;
 static cudaEvent_t g_stream_selected_reuse_event;
@@ -679,6 +708,7 @@ static void cuda_stream_resident_cache_release(void) {
     }
     g_stream_resident_experts.clear();
     g_stream_resident_index.clear();
+    g_stream_evict_heap.clear();
     g_stream_resident_bytes = 0;
     g_stream_resident_clock = 0;
     for (cuda_stream_expert_slab &slab : g_stream_expert_slabs) {
@@ -1496,10 +1526,171 @@ static int cuda_stream_resident_evict_at(size_t idx) {
     return 1;
 }
 
+static int cuda_stream_evict_policy_pop(void) {
+    if (g_stream_evict_policy < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_EVICT");
+        g_stream_evict_policy =
+            (env != NULL && strcmp(env, "lru") == 0) ? 0 : 1;
+        const char *prior = getenv("DS4_ROCM_STREAM_EVICT_POP_PRIOR");
+        if (prior && prior[0]) {
+            char *end = NULL;
+            const double v = strtod(prior, &end);
+            if (end != prior && v >= 1.0 && v <= 1.0e6) g_stream_pop_prior = v;
+        }
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming expert cache eviction policy=%s prior=%.0f\n",
+                g_stream_evict_policy ? "popularity" : "lru",
+                g_stream_pop_prior);
+    }
+    return g_stream_evict_policy;
+}
+
+static double *cuda_stream_pop_s_ptr(uint32_t layer, int32_t expert) {
+    if (expert < 0 || (uint32_t)expert >= DS4_ROCM_MAX_N_EXPERT ||
+        layer >= 4096u) {
+        return NULL;
+    }
+    const size_t idx = (size_t)layer * DS4_ROCM_MAX_N_EXPERT + (size_t)expert;
+    if (idx >= g_stream_pop_s.size()) {
+        /* p0 = 6/384 at scale 1; renormalisations keep s*g of unseen keys. */
+        const size_t want = ((size_t)layer + 1u) * DS4_ROCM_MAX_N_EXPERT;
+        g_stream_pop_s.resize(want, (6.0 / 384.0) / g_stream_pop_scale);
+    }
+    return &g_stream_pop_s[idx];
+}
+
+static double cuda_stream_pop_s(uint32_t layer, int32_t expert) {
+    const double *p = cuda_stream_pop_s_ptr(layer, expert);
+    return p ? *p : 0.0;
+}
+
+static bool cuda_stream_evict_node_less(const cuda_stream_evict_node &a,
+                                        const cuda_stream_evict_node &b) {
+    if (a.s != b.s) return a.s < b.s;
+    return a.last_used < b.last_used;
+}
+
+/* std heap algorithms build a max-heap; invert to keep the minimum on top. */
+static bool cuda_stream_evict_node_heap_cmp(const cuda_stream_evict_node &a,
+                                            const cuda_stream_evict_node &b) {
+    return cuda_stream_evict_node_less(b, a);
+}
+
+static void cuda_stream_evict_heap_push(const cuda_stream_resident_expert &e) {
+    cuda_stream_evict_node n;
+    n.s = cuda_stream_pop_s(e.layer, e.expert);
+    n.last_used = e.last_used;
+    n.serial = e.serial;
+    n.key = cuda_stream_resident_entry_key(e);
+    g_stream_evict_heap.push_back(n);
+    std::push_heap(g_stream_evict_heap.begin(), g_stream_evict_heap.end(),
+                   cuda_stream_evict_node_heap_cmp);
+}
+
+static void cuda_stream_evict_heap_pop(void) {
+    std::pop_heap(g_stream_evict_heap.begin(), g_stream_evict_heap.end(),
+                  cuda_stream_evict_node_heap_cmp);
+    g_stream_evict_heap.pop_back();
+}
+
+/*
+ * One routed pass (T rows) of `layer` chose these experts.  A new pass starts
+ * whenever the layer index does not increase; the global decay is applied
+ * then, so every layer of a pass sees the same scale.
+ */
+static void cuda_stream_pop_observe(uint32_t layer,
+                                    const int32_t *ids,
+                                    uint32_t n_ids,
+                                    uint32_t n_rows) {
+    if (!cuda_stream_evict_policy_pop() || !ids || n_ids == 0 || n_rows == 0) {
+        return;
+    }
+    const double P = g_stream_pop_prior;
+    const double T = (double)n_rows;
+    if (g_stream_pop_last_layer == UINT32_MAX || layer <= g_stream_pop_last_layer) {
+        g_stream_pop_scale *= P / (P + T);
+        g_stream_pop_passes++;
+        if (g_stream_pop_scale < 1.0e-100) {
+            const double g = g_stream_pop_scale;
+            for (double &s : g_stream_pop_s) s *= g;
+            for (cuda_stream_evict_node &n : g_stream_evict_heap) n.s *= g;
+            for (cuda_stream_evict_node &n : g_stream_evict_stash) n.s *= g;
+            g_stream_pop_scale = 1.0;
+        }
+    }
+    g_stream_pop_last_layer = layer;
+    const double inc = 1.0 / ((P + T) * g_stream_pop_scale);
+    for (uint32_t i = 0; i < n_ids; i++) {
+        double *s = cuda_stream_pop_s_ptr(layer, ids[i]);
+        if (s) *s += inc;
+    }
+}
+
+static int cuda_stream_resident_evict_one_pop(
+        uint32_t layer,
+        const int32_t *selected_ids,
+        uint32_t n_selected) {
+    g_stream_evict_stash.clear();
+    size_t victim = (size_t)-1;
+    int rebuilt = 0;
+    for (;;) {
+        if (g_stream_evict_heap.empty()) {
+            /* Only reachable if entries were admitted without a node. */
+            if (rebuilt || g_stream_resident_experts.empty()) break;
+            rebuilt = 1;
+            for (const cuda_stream_resident_expert &e : g_stream_resident_experts) {
+                cuda_stream_evict_heap_push(e);
+            }
+            /* The stash holds excluded entries that are pushed again below. */
+            g_stream_evict_stash.clear();
+            continue;
+        }
+        const cuda_stream_evict_node top = g_stream_evict_heap.front();
+        const auto it = g_stream_resident_index.find(top.key);
+        if (it == g_stream_resident_index.end() ||
+            it->second >= g_stream_resident_experts.size() ||
+            g_stream_resident_experts[it->second].serial != top.serial) {
+            cuda_stream_evict_heap_pop();           /* dead node */
+            continue;
+        }
+        const size_t idx = it->second;
+        const cuda_stream_resident_expert &e = g_stream_resident_experts[idx];
+        const double cur_s = cuda_stream_pop_s(e.layer, e.expert);
+        if (cur_s != top.s || e.last_used != top.last_used) {
+            cuda_stream_evict_heap_pop();           /* stale: re-file at its key */
+            cuda_stream_evict_heap_push(e);
+            continue;
+        }
+        cuda_stream_evict_heap_pop();
+        if (cuda_stream_selected_is_current(e, layer, selected_ids, n_selected)) {
+            g_stream_evict_stash.push_back(top);
+            continue;
+        }
+        victim = idx;
+        g_stream_evict_stash.push_back(top);    /* restored if eviction fails */
+        break;
+    }
+    int ok = 0;
+    if (victim != (size_t)-1) {
+        ok = cuda_stream_resident_evict_at(victim);
+        if (ok) g_stream_evict_stash.pop_back();
+    }
+    for (const cuda_stream_evict_node &n : g_stream_evict_stash) {
+        g_stream_evict_heap.push_back(n);
+        std::push_heap(g_stream_evict_heap.begin(), g_stream_evict_heap.end(),
+                       cuda_stream_evict_node_heap_cmp);
+    }
+    g_stream_evict_stash.clear();
+    return ok;
+}
+
 static int cuda_stream_resident_evict_one(
         uint32_t layer,
         const int32_t *selected_ids,
         uint32_t n_selected) {
+    if (cuda_stream_evict_policy_pop()) {
+        return cuda_stream_resident_evict_one_pop(layer, selected_ids, n_selected);
+    }
     size_t victim = (size_t)-1;
     uint64_t oldest = UINT64_MAX;
     if (cuda_stream_evict_past_layers_first()) {
@@ -1748,10 +1939,12 @@ static int cuda_stream_resident_alloc(
     e.down = e.base + 2u * gate_expert_bytes;
     e.bytes = bytes;
     e.last_used = ++g_stream_resident_clock;
+    e.serial = ++g_stream_resident_serial;
     e.pooled = pooled;
     g_stream_resident_experts.push_back(e);
     g_stream_resident_index[cuda_stream_resident_entry_key(e)] =
         g_stream_resident_experts.size() - 1u;
+    if (cuda_stream_evict_policy_pop()) cuda_stream_evict_heap_push(e);
     g_stream_resident_bytes += bytes;
     if (cuda_stream_cache_stats_on()) {
         g_stream_cache_stats.allocs++;
@@ -3178,6 +3371,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
         n_ids64 > SIZE_MAX / sizeof(int32_t)) {
         return 0;
     }
+    cuda_stream_pop_observe(layer, ids, (uint32_t)n_ids64, n_tokens);
     int32_t *compact_ids = (int32_t *)malloc((size_t)n_ids64 * sizeof(compact_ids[0]));
     if (!compact_ids) {
         free(compact_ids);
@@ -4121,6 +4315,7 @@ static int cuda_stream_selected_load(
         ls->selected_calls++;
         ls->selected_slots += n_selected;
     }
+    cuda_stream_pop_observe(layer, selected_ids, n_selected, 1u);
 
     cuda_stream_read_job read_jobs[DS4_ROCM_N_EXPERT_USED * 3u];
     memset(read_jobs, 0, sizeof(read_jobs));

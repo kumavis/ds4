@@ -41647,6 +41647,7 @@ static const char *const g_d0_tag[D0_NTAGS] = {
 typedef struct {
     uint32_t width, ndiff;
     float maxabs, maxref;
+    double sum_d2, sum_r2;  /* relative L2 = sqrt(sum_d2 / sum_r2) */
     bool have;
 } ds41_d0_cmp;
 static int g_d0_mode;            /* 0 idle, 1 capture batch, 2 compare scalar */
@@ -41714,7 +41715,9 @@ static void ds41_d0_put(int tag, uint32_t il, uint32_t row, const float *v, uint
     if (!ref || c->width != width) return;
     c->have = true;
     for (uint32_t i = 0; i < width; i++) {
+        c->sum_r2 += (double)v[i] * v[i];
         if (memcmp(&ref[i], &v[i], sizeof(float)) == 0) continue;
+        c->sum_d2 += ((double)ref[i] - v[i]) * ((double)ref[i] - v[i]);
         c->ndiff++;
         const float d = fabsf(ref[i] - v[i]);
         if (!(d <= c->maxabs)) c->maxabs = d;  /* NaN propagates */
@@ -41886,9 +41889,10 @@ static void ds41_d0_report(const int *tokens, uint32_t n, const float *batch_log
                 const ds41_d0_cmp *c = &g_d0_res[t][il][r];
                 if (!c->have) continue;
                 fprintf(stderr, "ds4: D0 tap round=%u row=%u layer=%u tag=%s "
-                        "ndiff=%u/%u maxabs=%.6g maxref=%.6g\n",
+                        "ndiff=%u/%u maxabs=%.6g maxref=%.6g rel_l2=%.3g\n",
                         g_d0_round, r, il, g_d0_tag[t], c->ndiff, c->width,
-                        (double)c->maxabs, (double)c->maxref);
+                        (double)c->maxabs, (double)c->maxref,
+                        c->sum_r2 > 0.0 ? sqrt(c->sum_d2 / c->sum_r2) : 0.0);
             }
     }
 }

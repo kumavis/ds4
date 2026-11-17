@@ -2211,13 +2211,16 @@ static int cuda_stream_read_job_upload(
  * uploaded bytes, and therefore all results, are identical.
  *
  * DS4_ROCM_STREAM_REPLICA_POLICY:
- *   split   (default) each job is cut in two halves (64 KiB-aligned) and each
- *           half goes to the drive with fewer bytes in flight.  One expert
- *           miss (3 jobs) then uses both drives evenly.
+ *   chunk   (default) DS4_ROCM_STREAM_REPLICA_CHUNK_KB pieces (default 1024,
+ *           at most 16 per job), each to the drive with fewer bytes in
+ *           flight.  Measured on MXFP4, two drives, identical output: 8.10 /
+ *           8.09 vs 7.78 / 7.82 tok/s for split on a short prompt, 7.70 /
+ *           7.69 vs 7.49 / 7.49 after a 1.4k prompt (k-pol-* runs).
+ *   split   each job is cut in two halves (64 KiB-aligned) and each half goes
+ *           to the drive with fewer bytes in flight.  One expert miss
+ *           (3 jobs) then uses both drives evenly.
  *   eft     whole jobs, each to the drive with fewer bytes in flight
  *   matrix  whole jobs, alternating drives
- *   chunk   DS4_ROCM_STREAM_REPLICA_CHUNK_KB pieces (default 1024, at most
- *           16 per job), each to the drive with fewer bytes in flight
  * DS4_ROCM_STREAM_REPLICA_WEIGHT (default 1.0) is the replica drive's speed
  * relative to the primary for the in-flight comparison.
  *
@@ -2251,7 +2254,7 @@ static int g_stream_replica_primary_set;
 static dev_t g_stream_replica_primary_dev;
 static ino_t g_stream_replica_primary_ino;
 static int g_stream_replica_match;
-static int g_stream_replica_policy = DS4_ROCM_REPLICA_SPLIT;
+static int g_stream_replica_policy = DS4_ROCM_REPLICA_CHUNK;
 static uint64_t g_stream_replica_chunk = 1048576u;
 static double g_stream_replica_weight = 1.0;
 static uint64_t g_stream_replica_rr;
@@ -2307,7 +2310,7 @@ static int cuda_stream_replica_env(void) {
             else if (!strcmp(pol, "chunk")) g_stream_replica_policy = DS4_ROCM_REPLICA_CHUNK;
             else {
                 fprintf(stderr,
-                        DS4_GPU_LOG_PREFIX "unknown DS4_ROCM_STREAM_REPLICA_POLICY=%s, using split\n",
+                        DS4_GPU_LOG_PREFIX "unknown DS4_ROCM_STREAM_REPLICA_POLICY=%s, using chunk\n",
                         pol);
             }
         }

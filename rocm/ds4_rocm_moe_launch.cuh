@@ -628,6 +628,18 @@ static int routed_moe_build_plan(
     return 1;
 }
 
+/* dspark-study: under SSD streaming, let a few MXFP4 rows (DSpark verify)
+ * use the batch union/pointer-table path with the one-token decode kernels'
+ * Indirect instantiations. DS4_ROCM_DSPARK_SSD_EXPERIMENT=1 only. */
+static int routed_moe_mxfp4_batch_stream_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_DSPARK_SSD_EXPERIMENT");
+        cached = env && env[0] == '1';
+    }
+    return cached;
+}
+
 static int routed_moe_full_table_is_cached(
         const void *model_map,
         uint64_t gate_offset,
@@ -760,7 +772,8 @@ static int routed_moe_launch(
         !full_table_cached &&
         !batch_stream_split_selected &&
         n_tokens > 1u &&
-        (iq2_gate_path || q2k_path) &&
+        (iq2_gate_path || q2k_path ||
+         (mxfp4_path && n_tokens <= 8u && routed_moe_mxfp4_batch_stream_enabled())) &&
         n_expert <= DS4_ROCM_N_EXPERT_USED &&
         cuda_stream_batch_selected_prepare(model_map,
                                            model_size,
@@ -1035,7 +1048,29 @@ static int routed_moe_launch(
         }
         if (ok && (batch_stream_selected || batch_stream_split_selected)) {
             dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
-            if (batch_stream_split_selected) {
+            if (mxfp4_path) {
+                /* Same kernel and per-(row, expert) arithmetic as one-token
+                 * decode; the slot table is indexed by the union index. */
+                dim3 mxgrid((expert_mid_dim + 7u) / 8u, pair_count, 1);
+                moe_gate_up_mid_decode_mxfp4_qwarp32_kernel<true><<<mxgrid, 256>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        (const char *)gate_slot_ptrs,
+                        (const char *)up_slot_ptrs,
+                        xq,
+                        (const int32_t *)selected_exec->ptr,
+                        (const float *)weights->ptr,
+                        0,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        write_gate_up,
+                        clamp);
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe streaming batch mxfp4 gate/up launch");
+            } else if (batch_stream_split_selected) {
                 if (stream_batch_resident_count != 0u) {
                     moe_gate_up_mid_qwarp32_ptrs_split_kernel<<<qgrid, 256>>>(
                             (float *)gate->ptr,
@@ -1113,7 +1148,21 @@ static int routed_moe_launch(
             }
             if (ok) {
                 dim3 dgrid((out_dim + 31u) / 32u, n_tokens, 1);
-                if (iq2_iq2_path) {
+                if (mxfp4_path) {
+                    dim3 mxgrid((out_dim + 7u) / 8u, n_tokens, 1);
+                    moe_down_mxfp4_sum6_qwarp32_kernel<true, true><<<mxgrid, 256>>>(
+                            (float *)out->ptr,
+                            (const char *)down_slot_ptrs,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            0,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe streaming batch mxfp4 down launch");
+                } else if (iq2_iq2_path) {
                     moe_down_iq2_sum_qwarp32_ptrs_batch_kernel<<<dgrid, 256>>>(
                             (float *)out->ptr,
                             down_slot_ptrs,

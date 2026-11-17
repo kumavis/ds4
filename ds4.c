@@ -42443,6 +42443,23 @@ static bool ds41_stream_selected_begin(ds41_gpu_graph *g, const ds4_model *m,
     return ds4_gpu_routed_moe_set_selected_override(selected, 6) &&
         ds4_gpu_stream_expert_cache_begin_selected_load(&table, selected, 6);
 }
+
+/* D2: the same begin, but the router ids come from the asynchronous readback
+ * started right after routing (ds4_gpu_selected_readback_start); the caller
+ * enqueued the shared expert in between, so the GPU runs it while the host
+ * waits for the router event (not a device drain) and starts the reads. */
+static bool ds41_stream_selected_finish_async(ds41_gpu_graph *g, const ds4_model *m,
+                                              const ds4_layer_weights *l, uint32_t il) {
+    (void)g;
+    ds4_gpu_stream_expert_table table;
+    int32_t selected[6];
+    if (!ds41_stream_table(m, l, il, &table) ||
+        !ds4_gpu_selected_readback_finish(selected, 6)) return false;
+    for (uint32_t i = 0; i < 6; i++)
+        if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT) return false;
+    return ds4_gpu_routed_moe_set_selected_override(selected, 6) &&
+        ds4_gpu_stream_expert_cache_begin_selected_load(&table, selected, 6);
+}
 #endif
 #ifdef DS4_ROCM_BUILD
 static bool ds41_rocm_shared_owner_enabled(void) {
@@ -42487,8 +42504,15 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             g->route_logits)) return false;
 #ifdef DS4_ROCM_BUILD
     /* Start expert I/O before enqueuing the independent shared expert. The
-     * routed consumer joins the matching compact table and upload event. */
-    if (g->streaming && !ds41_stream_selected_begin(g, m, l, il)) return false;
+     * routed consumer joins the matching compact table and upload event.
+     * D2 (DS4_ROCM_D2_DECODE, default on): the ids come back behind an event
+     * instead; the shared expert is enqueued first and the host then waits
+     * for the router event only.  Same kernels and inputs. */
+    const bool d2_async_readback = g->streaming && g->tp_world != 2 &&
+        ds4_gpu_d2_decode_mode() > 0;
+    if (d2_async_readback) {
+        if (!ds4_gpu_selected_readback_start(g->selected, 6)) return false;
+    } else if (g->streaming && !ds41_stream_selected_begin(g, m, l, il)) return false;
 #endif
     bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
@@ -42534,6 +42558,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                               DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
         !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
         !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
+#ifdef DS4_ROCM_BUILD
+    if (d2_async_readback && !ds41_stream_selected_finish_async(g, m, l, il)) return false;
+#endif
     bool routed_ok;
 #ifdef DS4_ROCM_BUILD
     if (g->tp_world == 2u) {
@@ -43124,9 +43151,65 @@ static bool ds41_moe_batch_overlap(ds41_gpu_graph *g, const ds4_model *m,
 }
 #endif
 
+#ifdef DS4_ROCM_BUILD
+/* D2 (DS4_ROCM_D2_VERIFY, default on): few-row MXFP4 batches under SSD
+ * streaming (DSpark verification rows).  Same kernels on the same inputs as
+ * the single-host path of ds41_moe_batch below; only the order of host work
+ * changes: the routed ids come back through an asynchronous readback, the
+ * shared expert is enqueued before the host waits for the router event, the
+ * union load starts the missing experts' reads without waiting, and the
+ * routed launch computes resident union slots while those reads run. */
+static bool ds41_moe_batch_d2_wanted(const ds41_gpu_graph *g, const ds4_layer_weights *l,
+                                     uint32_t count, bool shared_owner) {
+    return g->streaming && g->tp_world != 2 && !shared_owner &&
+        count >= 2u && count <= 6u &&
+        l->ffn_gate_exps && l->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
+        ds4_gpu_d2_verify_enabled();
+}
+
+static bool ds41_moe_batch_d2(ds41_gpu_graph *g, const ds4_model *m,
+                              const ds4_layer_weights *l, uint32_t il, uint32_t count) {
+    ds41_prefill_row *b = &g->batch;
+    const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
+    const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+    bool mid_f16 = false;
+    const uint32_t n_ids = count * DS4_N_EXPERT_USED;
+    int32_t ids[6u * 8u];
+    ds4_gpu_stream_expert_table table;
+    if (n_ids > sizeof(ids) / sizeof(ids[0]) ||
+        !ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) ||
+        !ds41_route_batch(g, m, l, count) ||
+        !ds4_gpu_selected_readback_start(b->selected, n_ids) ||
+        !ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) ||
+        !ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) ||
+        !ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+            count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
+        !ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) ||
+        !ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true) ||
+        !ds41_stream_table(m, l, il, &table) ||
+        !ds4_gpu_selected_readback_finish(ids, n_ids)) return false;
+    for (uint32_t i = 0; i < n_ids; i++)
+        if (ids[i] < 0 || (uint32_t)ids[i] >= DS4_N_EXPERT) return false;
+    return ds4_gpu_stream_expert_cache_begin_selected_batch(&table, ids, count,
+                                                            DS4_N_EXPERT_USED) &&
+        ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
+            il, count, &mid_f16, !g->verify_prefix) &&
+        ds41_sum_partial_batch(g, b->routed, il, DS4_TP_GATE_FFN, count);
+}
+#endif
+
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner) {
+#ifdef DS4_ROCM_BUILD
+    if (ds41_moe_batch_d2_wanted(g, l, count, shared_owner))
+        return ds41_moe_batch_d2(g, m, l, il, count);
+#endif
     ds41_prefill_row *b = &g->batch;
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);

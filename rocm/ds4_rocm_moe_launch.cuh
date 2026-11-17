@@ -818,9 +818,11 @@ static int routed_moe_mxfp4_decode_overlap_launch(
             gate, up, mid, gate_ptrs, up_ptrs, xq, selected, weights,
             gate_row_bytes, expert_in_dim, expert_mid_dim, n_expert,
             write_gate_up, clamp, list, n);
+    C1R(C1_MOE_GU_RES);
     uint32_t remaining = missing_mask;
     while (ok && remaining) {
         const uint32_t ready = cuda_stream_selected_overlap_wait(remaining) & remaining;
+        C1R(C1_MOE_READ_WAIT);
         if (!ready) break;
         n = 0;
         for (uint32_t i = 0; i < n_expert; i++) {
@@ -830,10 +832,12 @@ static int routed_moe_mxfp4_decode_overlap_launch(
                 gate, up, mid, gate_ptrs, up_ptrs, xq, selected, weights,
                 gate_row_bytes, expert_in_dim, expert_mid_dim, n_expert,
                 write_gate_up, clamp, list, n);
+        C1R(C1_MOE_GU_MISS);
         remaining &= ~ready;
     }
     /* All reads and uploads (down too) complete before any later launch. */
     if (!cuda_stream_selected_finish_pending_missing(0)) return 0;
+    C1R(C1_MOE_READ_WAIT);
     if (!ok) return 0;
     if (remaining) {
         n = 0;
@@ -844,10 +848,13 @@ static int routed_moe_mxfp4_decode_overlap_launch(
                 gate, up, mid, gate_ptrs, up_ptrs, xq, selected, weights,
                 gate_row_bytes, expert_in_dim, expert_mid_dim, n_expert,
                 write_gate_up, clamp, list, n)) return 0;
+        C1R(C1_MOE_GU_MISS);
     }
-    return routed_moe_mxfp4_ptrs_rows_tail_launch(out, mid, down_ptrs, midq, selected,
+    const int tail_ok = routed_moe_mxfp4_ptrs_rows_tail_launch(out, mid, down_ptrs, midq, selected,
                                                   down_row_bytes, expert_mid_dim, out_dim,
                                                   n_expert, 1u, 1);
+    C1R(C1_MOE_DOWN);
+    return tail_ok;
 }
 
 /* D2 (verify overlap): routed_moe_mxfp4_ptrs_rows_launch for a pending union
@@ -1452,6 +1459,7 @@ static int routed_moe_launch(
             q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         }
+        if (n_tokens == 1u) C1R(C1_MOE_PREP);
         if (zero_copy_overlap) {
             /* D2: resident-first single-token MXFP4 experts (see
              * routed_moe_mxfp4_decode_overlap_launch); the pending load is

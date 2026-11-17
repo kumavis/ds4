@@ -409,9 +409,47 @@ __device__ static DS4_ROCM_UNUSED void rope_tail_one_dev(float *x, uint32_t head
     }
 }
 
+/* C1 (DS4_ROCM_C1_NORM, default 1; 0 = old kernel): the 20480-wide HC norm
+ * with each thread's 80 inputs loaded before its in-order sum of squares.
+ * Same per-thread order and reduction tree: bitwise equal
+ * (tools/c1/c1_exact.cpp); 16.4 us -> 3.5 us per launch there. */
+template <uint32_t PER>
+__global__ static void c1_rms_norm_plain_pre_kernel(float *out, const float *x, uint32_t n, float eps) {
+    const float *xr = x;
+    float v[PER];
+#pragma unroll
+    for (uint32_t k = 0; k < PER; k++) v[k] = xr[threadIdx.x + k * 256u];
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t k = 0; k < PER; k++) sum += v[k] * v[k];
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+#pragma unroll
+    for (uint32_t k = 0; k < PER; k++) out[threadIdx.x + k * 256u] = v[k] * scale;
+}
+
+static int c1_norm_plain_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DS4_ROCM_C1_NORM");
+        mode = e && e[0] ? (atoi(e) != 0) : 1;
+    }
+    return mode;
+}
+
 extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
     if (!cuda_tensor_has_f32(out, n) || !cuda_tensor_has_f32(x, n)) return 0;
     if (n == 0u) return 1;
+    if (n == 20480u && c1_norm_plain_mode()) {
+        c1_rms_norm_plain_pre_kernel<80u><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, n, eps);
+        return cuda_ok(cudaGetLastError(), "C1 rms_norm_plain launch");
+    }
     rms_norm_plain_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }

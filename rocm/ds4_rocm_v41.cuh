@@ -1047,6 +1047,53 @@ __global__ static void v41_hc_ordered_prefetch_kernel(float *out,
     }
 }
 
+/* C1 (DS4_ROCM_C1_HC_PROJ: 0 old kernel, 1 step 64, 2 step 128 (default),
+ * 3 step 32): the same projection with every lane's 640-element chunk
+ * loaded STEP elements at a time (more loads in flight).
+ * Each lane still accumulates its chunk in the same element order with the
+ * same fused multiply-adds, and lane 0 adds the 32 lane partials in the
+ * same order, so the result is bitwise the old kernel's.  0 = old kernel. */
+template <unsigned STEP>
+__global__ static void c1_hc_ordered_wide_kernel(float *out,
+        const __half *weights, const float *input) {
+    constexpr unsigned width = 20480u, outputs = 24u, chunk = 640u;
+    static_assert(chunk % STEP == 0u, "step");
+    const unsigned lane = threadIdx.x, row = blockIdx.x, token = blockIdx.y;
+    const __half *w = weights + (uint64_t)row * width;
+    const float *x = input + (uint64_t)token * width;
+    __shared__ float partial[32];
+    float sum = 0.0f;
+    for (unsigned base = lane * chunk; base < (lane + 1u) * chunk; base += STEP) {
+        float ww[STEP], xx[STEP];
+#pragma unroll
+        for (unsigned u = 0; u < STEP; u += 2u) {
+            const float2 wp = __half22float2(*reinterpret_cast<const __half2 *>(w + base + u));
+            const float2 xp = *reinterpret_cast<const float2 *>(x + base + u);
+            ww[u] = wp.x; ww[u + 1u] = wp.y;
+            xx[u] = xp.x; xx[u + 1u] = xp.y;
+        }
+#pragma unroll
+        for (unsigned u = 0; u < STEP; u++) sum = __fmaf_rn(ww[u], xx[u], sum);
+    }
+    partial[lane] = sum;
+    __syncthreads();
+    if (lane == 0u) {
+        float total = 0.0f;
+        for (unsigned i = 0; i < 32u; i++) total += partial[i];
+        out[(uint64_t)token * outputs + row] = total;
+    }
+}
+
+static int c1_hc_proj_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DS4_ROCM_C1_HC_PROJ");
+        mode = e && e[0] ? atoi(e) : 2;
+        if (mode < 0 || mode > 3) mode = 2;
+    }
+    return mode;
+}
+
 extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                              uint64_t weight_offset, uint32_t width, uint32_t outputs,
                                              uint32_t rows, const ds4_gpu_tensor *in) {
@@ -1179,6 +1226,17 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
          * can be less aligned; retain the scalar kernel for those views. */
         if (((uintptr_t)w % alignof(__half2)) == 0u &&
             ((uintptr_t)in->ptr % alignof(float2)) == 0u) {
+            const int c1 = c1_hc_proj_mode();
+            if (c1 == 1)
+                c1_hc_ordered_wide_kernel<64u><<<dim3(outputs, rows), 32u>>>(
+                    (float *)out->ptr, w, (const float *)in->ptr);
+            else if (c1 == 2)
+                c1_hc_ordered_wide_kernel<128u><<<dim3(outputs, rows), 32u>>>(
+                    (float *)out->ptr, w, (const float *)in->ptr);
+            else if (c1 == 3)
+                c1_hc_ordered_wide_kernel<32u><<<dim3(outputs, rows), 32u>>>(
+                    (float *)out->ptr, w, (const float *)in->ptr);
+            else
             v41_hc_ordered_prefetch_kernel<<<dim3(outputs, rows), 32u>>>(
                 (float *)out->ptr, w, (const float *)in->ptr);
         } else {
@@ -1374,6 +1432,85 @@ __global__ static void v41_q8_f32_blocks4_kernel(float *out,
     }
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = ROUND_BF16 ? v41_bf16(acc) : acc;
+}
+
+/* C1 experiment (DS4_ROCM_C1_Q8_PIPE, default 0 = original kernel):
+ * v41_q8_f32_blocks4_kernel with the loads of U consecutive lane iterations
+ * issued before their arithmetic.  Same source-level order, but under
+ * -ffast-math the compiler reassociates it differently: NOT bitwise equal
+ * (tools/c1/c1_exact.cpp) and no faster (the original already reads at
+ * 200-213 GB/s), so it stays off. */
+template<bool ROUND_BF16, uint32_t U>
+__global__ static void c1_q8_f32_blocks4_pipe_kernel(float *out,
+        const unsigned char *weights, const float *input,
+        uint32_t width, uint32_t outputs, uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t token = blockIdx.y;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (row >= outputs) return;
+    input += (uint64_t)token * width;
+    out += (uint64_t)token * outputs;
+    const uint32_t blocks = width / 32u;
+    const uint32_t j = (lane & 7u) * 4u;
+    const unsigned char *rowp = weights + row * row_bytes;
+    float acc = 0.0f;
+    uint32_t b = lane / 8u;
+    for (; b + 4u * (U - 1u) < blocks; b += 4u * U) {
+        float d[U], wq[U][4], xv[U][4];
+#pragma unroll
+        for (uint32_t u = 0; u < U; u++) {
+            const unsigned char *p = rowp + (uint64_t)(b + 4u * u) * 34u;
+            d[u] = q8_0_scale_scalar(p);
+#pragma unroll
+            for (uint32_t k = 0; k < 4u; k++) {
+                wq[u][k] = (float)((const int8_t *)(p + 2u))[j + k];
+                xv[u][k] = input[(b + 4u * u) * 32u + j + k];
+            }
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < U; u++) {
+            float value = 0.0f;
+#pragma unroll
+            for (uint32_t k = 0; k < 4u; k++) value += wq[u][k] * xv[u][k];
+            acc += d[u] * value;
+        }
+    }
+    for (; b < blocks; b += 4u) {
+        const unsigned char *p = rowp + (uint64_t)b * 34u;
+        const float d = q8_0_scale_scalar(p);
+        float value = 0.0f;
+#pragma unroll
+        for (uint32_t k = 0; k < 4u; k++)
+            value += (float)((const int8_t *)(p + 2u))[j + k] * input[b * 32u + j + k];
+        acc += d * value;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = ROUND_BF16 ? v41_bf16(acc) : acc;
+}
+
+static int c1_q8_pipe_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DS4_ROCM_C1_Q8_PIPE");
+        mode = e && e[0] ? atoi(e) : 0;  /* not bitwise: off (see C1.md) */
+        if (mode < 0 || mode > 2) mode = 0;
+    }
+    return mode;
+}
+
+template<bool ROUND_BF16>
+static void c1_q8_blocks4_launch(float *out, const unsigned char *weights, const float *input,
+                                 uint32_t width, uint32_t outputs, uint64_t row_bytes) {
+    const int mode = c1_q8_pipe_mode();
+    if (mode == 1)
+        c1_q8_f32_blocks4_pipe_kernel<ROUND_BF16, 4u><<<(outputs + 7u) / 8u, 256u>>>(
+            out, weights, input, width, outputs, row_bytes);
+    else if (mode == 2)
+        c1_q8_f32_blocks4_pipe_kernel<ROUND_BF16, 8u><<<(outputs + 7u) / 8u, 256u>>>(
+            out, weights, input, width, outputs, row_bytes);
+    else
+        v41_q8_f32_blocks4_kernel<ROUND_BF16><<<(outputs + 7u) / 8u, 256u>>>(
+            out, weights, input, width, outputs, row_bytes);
 }
 
 /* DSpark verifies two to six consecutive rows.  Reuse each packed Q8 block
@@ -1581,7 +1718,7 @@ static int v41_q8_projection_rows(ds4_gpu_tensor *out, const void *model_map, ui
             if (trace && !strcmp(trace, "1")) fprintf(stderr,
                 "V41_Q8_SMALL_BF16 rows=%u width=%u outputs=%u\n", rows, width, outputs);
             if (rows == 1u) {
-                v41_q8_f32_blocks4_kernel<true><<<(outputs + 7u) / 8u, 256u>>>(
+                c1_q8_blocks4_launch<true>(
                     (float *)out->ptr, weights, (const float *)in->ptr,
                     width, outputs, (uint64_t)(width / 32u) * 34u);
                 return cuda_ok(cudaGetLastError(), "V4.1 scalar Q8 fused BF16");
@@ -1592,7 +1729,7 @@ static int v41_q8_projection_rows(ds4_gpu_tensor *out, const void *model_map, ui
         }
     }
     if (rows == 1u && ds4_rocm_is_gfx1151()) {
-        v41_q8_f32_blocks4_kernel<<<(outputs + 7u) / 8u, 256u>>>(
+        c1_q8_blocks4_launch<false>(
             (float *)out->ptr, weights, (const float *)in->ptr,
             width, outputs, (uint64_t)(width / 32u) * 34u);
     } else if (rows <= 6u && ds4_rocm_is_gfx1151()) {
@@ -3019,6 +3156,45 @@ __global__ static void rms_norm_weight_bf16_kernel(float *out, const float *x, c
     }
 }
 
+/* C1 (DS4_ROCM_C1_NORM, default 1; 0 = old kernels): one-row RMS norms with
+ * each thread's PER = n/256 inputs loaded before its in-order sum of squares.
+ * Same per-thread order, same shared-memory tree, same output expression:
+ * bitwise equal (tools/c1/c1_exact.cpp), and the loads overlap instead of
+ * running as n/256 dependent round trips. */
+static int c1_norm_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DS4_ROCM_C1_NORM");
+        mode = e && e[0] ? (atoi(e) != 0) : 1;
+    }
+    return mode;
+}
+
+template <uint32_t PER>
+__global__ static void c1_rms_norm_weight_bf16_pre_kernel(float *out, const float *x, const float *w, uint32_t n, float eps) {
+    const float *xr = x;
+    float *orow = out;
+    float v[PER];
+#pragma unroll
+    for (uint32_t k = 0; k < PER; k++) v[k] = xr[threadIdx.x + k * 256u];
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t k = 0; k < PER; k++) sum += v[k] * v[k];
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+#pragma unroll
+    for (uint32_t k = 0; k < PER; k++) {
+        const uint32_t i = threadIdx.x + k * 256u;
+        orow[i] = v41_bf16(v[k] * scale * w[i]);
+    }
+}
+
 extern "C" int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
     uint64_t weight_bytes = 0;
     if (!model_map || !cuda_u64_mul_checked(n, sizeof(float), &weight_bytes) ||
@@ -3029,6 +3205,20 @@ extern "C" int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, 
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
+    if (rows == 1u && c1_norm_mode()) {
+        if (n == 5120u) {
+            c1_rms_norm_weight_bf16_pre_kernel<20u><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, eps);
+            return cuda_ok(cudaGetLastError(), "C1 norm BF16 launch");
+        }
+        if (n == 1280u) {
+            c1_rms_norm_weight_bf16_pre_kernel<5u><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, eps);
+            return cuda_ok(cudaGetLastError(), "C1 norm BF16 launch");
+        }
+        if (n == 512u) {
+            c1_rms_norm_weight_bf16_pre_kernel<2u><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, eps);
+            return cuda_ok(cudaGetLastError(), "C1 norm BF16 launch");
+        }
+    }
     rms_norm_weight_bf16_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "V4.1 norm BF16 launch");
 }

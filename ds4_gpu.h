@@ -479,6 +479,28 @@ int ds4_gpu_d2_decode_mode(void);
 int ds4_gpu_d2_verify_enabled(void);
 int ds4_gpu_selected_readback_start(const ds4_gpu_tensor *selected, uint32_t n_ids);
 int ds4_gpu_selected_readback_finish(int32_t *ids, uint32_t n_ids);
+/* D5 stage 1 (measurement only): DS4_ROCM_D5_TRACE=<path> appends one line
+ * per single-token selected expert load ("S layer id0..id5 miss_mask") and a
+ * one-time resident-cache snapshot to <path>.  ds4_gpu_d5_trace_on reports
+ * whether the trace is open; ds4_gpu_d5_trace_write appends one line (the
+ * early-router probe in ds4.c uses it).  Off (unset) costs one branch. */
+int ds4_gpu_d5_trace_on(void);
+void ds4_gpu_d5_trace_write(const char *line);
+/* D5 stage 2: speculative next-layer expert prefetch (ROCm SSD streaming,
+ * single-token decode).  ds4_gpu_d5_prefetch_mode: 0 = off (default; nothing
+ * of D5 runs), 1 = predictor p1 (DS4_ROCM_D5_PREFETCH=1|p1).  _k / _depth:
+ * DS4_ROCM_D5_K (1) and DS4_ROCM_D5_DEPTH (6).  ds4_gpu_d5_probe_readback_*:
+ * asynchronous D2H copy of n early-router logits behind an event (like D2's
+ * id readback).  ds4_gpu_d5_prefetch queues speculative reads of up to k of
+ * the candidates that are neither resident nor already on the shelf; the
+ * selected load adopts them.  Returns the number queued. */
+int ds4_gpu_d5_prefetch_mode(void);
+uint32_t ds4_gpu_d5_k(void);
+uint32_t ds4_gpu_d5_depth(void);
+int ds4_gpu_d5_probe_readback_start(const ds4_gpu_tensor *logits, uint32_t n);
+int ds4_gpu_d5_probe_readback_finish(float *out, uint32_t n);
+int ds4_gpu_d5_prefetch(const ds4_gpu_stream_expert_table *table,
+                        const int32_t *candidates, uint32_t n_candidates, uint32_t k);
 int ds4_gpu_stream_expert_cache_begin_selected_batch(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,

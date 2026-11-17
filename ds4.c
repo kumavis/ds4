@@ -42323,18 +42323,25 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
 #ifdef DS4_ROCM_BUILD
-    if (g->streaming) {
-        const ds4_gpu_stream_expert_table table = {
-            .model_map = m->map, .model_size = m->size, .layer = il,
-            .n_total_expert = DS4_N_EXPERT,
-            .gate_offset = l->ffn_gate_exps->abs_offset,
-            .up_offset = l->ffn_up_exps->abs_offset,
-            .down_offset = l->ffn_down_exps->abs_offset,
-            .gate_expert_bytes = gate_row * DS4_N_FF_EXP,
-            .down_expert_bytes = down_row * DS4_N_EMBD,
-        };
+    const ds4_gpu_stream_expert_table stream_table = {
+        .model_map = m->map, .model_size = m->size, .layer = il,
+        .n_total_expert = DS4_N_EXPERT,
+        .gate_offset = l->ffn_gate_exps->abs_offset,
+        .up_offset = l->ffn_up_exps->abs_offset,
+        .down_offset = l->ffn_down_exps->abs_offset,
+        .gate_expert_bytes = gate_row * DS4_N_FF_EXP,
+        .down_expert_bytes = down_row * DS4_N_EMBD,
+    };
+    /* Router ids come back behind an event; the shared expert below is
+     * enqueued before the host waits for them (DS4_ROCM_ROUTER_READBACK_SYNC=1
+     * restores the blocking readback here). */
+    const bool async_readback = g->streaming && g->tp_world != 2 &&
+        ds4_gpu_glm_selected_readback_async_enabled();
+    if (async_readback) {
+        if (!ds4_gpu_glm_selected_readback_start(g->selected, DS4_N_EXPERT_USED)) return false;
+    } else if (g->streaming) {
         if (!ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
-                &table, g->selected, DS4_N_EXPERT_USED)) return false;
+                &stream_table, g->selected, DS4_N_EXPERT_USED)) return false;
     }
 #endif
     const bool shared_split = shared_owner && shared_down && ds41_tp_shared_split() &&
@@ -42411,6 +42418,11 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
            !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
                                  DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f))) ||
          (shared_down && !(shared_split ? ds41_shared_down_half(g, m, l) : ds41_shared_down(g, m, l))))) return false;
+#ifdef DS4_ROCM_BUILD
+    if (async_readback &&
+        !ds4_gpu_glm_stream_expert_cache_finish_selected_readback(&stream_table, DS4_N_EXPERT_USED))
+        return false;
+#endif
     bool routed_ok;
     const ds4_gpu_tensor *selected = g->selected, *weights = g->route_weights;
     uint32_t n_used = DS4_N_EXPERT_USED;

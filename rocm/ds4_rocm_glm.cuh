@@ -2046,6 +2046,92 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
     return ds4_gpu_routed_moe_set_selected_override(ids, n_selected);
 }
 
+/*
+ * Asynchronous router readback.  The blocking variant above drains the
+ * default stream once per layer (a cudaMemcpy D2H) before the shared expert
+ * is even enqueued.  Here the copy goes to pinned memory behind an event on
+ * the default stream, the caller enqueues the shared expert, and only then
+ * does the host wait, for the router event alone.  The GPU runs the shared
+ * expert while the host reads the ids, starts the expert reads and waits
+ * for them.  Same kernels, same stream, same inputs: outputs are unchanged.
+ */
+static int32_t *g_glm_selected_readback_host;
+static cudaEvent_t g_glm_selected_readback_event;
+static uint32_t g_glm_selected_readback_n;
+static int g_glm_selected_readback_pending;
+
+extern "C" int ds4_gpu_glm_selected_readback_async_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_ROUTER_READBACK_SYNC");
+        enabled = (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 0 : 1;
+    }
+    return enabled;
+}
+
+extern "C" int ds4_gpu_glm_selected_readback_start(
+        const ds4_gpu_tensor *selected,
+        uint32_t n_selected) {
+    g_glm_selected_readback_pending = 0;
+    if (n_selected > DS4_ROCM_N_EXPERT_USED ||
+        (n_selected != 0u && !cuda_tensor_has_i32(selected, n_selected))) {
+        return 0;
+    }
+    if (!g_glm_selected_readback_host) {
+        cudaError_t err = cudaMallocHost((void **)&g_glm_selected_readback_host,
+                                         DS4_ROCM_N_EXPERT_USED * sizeof(int32_t));
+        if (err != cudaSuccess) {
+            g_glm_selected_readback_host = NULL;
+            (void)cudaGetLastError();
+            return cuda_ok(err, "router readback pinned allocation");
+        }
+    }
+    if (!g_glm_selected_readback_event &&
+        !cuda_ok(cudaEventCreateWithFlags(&g_glm_selected_readback_event,
+                                          cudaEventDisableTiming),
+                 "router readback event creation")) {
+        g_glm_selected_readback_event = NULL;
+        return 0;
+    }
+    if (n_selected != 0u &&
+        !cuda_ok(cudaMemcpyAsync(g_glm_selected_readback_host,
+                                 selected->ptr,
+                                 (size_t)n_selected * sizeof(int32_t),
+                                 cudaMemcpyDeviceToHost,
+                                 0),
+                 "router readback enqueue")) {
+        return 0;
+    }
+    if (!cuda_ok(cudaEventRecord(g_glm_selected_readback_event, 0),
+                 "router readback event record")) {
+        return 0;
+    }
+    g_glm_selected_readback_n = n_selected;
+    g_glm_selected_readback_pending = 1;
+    return 1;
+}
+
+extern "C" int ds4_gpu_glm_stream_expert_cache_finish_selected_readback(
+        const ds4_gpu_stream_expert_table *table,
+        uint32_t n_selected) {
+    if (!table || !g_glm_selected_readback_pending ||
+        g_glm_selected_readback_n != n_selected) {
+        g_glm_selected_readback_pending = 0;
+        return 0;
+    }
+    g_glm_selected_readback_pending = 0;
+    if (!cuda_ok(cudaEventSynchronize(g_glm_selected_readback_event),
+                 "router readback wait")) {
+        return 0;
+    }
+    int32_t ids[DS4_ROCM_N_EXPERT_USED] = {0};
+    for (uint32_t i = 0; i < n_selected; i++) ids[i] = g_glm_selected_readback_host[i];
+    if (!ds4_gpu_stream_expert_cache_begin_selected_load(table, ids, n_selected)) {
+        return 0;
+    }
+    return ds4_gpu_routed_moe_set_selected_override(ids, n_selected);
+}
+
 extern "C" int ds4_gpu_glm_rope_tail_tensor(
         ds4_gpu_tensor *x,
         uint32_t n_tokens,

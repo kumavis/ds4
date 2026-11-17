@@ -502,6 +502,20 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
         uint32_t                           n_selected);
+#ifdef DS4_ROCM_BUILD
+/* Asynchronous router readback (ROCm): _start enqueues a D2H copy of the
+ * selected ids into pinned memory and records an event; the caller enqueues
+ * independent work (the shared expert); _finish waits for that event only,
+ * then begins the selected load exactly as the blocking variant does.
+ * _async_enabled is 0 when DS4_ROCM_ROUTER_READBACK_SYNC is set. */
+int ds4_gpu_glm_selected_readback_async_enabled(void);
+int ds4_gpu_glm_selected_readback_start(
+        const ds4_gpu_tensor              *selected,
+        uint32_t                           n_selected);
+int ds4_gpu_glm_stream_expert_cache_finish_selected_readback(
+        const ds4_gpu_stream_expert_table *table,
+        uint32_t                           n_selected);
+#endif
 #ifdef __APPLE__
 /* The async selected-load worker registers itself so Metal cache paths never
  * wait on command buffers from that thread (they fail the load instead and

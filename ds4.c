@@ -45796,6 +45796,7 @@ struct ds4_engine {
     bool metal_ready;
     bool mtp_ready;
     bool support_model_loaded;
+    bool ds41_support_resident;      /* V4.1 drafter image already copied to the device */
     bool vision_ready;
     bool vision_map_ready;
     bool share_session_prefill_workspace;
@@ -71843,6 +71844,149 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+#if defined(DS4_ROCM_BUILD) && defined(DS4_HAS_DEEPSEEK41_GPU)
+/* =========================================================================
+ * D4: V4.1 ROCm automatic expert-cache size from the available memory.
+ *
+ * Legacy (DS4_ROCM_STREAM_CACHE_SIZING=legacy): the automatic cache is 80%
+ * of the GPU working set (120 GiB GTT here) minus the non-routed weights,
+ * whatever the context, and the resident DSpark drafter is then taken out of
+ * that cache (4947 -> 4487 MXFP4 slots including the 768-slot two-layer
+ * prefill staging).
+ *
+ * Memory sizing (default, DS4_ROCM_STREAM_CACHE_SIZING=memory):
+ *
+ *   dynamic = MemAvailable at engine open
+ *             - fixed (non-routed weights + vision + DSpark support weights
+ *                      + graph(ctx) x sessions incl. drafter buffers
+ *                      + two-layer prefill staging + 2 GiB runtime/I/O)
+ *             - safety reserve (DS4_ROCM_STREAM_MEM_RESERVE_GB, default 13)
+ *
+ * capped so the GTT the run plans stays below the working set minus the
+ * allocator's free reserve (cuda_stream_resident_make_room evicts below it):
+ *
+ *   dynamic <= working set - allocator reserve - fixed
+ *
+ * The fixed charge is the one ds41_memory_admit_for_host makes, so the
+ * admission never trims this size.  Everything in it scales with the
+ * configured context through ds41_engine_graph_bytes(e, ctx), so a larger
+ * context gets a smaller cache and the same MemAvailable floor.  Measured at
+ * ctx 4096 the run's MemAvailable minimum sits about 0.6 GiB above the
+ * reserve (GTT runs ~0.8-0.95 GiB above the plan, the process' host memory
+ * ~0.5 GiB, both inside the 2 GiB runtime allowance).  See D4.md.
+ * ========================================================================= */
+typedef struct {
+    uint64_t baseline, fixed, reserve, graph, staging, support, gtt_cap, mem_cap;
+    uint32_t ctx, sessions, dynamic_slots, total_slots, legacy_dynamic;
+} ds41_mem_cache_plan;
+
+static uint64_t ds41_rocm_stream_reserve_bytes(uint64_t host);
+
+static DS4_MAYBE_UNUSED bool ds41_mem_cache_sizing_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_CACHE_SIZING");
+        cached = !(env && strcmp(env, "legacy") == 0);
+    }
+    return cached == 1;
+}
+
+static DS4_MAYBE_UNUSED uint64_t ds41_mem_cache_reserve_bytes(void) {
+    double gib = 13.0;
+    const char *env = getenv("DS4_ROCM_STREAM_MEM_RESERVE_GB");
+    if (env && env[0]) {
+        char *end = NULL;
+        const double v = strtod(env, &end);
+        /* Never below the 12 GiB floor this sizing promises. */
+        if (end != env && *end == '\0' && isfinite(v) && v >= 12.0 && v <= 96.0) {
+            gib = v;
+        } else {
+            fprintf(stderr, "ds4: ignoring DS4_ROCM_STREAM_MEM_RESERVE_GB=%s "
+                            "(needs 12..96); using %.1f\n", env, gib);
+        }
+    }
+    return (uint64_t)(gib * 1073741824.0);
+}
+
+static DS4_MAYBE_UNUSED bool ds41_mem_cache_plan_compute(ds4_engine *e, int ctx_size,
+                                        uint64_t recommended,
+                                        uint64_t non_routed_bytes,
+                                        uint64_t per_expert_bytes,
+                                        uint64_t max_model_experts,
+                                        uint32_t legacy_total_slots,
+                                        ds41_mem_cache_plan *p) {
+    memset(p, 0, sizeof(*p));
+    if (!e || !per_expert_bytes || !recommended) return false;
+    p->baseline = e->ds41_host_memory_baseline;
+    if (!p->baseline) {
+        fprintf(stderr, "ds4: V4.1 memory-sized cache: MemAvailable unknown; "
+                        "using the legacy automatic size\n");
+        return false;
+    }
+    p->ctx = ctx_size > 0 ? (uint32_t)ctx_size : 4096u;
+    p->sessions = e->placement_session_count_hint > 0 ?
+        (uint32_t)e->placement_session_count_hint : 1u;
+    const uint64_t gib = UINT64_C(1073741824);
+    const uint64_t staging_slots = 2u * (uint64_t)DS4_N_EXPERT;
+    p->staging = staging_slots * per_expert_bytes;
+    p->support = ds41_engine_support_bytes(e);
+    p->graph = ds4_mul_sat_u64(ds41_engine_graph_bytes(e, p->ctx), p->sessions);
+    p->reserve = ds41_mem_cache_reserve_bytes();
+    p->fixed = ds4_add_sat_u64(non_routed_bytes,
+               ds4_add_sat_u64(e->vision_model.size,
+               ds4_add_sat_u64(p->support,
+               ds4_add_sat_u64(p->graph,
+               ds4_add_sat_u64(p->staging, 2u * gib)))));
+    const uint64_t mem_need = ds4_add_sat_u64(p->fixed, p->reserve);
+    p->mem_cap = p->baseline > mem_need ? p->baseline - mem_need : 0;
+    const uint64_t alloc_reserve = ds41_rocm_stream_reserve_bytes(p->baseline);
+    const uint64_t gtt_need = ds4_add_sat_u64(p->fixed, alloc_reserve);
+    p->gtt_cap = recommended > gtt_need ? recommended - gtt_need : 0;
+    uint64_t dyn = (p->mem_cap < p->gtt_cap ? p->mem_cap : p->gtt_cap) / per_expert_bytes;
+    if (max_model_experts > staging_slots && dyn > max_model_experts - staging_slots)
+        dyn = max_model_experts - staging_slots;
+    /* What the legacy path would leave after its drafter charge. */
+    uint64_t legacy_bytes = (uint64_t)legacy_total_slots * per_expert_bytes;
+    if (ds41_dspark_ssd_enabled() && p->support && legacy_bytes > p->support)
+        legacy_bytes -= p->support;
+    const uint64_t legacy_total = legacy_bytes / per_expert_bytes;
+    p->legacy_dynamic = legacy_total > staging_slots ?
+        (uint32_t)(legacy_total - staging_slots) : 0;
+    if (dyn < DS4_N_EXPERT_USED) {
+        fprintf(stderr, "ds4: V4.1 memory-sized cache: only %.2f GiB left after %.2f GiB fixed "
+                        "and the %.2f GiB reserve (MemAvailable %.2f GiB); using the legacy size\n",
+                ds4_bytes_to_gib(p->mem_cap), ds4_bytes_to_gib(p->fixed),
+                ds4_bytes_to_gib(p->reserve), ds4_bytes_to_gib(p->baseline));
+        return false;
+    }
+    p->dynamic_slots = dyn > UINT32_MAX - staging_slots ?
+        (uint32_t)(UINT32_MAX - staging_slots) : (uint32_t)dyn;
+    p->total_slots = p->dynamic_slots + (uint32_t)staging_slots;
+    fprintf(stderr,
+            "ds4: V4.1 memory-sized SSD cache (DS4_ROCM_STREAM_CACHE_SIZING=memory): "
+            "MemAvailable %.2f GiB - fixed %.2f GiB - reserve %.2f GiB = %.2f GiB; "
+            "GTT cap %.2f GiB (working set %.2f - allocator reserve %.2f - fixed)\n",
+            ds4_bytes_to_gib(p->baseline), ds4_bytes_to_gib(p->fixed),
+            ds4_bytes_to_gib(p->reserve), ds4_bytes_to_gib(p->mem_cap),
+            ds4_bytes_to_gib(p->gtt_cap), ds4_bytes_to_gib(recommended),
+            ds4_bytes_to_gib(alloc_reserve));
+    fprintf(stderr,
+            "ds4:   fixed = non-routed %.2f + vision %.2f + DSpark support %.2f + graph %.2f "
+            "(ctx=%u x%u sessions) + prefill staging %.2f + runtime 2.00 GiB\n",
+            ds4_bytes_to_gib(non_routed_bytes), ds4_bytes_to_gib(e->vision_model.size),
+            ds4_bytes_to_gib(p->support), ds4_bytes_to_gib(p->graph), p->ctx, p->sessions,
+            ds4_bytes_to_gib(p->staging));
+    fprintf(stderr,
+            "ds4:   dynamic slots %u (%.2f GiB; legacy sizing would give %u), "
+            "%u total with the %u-slot staging; limited by %s\n",
+            p->dynamic_slots,
+            ds4_bytes_to_gib((uint64_t)p->dynamic_slots * per_expert_bytes),
+            p->legacy_dynamic, p->total_slots, (uint32_t)staging_slots,
+            p->mem_cap <= p->gtt_cap ? "MemAvailable reserve" : "GTT working set");
+    return true;
+}
+#endif
+
 static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_size) {
 #ifdef DS4_NO_GPU
     (void)e;
@@ -72018,13 +72162,25 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
 #endif
 
 #if defined(DS4_ROCM_BUILD) && defined(DS4_HAS_DEEPSEEK41_GPU)
-    /* D1: the resident DSpark drafter (support model, pinned through the aux
-     * range cache) is charged against the automatic cache target, so the
-     * default command passes the start-up admission instead of failing by
-     * about the drafter's size.  Interim until the drafter borrows the idle
-     * prefill staging (plan D4).  An explicit cache size is not changed. */
+    /* D1 (legacy sizing): the resident DSpark drafter (support model, pinned
+     * through the aux range cache) is charged against the automatic cache
+     * target, so the default command passes the start-up admission instead
+     * of failing by about the drafter's size.  D4's memory sizing (default)
+     * charges it to the fixed memory instead.  An explicit cache size is not
+     * changed by either. */
     uint64_t dspark_cache_charge = 0;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+    ds41_mem_cache_plan mem_plan;
+    const bool mem_sized = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        ds41_mem_cache_sizing_enabled() &&
+        ds41_mem_cache_plan_compute(e, ctx_size, recommended, non_routed_bytes,
+                                    per_expert_bytes, max_model_experts,
+                                    cache_experts, &mem_plan);
+    if (mem_sized) {
+        /* D4: size from the memory that is actually available; the drafter
+         * is part of the fixed charge, not taken out of the cache. */
+        cache_experts = mem_plan.total_slots;
+        effective_cache_bytes = (uint64_t)cache_experts * per_expert_bytes;
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
         ds41_dspark_ssd_enabled()) {
         dspark_cache_charge = ds41_engine_support_bytes(e);
         if (dspark_cache_charge) {
@@ -74584,7 +74740,14 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
      * cache. Charge its remaining allocation until that auxiliary map exists. */
     if (e->vision_ready && !e->vision_map_ready)
         not_loaded = ds4_add_sat_u64(not_loaded, e->vision_model.size);
-    if (!e->support_model_loaded)
+    /* D4: under SSD streaming the V4.1 drafter image is copied to the device
+     * (aux range cache) before the staging admission, while
+     * support_model_loaded is only set later; MemAvailable already excludes
+     * it, so charging it again here double-counts 8 GiB and refused any
+     * DSpark cache above ~4050 MXFP4 slots (d4-c-d-4219-s8).  Fixed under the
+     * memory sizing only; legacy keeps today's check exactly. */
+    if (!e->support_model_loaded &&
+        !(e->ds41_support_resident && ds41_mem_cache_sizing_enabled()))
         not_loaded = ds4_add_sat_u64(not_loaded,
                                      ds41_engine_support_bytes(e));
     const uint64_t required = ds4_add_sat_u64(not_loaded, ds4_add_sat_u64(additional,
@@ -76021,6 +76184,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 e->mtp_model.size, e->mtp_model.tensor_data_pos,
                 e->mtp_model.size - e->mtp_model.tensor_data_pos) != 0;
             (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+            e->ds41_support_resident = resident;
             if (!resident) {
                 fprintf(stderr, "ds4: ROCm failed to make the V4.1 drafter resident\n");
                 free(load_offsets);
@@ -89558,9 +89722,9 @@ static uint32_t ds41_draft_scheduled_prefix_len(
  * plain sample, and at least 8 rounds apart.  There is no random stream.
  *
  * Knobs (environment):
- *   DS4_DSPARK_SCHED=online|old    online is the default for --ssd-streaming
- *       sessions on the gfx1151 cost-scheduled path; old = the fork's
- *       resident table + 64-cycle backoff.  Resident (non-streaming) sessions,
+ *   DS4_DSPARK_SCHED=online|old    old (the default since D4) = the fork's
+ *       resident table + 64-cycle backoff; online = the cost-scheduled
+ *       policy above for --ssd-streaming sessions on gfx1151.  Resident (non-streaming) sessions,
  *       --dspark-confidence and the TP verifier keep the old policy.
  *   DS4_DSPARK_SCHED_HALFLIFE=16   EWMA half-life in samples (2..1024)
  *   DS4_DSPARK_SCHED_EXPLORE=0.01  exploration budget (fraction of decode time)
@@ -89597,8 +89761,11 @@ static const ds41_sched_params *ds41_sched_params_get(void) {
     static ds41_sched_params p;
     static bool ready = false;
     if (ready) return &p;
+    /* D4: old is the default (kumanix-int measurements: better on average
+     * over code/prose/json/translate/list and repeatable); online stays
+     * selectable with DS4_DSPARK_SCHED=online. */
     const char *mode = getenv("DS4_DSPARK_SCHED");
-    p.online = !(mode && strcmp(mode, "old") == 0);
+    p.online = mode && strcmp(mode, "online") == 0;
     const char *trace = getenv("DS4_DSPARK_SCHED_TRACE");
     p.trace = trace && trace[0] && strcmp(trace, "0") != 0;
     const char *force = getenv("DS4_DSPARK_SCHED_FORCE");

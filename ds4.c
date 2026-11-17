@@ -67962,6 +67962,8 @@ static int ds4_session_eval_splitkv_spec_after_first(
 static bool qwen4_streaming_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache);
 #endif
 
+void ds4_rocm_perf_counters(uint64_t *, uint64_t *, uint64_t *, uint64_t *) __attribute__((weak));
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -68005,8 +68007,13 @@ int ds4_engine_generate_argmax(
             int n_generated = 0;
             const double t_decode0 = now_sec();
             const bool greedy_top1 = metal_graph_tp_env_flag("DS4_CUDA_GREEDY_TOP1", true);
+            const bool perf_token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
             int token = ds4_session_argmax(s);
             for (int i = 0; i < n_predict && ds4_session_pos(s) < ctx_size; i++) {
+                const double perf_t0 = perf_token_timing ? now_sec() : 0.0;
+                uint64_t perf_s0 = 0, perf_m0 = 0, perf_w0 = 0, perf_j0 = 0;
+                if (perf_token_timing && ds4_rocm_perf_counters)
+                    ds4_rocm_perf_counters(&perf_s0, &perf_m0, &perf_w0, &perf_j0);
                 if (token < 0) {
                     fprintf(stderr, "ds4: multi-tier argmax failed\n");
                     rc = 1;
@@ -68027,6 +68034,20 @@ int ds4_engine_generate_argmax(
                     fprintf(stderr, "ds4: multi-tier decode failed: %s\n", err);
                     rc = 1;
                     break;
+                }
+                if (perf_token_timing) {
+                    uint64_t perf_s1 = 0, perf_m1 = 0, perf_w1 = 0, perf_j1 = 0;
+                    if (ds4_rocm_perf_counters)
+                        ds4_rocm_perf_counters(&perf_s1, &perf_m1, &perf_w1, &perf_j1);
+                    fprintf(stderr,
+                            "ds4: perf token %d pos %d ms %.3f slots %llu misses %llu wait_ms %.3f jobs %llu id %d\n",
+                            i, (int)ds4_session_pos(s),
+                            (now_sec() - perf_t0) * 1000.0,
+                            (unsigned long long)(perf_s1 - perf_s0),
+                            (unsigned long long)(perf_m1 - perf_m0),
+                            (double)(perf_w1 - perf_w0) / 1000.0,
+                            (unsigned long long)(perf_j1 - perf_j0),
+                            token);
                 }
             }
             const double t_decode1 = now_sec();

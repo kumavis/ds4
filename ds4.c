@@ -154,6 +154,7 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 #pragma weak ds4_gpu_c1_token_end
 #pragma weak ds4_gpu_c1_note_token_ms
 static int g_ds4_c1_active;
+void ds4_rocm_perf_counters(uint64_t *, uint64_t *, uint64_t *, uint64_t *) __attribute__((weak));
 #define C1M(label, layer) do { if (g_ds4_c1_active) ds4_gpu_c1_mark((label), (int)(layer)); } while (0)
 #define C1F(label, layer) do { if (g_ds4_c1_active) ds4_gpu_c1_mark_fine((label), (int)(layer)); } while (0)
 #define C1ROUTED(layer) do { if (g_ds4_c1_active) ds4_gpu_c1_mark_routed_end((int)(layer)); } while (0)
@@ -42301,12 +42302,16 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
     const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
     const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
     const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
-    return ds4_gpu_rms_norm_plain_tensor(g->flat_norm, residual,
-               DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
-           ds41_matmul(g->mix, m, fn, g->flat_norm, false) &&
-           ds4_gpu_hc_split_sinkhorn_tensor(ffn ? g->ffn_split : g->attn_split,
+    if (!ds4_gpu_rms_norm_plain_tensor(g->flat_norm, residual,
+               DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS)) return false;
+    C1F(C1_HC_NORM, -2);
+    if (!ds41_matmul(g->mix, m, fn, g->flat_norm, false)) return false;
+    C1F(C1_HC_PROJ, -2);
+    const bool ok = ds4_gpu_hc_split_sinkhorn_tensor(ffn ? g->ffn_split : g->attn_split,
                g->mix, m->map, m->size, scale->abs_offset, base->abs_offset,
                DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
+    C1F(C1_HC_SINK, -2);
+    return ok;
 }
 
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
@@ -42470,9 +42475,10 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
 #ifdef DS4_ROCM_BUILD
     if (ds41_attention_pair_enabled(l, 1u)) {
-        return ds4_gpu_dsv41_q8_attention_pair_bf16(g->qr, g->kv, m->map, m->size,
-                l->attn_q_a->abs_offset, l->attn_kv->abs_offset, 1u, g->norm) &&
-            ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
+        if (!ds4_gpu_dsv41_q8_attention_pair_bf16(g->qr, g->kv, m->map, m->size,
+                l->attn_q_a->abs_offset, l->attn_kv->abs_offset, 1u, g->norm)) return false;
+        C1F(C1_ATTN_QA_KV, -2);
+        return ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
             ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr, g->tp_rank * q_dim, q_dim) &&
             ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
     }
@@ -45171,6 +45177,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     }
     const bool dspark_profile = g->draft && dspark_profile_left > 0;
     if (dspark_profile) dspark_profile_left--;
+    uint64_t c1_w0 = 0;  /* C1: read wait inside this profiled verify call */
+    if (dspark_profile && ds4_rocm_perf_counters) ds4_rocm_perf_counters(NULL, NULL, &c1_w0, NULL);
     double profile_setup = 0.0, profile_pre_attn = 0.0, profile_attn = 0.0;
     double profile_post_attn = 0.0, profile_moe = 0.0, profile_post_moe = 0.0;
     double profile_head = 0.0, profile_engram_host = 0.0, profile_t0 = now_sec();
@@ -45484,6 +45492,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             profile_head * 1000.0,
             (profile_setup + profile_pre_attn + profile_attn + profile_post_attn +
              profile_moe + profile_post_moe + profile_head) * 1000.0);
+        uint64_t c1_w1 = c1_w0;
+        if (ds4_rocm_perf_counters) ds4_rocm_perf_counters(NULL, NULL, &c1_w1, NULL);
+        fprintf(stderr, "ds4: C1 verify rows=%u rdwait=%.3f ms\n", rows,
+                (double)(c1_w1 - c1_w0) / 1000.0);
         for (uint32_t layer = 0; layer < DS4_N_LAYER; layer++)
             fprintf(stderr,
                 "ds4: V4.1 DSpark verify layer=%u pre_attn=%.3f attn=%.3f "

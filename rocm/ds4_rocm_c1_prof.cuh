@@ -5,7 +5,7 @@
 #define C1_MAX_LAYERS 64
 
 static const char *const g_c1_names[C1_N_LABELS] = {
-    "start", "embed", "layer_pre", "hc_pre", "attn_proj", "attn_rope_kv",
+    "start", "embed", "layer_pre", "hc_norm", "hc_proj", "hc_sinkhorn", "hc_pre", "attn_qa_kv", "attn_proj", "attn_rope_kv",
     "compressor", "indexer_topk", "attn_core", "attn_out", "hc_post",
     "router", "shared_expert", "sel_wait_host", "moe_prep_xq", "moe_gu_resident",
     "moe_read_wait", "moe_gu_missing", "moe_down", "moe_tail", "moe_all_resident", "moe_finish",
@@ -121,6 +121,11 @@ extern "C" void ds4_gpu_c1_token_end(void) {
     g_c1_last_counted = 0;
     const int n = g_c1_n;
     if (g_c1_mode_v >= 2) (void)hipEventSynchronize(g_c1_ev[n - 1]);
+    /* Only decode steps count: they end with the logits readback.  Prefill
+     * runs the same single-token step without logits on this path. */
+    int has_logits = 0;
+    for (int i = 0; i < n; i++) if (g_c1_lab[i] == C1_LOGITS_READ) has_logits = 1;
+    if (!has_logits) return;
     g_c1_tokens_seen++;
     if (g_c1_tokens_seen <= (uint64_t)g_c1_skip || n >= C1_MAX_MARKS) return;
     g_c1_tokens++;

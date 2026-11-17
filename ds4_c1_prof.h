@@ -27,7 +27,11 @@ enum {
     C1_START = 0,
     C1_EMBED,        /* engram hash/read start, pre write, token embedding */
     C1_LAYER_PRE,    /* draft capture, engram rows upload */
+    C1_HC_NORM,      /* hc mix: rms norm of the 4x5120 residual */
+    C1_HC_PROJ,      /* hc mix: 20480x24 F16 projection */
+    C1_HC_SINK,      /* hc mix: split + sinkhorn */
     C1_HC_PRE,       /* engram add, hc mix (norm+matmul+sinkhorn), hc sum, attn norm */
+    C1_ATTN_QA_KV,   /* q_a + kv paired projection (bf16) */
     C1_ATTN_PROJ,    /* q_a/kv projections, norms, q_b */
     C1_ATTN_ROPE,    /* rope q/kv, kv quantize, window write */
     C1_COMPRESSOR,   /* KV compressor / pool / index-k publish */

@@ -1607,7 +1607,7 @@ test-halo-shapes: tests/test_halo_shapes
 
 # This is a normal source build, independent of experimental binaries or paths.
 rocm/halo/output_b/code.inc: rocm/halo/output_b/s4_d2.s scripts/build_halo_output_b.py FORCE_HALO_ARCH
-	python3 scripts/build_halo_output_b.py --hipcc "$(HIPCC)" --arch "$(ROCM_ARCH)" --output $@
+	python3 scripts/build_halo_output_b.py --hipcc "$(HIPCC)" --arch "none-rocm724-local" --output $@
 
 .PHONY: FORCE_HALO_ARCH
 FORCE_HALO_ARCH:

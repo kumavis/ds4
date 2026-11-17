@@ -2034,6 +2034,16 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.dspark_confidence_threshold =
                 parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.engine.dspark_confidence_threshold_set = true;
+        } else if (!strcmp(arg, "--dspark-verify")) {
+            /* Verification accuracy vs speed; read by the engine from the
+             * environment so ds4-server and ds4-bench share the setting. */
+            const char *mode = need_arg(&i, argc, argv, arg);
+            if (strcmp(mode, "fast") && strcmp(mode, "attn") &&
+                strcmp(mode, "attn-moe") && strcmp(mode, "exact")) {
+                fprintf(stderr, "ds4: --dspark-verify expects fast, attn, attn-moe or exact\n");
+                exit(2);
+            }
+            setenv("DS4_DSPARK_VERIFY", mode, 1);
         } else if (!strcmp(arg, "--dspark-strict")) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;

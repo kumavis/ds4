@@ -41619,6 +41619,287 @@ static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
 static bool g_ds41_dspark_verify_dense;
 #endif
 
+/* ---- D0 DSpark exactness/quality harness (test instrumentation) ----
+ *
+ * DS4_D0_SHADOW=1: every V4.1 DSpark verify round runs the batched verifier
+ * first (taps captured), then restores the session state and re-verifies the
+ * same rows with one-token decode steps (taps compared). The one-token result
+ * is what the session commits, so the run's output equals plain decode and
+ * every round is a teacher-forced, same-state comparison of the batched rows
+ * against single-token decode. One "ds4: D0 row" line per verified row.
+ * DS4_D0_SHADOW_TRACE=N prints every differing (tag, layer) for N rounds.
+ *
+ * DS4_D0_LOGITS=FILE: append every decode-step logits row and every verified
+ * row (binary records, see scripts/d0/d0_logits.py) for plain-vs-DSpark
+ * comparisons. DS4_D0_LOGITS_MAXPOS bounds the positions (default 4096).
+ *
+ * Both are off by default; when off each tap is one predictable branch. */
+enum {
+    D0_ATTN_NORM, D0_QR, D0_KV, D0_Q, D0_HEADS, D0_ATTN_OUT, D0_AFTER_ATTN,
+    D0_FFN_NORM, D0_ROUTE_LOGITS, D0_SELECTED, D0_ROUTE_W, D0_SHARED,
+    D0_ROUTED, D0_FFN_OUT, D0_RESIDUAL, D0_OUT_NORM, D0_LOGITS, D0_NTAGS
+};
+#define D0_MAX_LAYER 64u
+#define D0_HEAD_LAYER (D0_MAX_LAYER - 1u)
+#define D0_MAX_ROWS 8u
+static const char *const g_d0_tag[D0_NTAGS] = {
+    "attn_norm", "qr", "kv", "q", "heads", "attn_out", "after_attn",
+    "ffn_norm", "route_logits", "selected", "route_w", "shared",
+    "routed", "ffn_out", "residual", "out_norm", "logits"
+};
+typedef struct {
+    uint32_t width, ndiff;
+    float maxabs, maxref;
+    double sum_d2, sum_r2;  /* relative L2 = sqrt(sum_d2 / sum_r2) */
+    bool have;
+} ds41_d0_cmp;
+static int g_d0_mode;            /* 0 idle, 1 capture batch, 2 compare scalar */
+static uint32_t g_d0_pos0, g_d0_rows;
+static float *g_d0_store[D0_NTAGS][D0_MAX_LAYER][D0_MAX_ROWS];
+static uint32_t g_d0_cap[D0_NTAGS][D0_MAX_LAYER][D0_MAX_ROWS];
+static ds41_d0_cmp g_d0_res[D0_NTAGS][D0_MAX_LAYER][D0_MAX_ROWS];
+static float *g_d0_tmp;
+static uint64_t g_d0_tmp_cap;
+
+/* DSpark verification accuracy setting (--dspark-verify / DS4_DSPARK_VERIFY):
+ *   fast      batched verifier (default): one pass over the layers for all rows
+ *   attn      batched, but each row's attention core (window/compressed KV,
+ *             indexer, compressor publish) runs the one-token decode kernels
+ *   attn-moe  as attn, and each row's MoE (router, shared and routed experts)
+ *             runs the one-token decode path; dense projections, attention
+ *             output and the head stay batched (they are bit-exact)
+ *   exact     row-at-a-time: n one-token decode steps; same tokens as plain
+ * DS4_ROCM_DSPARK_SCALAR_VERIFY (older switch) is an alias of exact. */
+enum { DS41_VERIFY_FAST, DS41_VERIFY_ATTN, DS41_VERIFY_ATTN_MOE, DS41_VERIFY_EXACT };
+static int ds41_verify_setting(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    const char *env = getenv("DS4_DSPARK_VERIFY");
+    cached = DS41_VERIFY_FAST;
+    if (getenv("DS4_ROCM_DSPARK_SCALAR_VERIFY")) cached = DS41_VERIFY_EXACT;
+    if (env && env[0]) {
+        if (!strcmp(env, "fast")) cached = DS41_VERIFY_FAST;
+        else if (!strcmp(env, "attn")) cached = DS41_VERIFY_ATTN;
+        else if (!strcmp(env, "attn-moe")) cached = DS41_VERIFY_ATTN_MOE;
+        else if (!strcmp(env, "exact")) cached = DS41_VERIFY_EXACT;
+        else fprintf(stderr, "ds4: unknown DSpark verify setting '%s'; using fast\n", env);
+    }
+    return cached;
+}
+
+static const char *ds41_verify_setting_name(void) {
+    static const char *const names[] = {"fast", "attn", "attn-moe", "exact"};
+    return names[ds41_verify_setting()];
+}
+
+static bool ds41_d0_shadow_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_D0_SHADOW");
+        cached = env && env[0] == '1';
+    }
+    return cached == 1;
+}
+
+static void ds41_d0_put(int tag, uint32_t il, uint32_t row, const float *v, uint32_t width) {
+    if (il >= D0_MAX_LAYER || row >= D0_MAX_ROWS || row >= g_d0_rows) return;
+    if (g_d0_mode == 1) {
+        if (g_d0_cap[tag][il][row] < width) {
+            free(g_d0_store[tag][il][row]);
+            g_d0_store[tag][il][row] = xmalloc((size_t)width * sizeof(float));
+            g_d0_cap[tag][il][row] = width;
+        }
+        memcpy(g_d0_store[tag][il][row], v, (size_t)width * sizeof(float));
+        g_d0_res[tag][il][row] = (ds41_d0_cmp){.width = width};
+        return;
+    }
+    ds41_d0_cmp *c = &g_d0_res[tag][il][row];
+    const float *ref = g_d0_store[tag][il][row];
+    if (!ref || c->width != width) return;
+    c->have = true;
+    for (uint32_t i = 0; i < width; i++) {
+        c->sum_r2 += (double)v[i] * v[i];
+        if (memcmp(&ref[i], &v[i], sizeof(float)) == 0) continue;
+        c->sum_d2 += ((double)ref[i] - v[i]) * ((double)ref[i] - v[i]);
+        c->ndiff++;
+        const float d = fabsf(ref[i] - v[i]);
+        if (!(d <= c->maxabs)) c->maxabs = d;  /* NaN propagates */
+        if (fabsf(v[i]) > c->maxref) c->maxref = fabsf(v[i]);
+    }
+}
+
+/* rows consecutive rows of width floats from t, the first being verify row row0. */
+static void ds41_d0_tap_rows(int mode, int tag, uint32_t il, const ds4_gpu_tensor *t,
+                             uint32_t width, uint32_t rows, uint32_t row0) {
+    if (g_d0_mode != mode || !t) return;
+    const uint64_t bytes = (uint64_t)width * sizeof(float);
+    if (g_d0_tmp_cap < bytes) {
+        free(g_d0_tmp);
+        g_d0_tmp = xmalloc((size_t)bytes);
+        g_d0_tmp_cap = bytes;
+    }
+    (void)ds4_gpu_synchronize();
+    for (uint32_t r = 0; r < rows; r++) {
+        if (!ds4_gpu_tensor_read(t, (uint64_t)r * bytes, g_d0_tmp, bytes)) return;
+        ds41_d0_put(tag, il, row0 + r, g_d0_tmp, width);
+    }
+}
+#define D0_TAP_BATCH(tag, il, t, width, rows) \
+    do { if (g_d0_mode == 1) ds41_d0_tap_rows(1, tag, il, t, width, rows, 0); } while (0)
+#define D0_TAP_ROW(g, tag, il, t, width) \
+    do { if (g_d0_mode == 2) ds41_d0_tap_rows(2, tag, il, t, width, 1, (g)->pos - g_d0_pos0); } while (0)
+
+/* Binary logits log: header then width floats. */
+typedef struct {
+    char magic[4];          /* "D0LG" */
+    uint32_t kind;          /* 0 decode step, 1 verify row, 2 shadow batch row,
+                               3 verify commit (row = accepted rows, no data) */
+    uint32_t pos;
+    int32_t token;          /* input token of this row */
+    uint32_t round, row, rows, width;
+} ds41_d0_logits_header;
+static uint32_t g_d0_round;
+
+static void ds41_d0_log_logits(uint32_t kind, uint32_t pos, int token,
+                               uint32_t row, uint32_t rows, const float *logits,
+                               uint32_t width) {
+    static FILE *fp;
+    static int state = -1;
+    static uint32_t maxpos = 4096u;
+    if (state < 0) {
+        const char *path = getenv("DS4_D0_LOGITS");
+        const char *mp = getenv("DS4_D0_LOGITS_MAXPOS");
+        if (mp) maxpos = (uint32_t)strtoul(mp, NULL, 10);
+        fp = path && path[0] ? fopen(path, "wb") : NULL;
+        if (path && path[0] && !fp) fprintf(stderr, "ds4: D0 cannot open %s\n", path);
+        state = fp != NULL;
+    }
+    if (!state || (!logits && width) || pos > maxpos) return;
+    const ds41_d0_logits_header h = {{'D', '0', 'L', 'G'}, kind, pos, token,
+        g_d0_round, row, rows, width};
+    if (fwrite(&h, sizeof(h), 1, fp) != 1 ||
+        fwrite(logits, sizeof(float), width, fp) != width) {
+        fprintf(stderr, "ds4: D0 logits write failed\n");
+        state = 0;
+    }
+    fflush(fp);
+}
+
+/* DS4_D0_FORCE=FILE ("pos token" per line): greedy generation commits these
+ * tokens instead of its own argmax, so a run is teacher-forced along a
+ * reference run's path (logits still come from this run's verifier). */
+static int ds41_d0_forced(uint32_t pos) {
+    static int32_t *tok;
+    static uint32_t cap;
+    static int state = -1;
+    if (state < 0) {
+        state = 0;
+        const char *path = getenv("DS4_D0_FORCE");
+        FILE *fp = path && path[0] ? fopen(path, "r") : NULL;
+        if (path && path[0] && !fp) fprintf(stderr, "ds4: D0 cannot open %s\n", path);
+        unsigned p, t;
+        while (fp && fscanf(fp, "%u %u", &p, &t) == 2) {
+            if (p >= cap) {
+                const uint32_t ncap = p + 4096u;
+                tok = realloc(tok, (size_t)ncap * sizeof(*tok));
+                if (!tok) abort();
+                for (uint32_t i = cap; i < ncap; i++) tok[i] = -1;
+                cap = ncap;
+            }
+            tok[p] = (int32_t)t;
+            state = 1;
+        }
+        if (fp) fclose(fp);
+        if (state) fprintf(stderr, "ds4: D0 teacher forcing from %s\n", path);
+    }
+    return state && pos < cap ? tok[pos] : -1;
+}
+
+static uint32_t ds41_d0_argmax(const float *x, uint32_t n, float *top, float *second) {
+    uint32_t best = 0;
+    float b = -INFINITY, s = -INFINITY;
+    for (uint32_t i = 0; i < n; i++) {
+        if (x[i] > b) { s = b; b = x[i]; best = i; }
+        else if (x[i] > s) s = x[i];
+    }
+    if (top) *top = b;
+    if (second) *second = s;
+    return best;
+}
+
+/* After a shadow round: one line per row, plus optional per-tap trace. */
+static void ds41_d0_report(const int *tokens, uint32_t n, const float *batch_logits,
+                           const float *scalar_logits, uint32_t vocab) {
+    static int trace_left = -1;
+    if (trace_left < 0) {
+        const char *env = getenv("DS4_D0_SHADOW_TRACE");
+        trace_left = env ? atoi(env) : 0;
+    }
+    const bool trace = trace_left > 0;
+    if (trace) trace_left--;
+    for (uint32_t r = 0; r < n && r < D0_MAX_ROWS; r++) {
+        const float *bl = batch_logits + (uint64_t)r * vocab;
+        const float *sl = scalar_logits + (uint64_t)r * vocab;
+        float maxabs = 0.0f, top = 0.0f, second = 0.0f;
+        uint32_t nd = 0;
+        for (uint32_t i = 0; i < vocab; i++) {
+            if (memcmp(&bl[i], &sl[i], sizeof(float)) == 0) continue;
+            nd++;
+            const float d = fabsf(bl[i] - sl[i]);
+            if (!(d <= maxabs)) maxabs = d;
+        }
+        const uint32_t ab = ds41_d0_argmax(bl, vocab, NULL, NULL);
+        const uint32_t as = ds41_d0_argmax(sl, vocab, &top, &second);
+        /* First differing tap in execution order, and each tag's first layer. */
+        int ftag = -1;
+        uint32_t flayer = 0;
+        char tags[1024];
+        size_t off = 0;
+        tags[0] = 0;
+        for (uint32_t il = 0; il < D0_MAX_LAYER && ftag < 0; il++)
+            for (int t = 0; t < D0_NTAGS; t++)
+                if (g_d0_res[t][il][r].have && g_d0_res[t][il][r].ndiff) {
+                    ftag = t;
+                    flayer = il;
+                    break;
+                }
+        for (int t = 0; t < D0_NTAGS; t++) {
+            int first = -1;
+            float mx = 0.0f;
+            uint32_t checked = 0;
+            for (uint32_t il = 0; il < D0_MAX_LAYER; il++) {
+                const ds41_d0_cmp *c = &g_d0_res[t][il][r];
+                if (!c->have) continue;
+                checked++;
+                if (c->ndiff && first < 0) first = (int)il;
+                if (!(c->maxabs <= mx)) mx = c->maxabs;
+            }
+            if (checked && off < sizeof(tags) - 64)
+                off += (size_t)snprintf(tags + off, sizeof(tags) - off, " %s=%s%d/%.3g",
+                    g_d0_tag[t], first < 0 ? "eq" : "L", first < 0 ? (int)checked : first,
+                    (double)mx);
+        }
+        fprintf(stderr,
+            "ds4: D0 row round=%u pos=%u row=%u rows=%u tok=%d next=%d "
+            "logit_maxabs=%.6g logit_ndiff=%u argmax_b=%u argmax_s=%u flip=%d "
+            "margin_s=%.6g first=%s@%u taps:%s\n",
+            g_d0_round, g_d0_pos0 + r, r, n, tokens[r],
+            r + 1 < n ? tokens[r + 1] : -1, (double)maxabs, nd, ab, as,
+            ab != as, (double)(top - second),
+            ftag < 0 ? "none" : g_d0_tag[ftag], ftag < 0 ? 0u : flayer, tags);
+        for (uint32_t il = 0; trace && il < D0_MAX_LAYER; il++)
+            for (int t = 0; t < D0_NTAGS; t++) {
+                const ds41_d0_cmp *c = &g_d0_res[t][il][r];
+                if (!c->have) continue;
+                fprintf(stderr, "ds4: D0 tap round=%u row=%u layer=%u tag=%s "
+                        "ndiff=%u/%u maxabs=%.6g maxref=%.6g rel_l2=%.3g\n",
+                        g_d0_round, r, il, g_d0_tag[t], c->ndiff, c->width,
+                        (double)c->maxabs, (double)c->maxref,
+                        c->sum_r2 > 0.0 ? sqrt(c->sum_d2 / c->sum_r2) : 0.0);
+            }
+    }
+}
+
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
 #ifdef DS4_ROCM_BUILD
@@ -42090,6 +42371,11 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
     if (!projected && !ds41_attention_project(g, m, l)) return false;
+    if (!projected) {
+        D0_TAP_ROW(g, D0_QR, il, g->qr, DS4_N_LORA_Q);
+        D0_TAP_ROW(g, D0_KV, il, g->kv, DS4_N_HEAD_DIM);
+        D0_TAP_ROW(g, D0_Q, il, g->q, heads * DS4_N_HEAD_DIM);
+    }
     if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
@@ -42109,9 +42395,12 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
     if (projected) return true;
-    return ds41_attention_output(g, m, l) &&
+    D0_TAP_ROW(g, D0_HEADS, il, g->heads, heads * DS4_N_HEAD_DIM);
+    const bool ok = ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
            ds41_bf16(g->block, DS4_N_EMBD);
+    if (ok) D0_TAP_ROW(g, D0_ATTN_OUT, il, g->block, DS4_N_EMBD);
+    return ok;
 }
 
 #ifdef DS4_ROCM_BUILD
@@ -42300,8 +42589,9 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
     if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
     bool ok = ds41_hc_sum(g->x, g->residual, g->pre, false) &&
-              ds41_norm(g->norm, g->x, m, w->output_norm) &&
-              ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
+              ds41_norm(g->norm, g->x, m, w->output_norm);
+    if (ok) D0_TAP_ROW(g, D0_OUT_NORM, D0_HEAD_LAYER, g->norm, DS4_N_EMBD);
+    ok = ok && ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
                                       m, w, g->norm, 1);
     if (!ds4_gpu_end_commands()) ok = false;
     return ok && ds4_gpu_tensor_read(g->logits, 0, logits,
@@ -42317,9 +42607,11 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;
     }
-    return ds41_dspark_capture(g->dspark, il, g->pos, g->residual, 1) &&
+    const bool ok = ds41_dspark_capture(g->dspark, il, g->pos, g->residual, 1) &&
         ds41_hc_mix(g, m, l, false) &&
         ds41_hc_sum(g->x, g->residual, g->pre, false) && ds41_norm(g->norm, g->x, m, l->attn_norm);
+    if (ok) D0_TAP_ROW(g, D0_ATTN_NORM, il, g->norm, DS4_N_EMBD);
+    return ok;
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
@@ -42331,8 +42623,13 @@ static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_layer_weights *l, uint32_t il) {
-    return ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false) &&
+    const bool ok = ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false) &&
         ds41_graph_after_attention(g, m, l);
+    if (ok) {
+        D0_TAP_ROW(g, D0_AFTER_ATTN, il, g->after_attn, DS4_N_HC * DS4_N_EMBD);
+        D0_TAP_ROW(g, D0_FFN_NORM, il, g->norm, DS4_N_EMBD);
+    }
+    return ok;
 }
 
 static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
@@ -42699,8 +42996,19 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+    if (!ds41_graph_before_moe(g, m, l, il) || !ds41_moe(g, m, l, il, (uint32_t)token))
+        return false;
+    if (g_d0_mode == 2 && g->tp_world == 1u) {
+        D0_TAP_ROW(g, D0_ROUTE_LOGITS, il, g->route_logits, DS4_N_EXPERT);
+        D0_TAP_ROW(g, D0_SELECTED, il, g->selected, DS4_N_EXPERT_USED);
+        D0_TAP_ROW(g, D0_ROUTE_W, il, g->route_weights, DS4_N_EXPERT_USED);
+        D0_TAP_ROW(g, D0_SHARED, il, g->shared, DS4_N_EMBD);
+        D0_TAP_ROW(g, D0_ROUTED, il, g->routed, DS4_N_EMBD);
+        D0_TAP_ROW(g, D0_FFN_OUT, il, g->block, DS4_N_EMBD);
+    }
+    if (!ds41_graph_after_moe(g)) return false;
+    D0_TAP_ROW(g, D0_RESIDUAL, il, g->residual, DS4_N_HC * DS4_N_EMBD);
+    return true;
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -43356,6 +43664,12 @@ static bool ds41_draft_init(ds41_gpu_graph *g,
     g->draft = d;
     g->allocation_bytes = ds4_add_sat_u64(g->allocation_bytes,
                                            ds41_draft_bytes(dw));
+    static bool announced;
+    if (!announced) {
+        announced = true;
+        fprintf(stderr, "ds4: DSpark verify setting: %s%s\n", ds41_verify_setting_name(),
+                ds41_d0_shadow_enabled() ? " (D0 shadow: exact rows committed)" : "");
+    }
     return true;
 }
 
@@ -43476,6 +43790,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (!ds4_gpu_end_commands()) ok = false;
     }
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
+    if (ok && logits && g_d0_mode != 2)
+        ds41_d0_log_logits(0u, g->pos, token, 0u, 1u, logits, DS4_N_VOCAB);
     /* Even a failed GPU layer must finish the reader before this graph (or
      * a borrowed row graph) can leave scope or reuse its host output rows. */
     if (overlap_engram && !ds4_engram_reader_wait(g->engram_reader, 1)) ok = false;
@@ -44581,8 +44897,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 g->rows_view[i].residual, 1);
         if (ok && g->draft)
             ok = ds41_draft_capture(g, il, active.residual, positions[0], rows);
-        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
-            ds41_attention_project_batch(g, model, l, rows);
+        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows);
+        if (ok) D0_TAP_BATCH(D0_ATTN_NORM, il, active.norm, DS4_N_EMBD, rows);
+        if (ok) ok = ds41_attention_project_batch(g, model, l, rows);
+        if (ok && g_d0_mode == 1) {
+            D0_TAP_BATCH(D0_QR, il, active.qr, DS4_N_LORA_Q, rows);
+            D0_TAP_BATCH(D0_KV, il, active.kv, DS4_N_HEAD_DIM, rows);
+            D0_TAP_BATCH(D0_Q, il, active.q, DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM, rows);
+        }
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
@@ -44592,8 +44914,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         }
 #endif
 #ifdef DS4_ROCM_BUILD
-        const bool batch_attention = prefill_only;
-        const bool batch_output = g->draft && g->draft->verify_rows == rows &&
+        const bool verify_round = g->draft && g->draft->verify_rows == rows;
+        const bool batch_attention = prefill_only &&
+            !(verify_round && ds41_verify_setting() >= DS41_VERIFY_ATTN);
+        const bool batch_output = verify_round &&
             rows > 1u && rows <= DS4_DSPARK_MAX_BLOCK_SIZE + 1u &&
             l->attn_output_a->type == DS4_TENSOR_Q8_0 &&
             l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
@@ -44615,9 +44939,22 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #undef DS41_SESSION_ROW
             row.q = queries[i];
             row.heads = heads[i];
-            ok = (batch_attention || ds41_attention(&row, model, l, il, true)) &&
-                (batch_output || ds41_attention_output(&row, model, l));
+            ok = batch_attention || ds41_attention(&row, model, l, il, true);
+            /* Row-wise attention inside a verify pass: keep each row's
+             * ratio-two pooling state for rollback, as the scalar verifier
+             * does (ds41_attention_batch keeps the equivalent rows). */
+            if (ok && !batch_attention && g->draft && g->draft->verify_rows &&
+                il < 20u && ds41_kv_source(il) && ds4_layer_compress_ratio(il) == 2u) {
+                const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : 2u;
+                const uint64_t hb = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+                const uint64_t at = ((uint64_t)owner * (DS4_DSPARK_MAX_BLOCK_SIZE + 1u) +
+                                     (uint32_t)i) * hb;
+                ok = ds4_gpu_tensor_copy(g->draft->pool_kv, at, g->previous_kv[owner], 0, hb) &&
+                    ds4_gpu_tensor_copy(g->draft->pool_score, at, g->previous_score[owner], 0, hb);
+            }
+            ok = ok && (batch_output || ds41_attention_output(&row, model, l));
         }
+        if (ok) D0_TAP_BATCH(D0_HEADS, il, active.heads, DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM, rows);
         if (ok && batch_output)
             ok = g->tp_world == 2u ?
                 ds4_gpu_dsv41_attention_output_tp_batch(active.block, active.low,
@@ -44637,12 +44974,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         }
 #endif
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows);
-        if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds41_after_attention_batch(
+        if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16);
+        if (ok) D0_TAP_BATCH(D0_ATTN_OUT, il, active.block, DS4_N_EMBD, rows);
+        if (ok) ok = ds41_after_attention_batch(
 #ifdef DS4_ROCM_BUILD
             g,
 #endif
             &active, model, l, rows);
+        if (ok && g_d0_mode == 1) {
+            D0_TAP_BATCH(D0_AFTER_ATTN, il, active.after_attn, DS4_N_HC * DS4_N_EMBD, rows);
+            D0_TAP_BATCH(D0_FFN_NORM, il, active.norm, DS4_N_EMBD, rows);
+        }
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
@@ -44651,7 +44993,36 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             profile_t0 = now_sec();
         }
 #endif
-        if (ok) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner);
+#ifdef DS4_ROCM_BUILD
+        const bool row_moe = verify_round && g->tp_world == 1u &&
+            ds41_verify_setting() == DS41_VERIFY_ATTN_MOE;
+#else
+        const bool row_moe = false;
+#endif
+        /* Per-row MoE (verify setting attn-moe): the one-token decode path,
+         * leaving bf16(shared + routed) in each row's block. */
+        for (int i = 0; ok && row_moe && i < count; i++) {
+            ds41_gpu_graph row = *graphs[i];
+            row.pos = positions[i];
+#define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
+            DS41_PREFILL_ROWS(DS41_SESSION_ROW)
+#undef DS41_SESSION_ROW
+            row.q = queries[i];
+            row.heads = heads[i];
+            ok = ds41_moe(&row, model, l, il, (uint32_t)tokens[i]);
+        }
+        if (ok && !row_moe) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner);
+        if (ok && g_d0_mode == 1 && g->tp_world == 1u) {
+            D0_TAP_BATCH(D0_ROUTE_LOGITS, il, active.route_logits, DS4_N_EXPERT, rows);
+            D0_TAP_BATCH(D0_SELECTED, il, active.selected, DS4_N_EXPERT_USED, rows);
+            D0_TAP_BATCH(D0_ROUTE_W, il, active.route_weights, DS4_N_EXPERT_USED, rows);
+            /* shared/routed are aliased scratch; per-row MoE reuses them
+             * for the next row, so only the batched path can tap them. */
+            if (!row_moe) {
+                D0_TAP_BATCH(D0_SHARED, il, active.shared, DS4_N_EMBD, rows);
+                D0_TAP_BATCH(D0_ROUTED, il, active.routed, DS4_N_EMBD, rows);
+            }
+        }
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
@@ -44660,12 +45031,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             profile_t0 = now_sec();
         }
 #endif
-        if (ok) ok =
+        if (ok && !row_moe) ok =
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
                 ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
-            ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds41_hc_expand_bf16_rows(active.residual, active.block, active.after_attn, active.ffn_split, rows);
+            ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16);
+        if (ok) D0_TAP_BATCH(D0_FFN_OUT, il, active.block, DS4_N_EMBD, rows);
+        if (ok) ok = ds41_hc_expand_bf16_rows(active.residual, active.block, active.after_attn, active.ffn_split, rows);
+        if (ok) D0_TAP_BATCH(D0_RESIDUAL, il, active.residual, DS4_N_HC * DS4_N_EMBD, rows);
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
@@ -44755,19 +45128,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     return ok;
 }
 
-static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
-                              const ds4_weights *w, const int *tokens,
-                              uint32_t n, float *logits_rows) {
+/* Row-at-a-time verification: n one-token decode steps. Reproduces plain
+ * decode's arithmetic exactly (the "exact" verify setting). */
+static bool ds41_draft_verify_scalar(ds41_gpu_graph *g, const ds4_model *m,
+                                     const ds4_weights *w, const int *tokens,
+                                     uint32_t n, float *logits_rows) {
     ds41_draft *d = g->draft;
-    if (!d || !g->valid || n < 2u || n > d->block + 1u ||
-        n > DS4_TP_BATCH_MAX_ROWS || g->pos > g->ctx || n > g->ctx - g->pos)
-        return false;
-#ifdef DS4_ROCM_BUILD
-    /* gfx1151's highly tuned resident one-row trunk is substantially faster
-     * than its prefill kernels at DSpark's two-to-six-row verifier widths.
-     * Keep this source-bound ablation until the width-specific batch kernels
-     * are qualified, then select the faster path from measured thresholds. */
-    if (getenv("DS4_ROCM_DSPARK_SCALAR_VERIFY")) {
+    {
         const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
         const uint32_t pos0 = g->pos;
         d->verify_rows = n;
@@ -44796,7 +45163,13 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
         if (!ok) g->valid = false;
         return ok;
     }
-#endif
+}
+
+/* Batched verification: one pass over the layers for all n rows. */
+static bool ds41_draft_verify_batch(ds41_gpu_graph *g, const ds4_model *m,
+                                    const ds4_weights *w, const int *tokens,
+                                    uint32_t n, float *logits_rows) {
+    ds41_draft *d = g->draft;
     ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
     for (uint32_t i = 0; i < n; i++) graphs[i] = g;
     d->verify_rows = n;
@@ -44825,8 +45198,9 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
             (uint64_t)n * DS4_N_EMBD * sizeof(float));
         ok = res && split && x && xn &&
             ds41_hc_sum_bf16_rows(x, res, split, true, n) &&
-            ds41_norm_batch(xn, x, m, w->output_norm, n) &&
-            ds41_output_projection(g, d->rows_logits, m, w, xn, n) &&
+            ds41_norm_batch(xn, x, m, w->output_norm, n);
+        if (ok) D0_TAP_BATCH(D0_OUT_NORM, D0_HEAD_LAYER, xn, DS4_N_EMBD, n);
+        ok = ok && ds41_output_projection(g, d->rows_logits, m, w, xn, n) &&
             ds41_draft_pending(g);
         ds4_gpu_tensor_free(xn);
         ds4_gpu_tensor_free(x);
@@ -44848,6 +45222,86 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
         logits_rows, (uint64_t)n * logits_width * sizeof(float));
 }
 
+/* D0 shadow round: batched verify with taps captured, restore the state the
+ * batch wrote, then the exact row-at-a-time verify with taps compared. The
+ * exact rows are returned (and committed). */
+static bool ds41_draft_verify_shadow(ds41_gpu_graph *g, const ds4_model *m,
+                                     const ds4_weights *w, const int *tokens,
+                                     uint32_t n, float *logits_rows) {
+    const uint32_t pos0 = g->pos, vocab = DS4_N_VOCAB;
+    const ds4_engram_history history = g->history;
+    float prev[4][2][512];
+    bool ok = n <= D0_MAX_ROWS && logits_rows && g->tp_world == 1u;
+    for (uint32_t o = 0; ok && o < 4u; o++)
+        ok = ds4_gpu_tensor_read(g->previous_kv[o], 0, prev[o][0], sizeof(prev[o][0])) &&
+            ds4_gpu_tensor_read(g->previous_score[o], 0, prev[o][1], sizeof(prev[o][1]));
+    if (!ok) return false;
+    float *batch = xmalloc((size_t)n * vocab * sizeof(float));
+    g_d0_pos0 = pos0;
+    g_d0_rows = n;
+    memset(g_d0_res, 0, sizeof(g_d0_res));
+    g_d0_mode = 1;
+    ok = ds41_draft_verify_batch(g, m, w, tokens, n, batch);
+    g_d0_mode = 0;
+    /* Undo the batch: ring slots of rows 1..n-1 (saved by ds41_draft_slots),
+     * ratio-two pooling state, position and Engram history. Everything else
+     * it wrote is position-indexed and rewritten by the exact rows. */
+    if (ok) {
+        ok = ds4_gpu_begin_commands() &&
+            ds41_draft_slots(g, pos0, 1, n, false) && ds4_gpu_end_commands();
+        for (uint32_t o = 0; ok && o < 4u; o++)
+            ok = ds4_gpu_tensor_write(g->previous_kv[o], 0, prev[o][0], sizeof(prev[o][0])) &&
+                ds4_gpu_tensor_write(g->previous_score[o], 0, prev[o][1], sizeof(prev[o][1]));
+        g->pos = pos0;
+        g->history = history;
+    }
+    if (ok) {
+        for (uint32_t r = 0; r < n; r++)
+            ds41_d0_log_logits(2u, pos0 + r, tokens[r], r, n,
+                               batch + (uint64_t)r * vocab, vocab);
+        g_d0_mode = 2;
+        ok = ds41_draft_verify_scalar(g, m, w, tokens, n, logits_rows);
+        g_d0_mode = 0;
+    }
+    if (ok) {
+        ds41_d0_report(tokens, n, batch, logits_rows, vocab);
+        for (uint32_t r = 0; r < n; r++)
+            ds41_d0_log_logits(1u, pos0 + r, tokens[r], r, n,
+                               logits_rows + (uint64_t)r * vocab, vocab);
+    }
+    free(batch);
+    if (!ok) g->valid = false;
+    return ok;
+}
+
+static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
+                              const ds4_weights *w, const int *tokens,
+                              uint32_t n, float *logits_rows) {
+    ds41_draft *d = g->draft;
+    if (!d || !g->valid || n < 2u || n > d->block + 1u ||
+        n > DS4_TP_BATCH_MAX_ROWS || g->pos > g->ctx || n > g->ctx - g->pos)
+        return false;
+    g_d0_round++;
+    bool ok;
+    if (ds41_d0_shadow_enabled())
+        return ds41_draft_verify_shadow(g, m, w, tokens, n, logits_rows);
+#ifdef DS4_ROCM_BUILD
+    /* gfx1151's highly tuned resident one-row trunk is substantially faster
+     * than its prefill kernels at DSpark's two-to-six-row verifier widths.
+     * Keep this source-bound ablation until the width-specific batch kernels
+     * are qualified, then select the faster path from measured thresholds. */
+    if (ds41_verify_setting() == DS41_VERIFY_EXACT)
+        ok = ds41_draft_verify_scalar(g, m, w, tokens, n, logits_rows);
+    else
+#endif
+        ok = ds41_draft_verify_batch(g, m, w, tokens, n, logits_rows);
+    if (ok && logits_rows)
+        for (uint32_t r = 0; r < n; r++)
+            ds41_d0_log_logits(1u, g->pos - n + r, tokens[r], r, n,
+                               logits_rows + (uint64_t)r * DS4_N_VOCAB, DS4_N_VOCAB);
+    return ok;
+}
+
 static void ds41_tp_merge_logits_rows(float *rows, const float *peer,
                                       uint32_t n, uint32_t half) {
     const size_t half_bytes = (size_t)half * sizeof(float);
@@ -44866,6 +45320,7 @@ static bool ds41_draft_rollback(ds41_gpu_graph *g, const int *tokens,
     if (!d || !accepted || accepted > n || g->pos < n) return false;
     const uint32_t pos0 = g->pos - n;
     const uint32_t last = pos0 + accepted - 1u;
+    ds41_d0_log_logits(3u, pos0, tokens[0], accepted, n, NULL, 0u);
     g->pos = pos0 + accepted;
     g->history = history;
     if (!ds41_hash_tokens(g, &g->history, tokens, accepted,
@@ -80491,6 +80946,10 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (temperature <= 0.0f) {
+        const int forced = ds41_d0_forced((uint32_t)s->checkpoint.len);
+        if (forced >= 0) return forced;
+    }
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
@@ -88982,8 +89441,12 @@ static int ds41_session_spec(ds4_session *s, int first_token,
             matched++;
         }
     } else {
-        while (matched < k && sample_argmax(rows + (size_t)matched * vocab,
-                vocab) == drafts[matched]) matched++;
+        while (matched < k) {
+            const int forced = ds41_d0_forced(pos + 1u + matched);
+            if ((forced >= 0 ? forced : sample_argmax(rows + (size_t)matched * vocab,
+                    vocab)) != drafts[matched]) break;
+            matched++;
+        }
     }
     memcpy(s->logits, rows + (size_t)matched * vocab,
            (size_t)vocab * sizeof(float));

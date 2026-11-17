@@ -1222,6 +1222,16 @@ tests/test_mxfp4_stream_rows_rocm: tests/test_mxfp4_stream_rows_rocm.o ds4_rocm.
 test-mxfp4-stream-rows-rocm: tests/test_mxfp4_stream_rows_rocm
 	./tests/test_mxfp4_stream_rows_rocm
 
+# D0: DSpark verifier multi-row kernels vs one-token decode kernels, bitwise.
+tests/test_d0_verify_rows_rocm.o: tests/test_d0_verify_rows_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_d0_verify_rows_rocm: tests/test_d0_verify_rows_rocm.o ds4_rocm.o ds4_image.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-d0-verify-rows-rocm: tests/test_d0_verify_rows_rocm
+	./tests/test_d0_verify_rows_rocm
+
 ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_tp.h ds4_gpu_mgpu.h ds4_gpu_args.h ds4_rocm_memory.h ds4_linux_memory.h ds4_deepseek41_gpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_compat.cu
 

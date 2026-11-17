@@ -966,6 +966,43 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
                                  n_head, head_dim, ratio, scale, 1);
 }
 
+/* Rows that no fixed-k path takes (top_k not 1, 512, 1024 or 2048) used to
+ * run through indexer_topk_kernel, a single-lane insertion sort costing
+ * O(n_comp * top_k) on one GPU lane.  V4.1 decode asks for top_k = n_comp
+ * while n_comp < 512, i.e. on every step up to position 511 (ratio-1 layers)
+ * or 1023 (ratio-2 layers), so that sort grew to a large part of each decode
+ * step on gfx1151.  Such rows with n_comp <= 2048 now use the bitonic sorts.
+ *
+ * The lists are identical, order included (the attention gathers the
+ * selected rows in list order).  The bitonic kernels fully sort the padded
+ * row by (score desc, index asc), a strict total order on distinct indices,
+ * and then write its first top_k entries; pads are (-inf, UINT32_MAX) and
+ * sort after every real entry, -inf scores included.  The insertion sort
+ * yields the same prefix: indices arrive in increasing order and an entry
+ * only moves ahead of strictly smaller scores, so ties keep the lower index
+ * first, and once the list is full the entry dropped from the tail is the
+ * last of that order.  Both compare with float < / ==, so -0 and +0 tie.
+ * This holds for every top_k <= n_comp and all non-NaN scores; NaN scores
+ * order differently (tests/test_indexer_topk_rocm.c).
+ *
+ * DS4_ROCM_INDEXER_TOPK_LEGACY=1 keeps the insertion sort for A/B runs.  It
+ * is read once, on the first call. */
+static int g_indexer_topk_legacy = -1;
+
+static int indexer_topk_legacy(void) {
+    if (g_indexer_topk_legacy < 0) {
+        const char *env = getenv("DS4_ROCM_INDEXER_TOPK_LEGACY");
+        g_indexer_topk_legacy = env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+    }
+    return g_indexer_topk_legacy;
+}
+
+/* 1 forces the insertion sort, 0 the bitonic sorts, a negative value goes
+ * back to the environment setting. */
+extern "C" void ds4_gpu_test_set_indexer_topk_legacy(int legacy) {
+    g_indexer_topk_legacy = legacy < 0 ? -1 : legacy != 0;
+}
+
 extern "C" int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
@@ -1198,6 +1235,18 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                  n_sets * top_k,
                                                                  cur_stride);
         return cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
+    }
+    if (n_comp <= 2048u && !indexer_topk_legacy()) {
+        if (n_comp <= 1024u) {
+            indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                         (const float *)scores->ptr,
+                                                         n_comp, n_tokens, top_k);
+            return cuda_ok(cudaGetLastError(), "indexer topk small 1024 launch");
+        }
+        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                           (const float *)scores->ptr,
+                                                           n_comp, n_tokens, top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk small 2048 launch");
     }
     indexer_topk_kernel<<<n_tokens, 1>>>((uint32_t *)selected->ptr,
                                          (const float *)scores->ptr,

@@ -309,6 +309,10 @@ int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
 #ifdef DS4_ROCM_BUILD
 void ds4_gpu_release_q8_f16_cache(void);
+/* Test hook for ds4_gpu_indexer_topk_tensor's small-row path: 1 selects the
+ * single-lane insertion sort, 0 the bitonic sort, a negative value restores
+ * the DS4_ROCM_INDEXER_TOPK_LEGACY setting. */
+void ds4_gpu_test_set_indexer_topk_legacy(int legacy);
 #endif
 
 /* Model-file ranges assigned to CUDA devices by the multi-GPU placement

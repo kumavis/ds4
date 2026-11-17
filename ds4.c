@@ -42953,9 +42953,85 @@ static bool ds41_hc_mix_batch(
             DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
 }
 
+#ifdef DS4_ROCM_BUILD
+/* D5b: prefetch for few-row MXFP4 batches (DSpark verify rounds through
+ * ds41_moe_batch_d2).  Same idea as the single-token P1 probe, for every row:
+ * before layer L's router, layer L+1's router runs on the rows' FFN input
+ * (b->x, normalised with L+1's ffn_norm) into private scratch and the logits
+ * come back behind an event; once L's union reads are queued, each row's
+ * first DS4_ROCM_D5_VERIFY_DEPTH experts by the router's selection score are
+ * merged rank by rank and up to DS4_ROCM_D5_VERIFY_K non-resident ones are
+ * read speculatively.  Layer 0 has no previous layer in the round: with
+ * DS4_ROCM_D5_VERIFY_L0 its own router runs on the rows' attention input
+ * (before layer 0's attention) and its reads are queued when layer 0's MoE
+ * starts.  Nothing the model computes changes. */
+static ds4_gpu_tensor *g_d5v_norm, *g_d5v_logits;
+static bool g_d5v_l0_pending;
+static uint32_t g_d5v_l0_count;
+
+static bool d5_verify_applies(const ds41_gpu_graph *g, const ds4_layer_weights *target,
+                              uint32_t count) {
+    return g->streaming && g->tp_world == 1u && count >= 2u && count <= 6u &&
+        ds4_gpu_d2_verify_enabled() && ds4_gpu_d5_prefetch_mode() > 0 &&
+        ds4_gpu_d5_verify_k() > 0 && DS4_N_EXPERT == 384u &&
+        target->ffn_norm && target->ffn_gate_inp && target->ffn_exp_probs_b &&
+        target->ffn_gate_exps && target->ffn_gate_exps->type == DS4_TENSOR_MXFP4;
+}
+
+static bool d5_verify_probe_start(const ds4_model *m, const ds4_layer_weights *target,
+                                  const ds4_gpu_tensor *x, uint32_t count) {
+    if (!g_d5v_norm) {
+        g_d5v_norm = ds4_gpu_tensor_alloc(8ull * DS4_N_EMBD * sizeof(float));
+        g_d5v_logits = ds4_gpu_tensor_alloc(8ull * 384u * sizeof(float));
+        if (!g_d5v_norm || !g_d5v_logits) return false;
+    }
+    return ds41_norm_batch(g_d5v_norm, x, m, target->ffn_norm, count) &&
+        ds41_matmul_batch(g_d5v_logits, m, target->ffn_gate_inp, g_d5v_norm, count, false) &&
+        ds4_gpu_d5_probe_readback_start(g_d5v_logits, count * 384u);
+}
+
+static void d5_verify_issue(const ds4_model *m, const ds4_layer_weights *target,
+                            uint32_t target_il, uint32_t count) {
+    static float lg[6u * 384u];
+    if (count > 6u || !ds4_gpu_d5_probe_readback_finish(lg, count * 384u)) return;
+    ds4_gpu_stream_expert_table table;
+    if (!ds41_stream_table(m, target, target_il, &table)) return;
+    const float *bias = (const float *)((const char *)m->map +
+                                        target->ffn_exp_probs_b->abs_offset);
+    uint32_t depth = ds4_gpu_d5_verify_depth();
+    if (depth > 16u) depth = 16u;
+    int32_t ranked[6][16];
+    for (uint32_t r = 0; r < count; r++) {
+        float score[384];
+        for (uint32_t e = 0; e < 384u; e++)
+            score[e] = sqrtf(d5_softplus(lg[r * 384u + e])) + bias[e];
+        for (uint32_t k = 0; k < depth; k++) {
+            uint32_t best = 0;
+            for (uint32_t e = 1; e < 384u; e++)
+                if (score[e] > score[best]) best = e;
+            ranked[r][k] = (int32_t)best;
+            score[best] = -INFINITY;
+        }
+    }
+    int32_t cand[6u * 16u];
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < depth; k++) {
+        for (uint32_t r = 0; r < count; r++) {
+            int dup = 0;
+            for (uint32_t i = 0; i < n && !dup; i++) dup = cand[i] == ranked[r][k];
+            if (!dup) cand[n++] = ranked[r][k];
+        }
+    }
+    (void)ds4_gpu_d5_prefetch(&table, cand, n, ds4_gpu_d5_verify_k());
+}
+#endif
+
 static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
                                          uint32_t il, uint32_t count) {
+#ifdef DS4_ROCM_BUILD
+    if (il == 0u) g_d5v_l0_pending = false;
+#endif
     if (ds41_engram_layer(il)) {
         const uint32_t i = il == 1 ? 0 : 1;
         if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true) ||
@@ -42970,8 +43046,19 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
 #endif
             b, m, l, false, count)) return false;
     /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
+#ifdef DS4_ROCM_BUILD
+    if (!ds41_hc_sum_bf16_rows(b->x, b->residual, il ? b->ffn_split : b->pre, il != 0, count))
+        return false;
+    if (il == 0u && g->draft && g->draft->verify_rows == count && ds4_gpu_d5_verify_l0() &&
+        d5_verify_applies(g, l, count)) {
+        g_d5v_l0_pending = d5_verify_probe_start(m, l, b->x, count);
+        g_d5v_l0_count = count;
+    }
+    return ds41_norm_batch(b->norm, b->x, m, l->attn_norm, count);
+#else
     return ds41_hc_sum_bf16_rows(b->x, b->residual, il ? b->ffn_split : b->pre, il != 0, count) &&
         ds41_norm_batch(b->norm, b->x, m, l->attn_norm, count);
+#endif
 }
 
 static bool ds41_after_attention_batch(
@@ -43408,6 +43495,14 @@ static bool ds41_moe_batch_d2(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t n_ids = count * DS4_N_EXPERT_USED;
     int32_t ids[6u * 8u];
     ds4_gpu_stream_expert_table table;
+    /* D5b: layer 0's own probe (started before its attention) is consumed
+     * first, then layer L+1's probe is enqueued ahead of L's router. */
+    if (il == 0u && g_d5v_l0_pending) {
+        g_d5v_l0_pending = false;
+        if (g_d5v_l0_count == count) d5_verify_issue(m, l, 0u, count);
+    }
+    const bool d5_next = il + 1u < DS4_N_LAYER && d5_verify_applies(g, l + 1, count) &&
+        d5_verify_probe_start(m, l + 1, b->x, count);
     if (n_ids > sizeof(ids) / sizeof(ids[0]) ||
         !ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) ||
         !ds41_route_batch(g, m, l, count) ||
@@ -43422,8 +43517,12 @@ static bool ds41_moe_batch_d2(ds41_gpu_graph *g, const ds4_model *m,
         !ds4_gpu_selected_readback_finish(ids, n_ids)) return false;
     for (uint32_t i = 0; i < n_ids; i++)
         if (ids[i] < 0 || (uint32_t)ids[i] >= DS4_N_EXPERT) return false;
-    return ds4_gpu_stream_expert_cache_begin_selected_batch(&table, ids, count,
-                                                            DS4_N_EXPERT_USED) &&
+    if (!ds4_gpu_stream_expert_cache_begin_selected_batch(&table, ids, count,
+                                                          DS4_N_EXPERT_USED)) return false;
+    /* D5b: layer L's union reads are queued; the probe's event precedes L's
+     * router on stream 0, so this wait is already satisfied. */
+    if (d5_next) d5_verify_issue(m, l + 1, il + 1u, count);
+    return
         ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,

@@ -426,6 +426,13 @@ static int cuda_stream_batch_selected_upload_wait_host(const char *what);
 static void cuda_stream_batch_selected_stage_release(void);
 static void cuda_stream_read_pool_shutdown(void);
 static void cuda_d5_shelf_reset(void);
+static void cuda_d5_release_unneeded(const void *model_map, uint32_t layer,
+                                     const int32_t *ids, uint32_t n);
+static void cuda_d5_release_upto(const void *model_map, uint32_t layer);
+static int cuda_d5_adopt(const void *model_map, uint32_t layer, int32_t expert,
+                         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                         size_t resident_idx);
 
 static int cuda_u64_mul_checked(uint64_t a, uint64_t b, uint64_t *out) {
     if (!out) return 0;
@@ -2685,6 +2692,20 @@ static uint64_t g_d5_stat_issued, g_d5_stat_adopt_ready, g_d5_stat_adopt_wait,
                 g_d5_stat_no_slot;
 static uint64_t g_d5_stat_swapped;
 static double g_d5_stat_wait_ms, g_d5_stat_copy_ms;
+/* D5b lane knobs (set once at shelf init, before any speculative task):
+ * g_d5_drive: -1 = least-loaded of both drives, 0 = primary (data) drive
+ * only, 1 = replica only (DS4_ROCM_D5_DRIVE).  g_d5_lane_diag: 0 normal,
+ * 3 = skip the H2D upload, 4 = skip the read (DS4_ROCM_D5_DIAG=noupload /
+ * noread; both imply no adoption: the shelf holds garbage).  g_d5_strict:
+ * speculative chunks start only while no demand job set is active at all
+ * (DS4_ROCM_D5_STRICT=1), not merely when no demand chunk is queued. */
+static int g_d5_drive = -1;
+static int g_d5_lane_diag;
+static int g_d5_strict;
+/* Under g_stream_read_mutex: demand job sets started while speculative
+ * chunks were in flight, and the sum of those in-flight counts. */
+static uint64_t g_d5_stat_demand_starts, g_d5_stat_demand_starts_spec,
+                g_d5_stat_demand_spec_chunks;
 
 /* Drop all speculative work, wait for in-flight chunks, and give every shelf
  * entry its original buffer (from g_d5_shelf_mem).  Called before the
@@ -2729,6 +2750,7 @@ static int cuda_d5_spec_pick(int demand_waiting) {
         }
     }
     if (demand_waiting || g_d5_spec_inflight >= g_d5_cap) return -1;
+    if (g_d5_strict && g_stream_read_active_jobs) return -1;
     return 0;
 }
 
@@ -2777,13 +2799,18 @@ static void cuda_d5_spec_run(uint32_t worker_id, const d5_spec_task task, int dr
         const int fd = drive ? g_stream_replica_fd : g_model_direct_fd;
         if (read_size <= stage_bytes && aligned_off <= g_model_file_size &&
             read_size <= g_model_file_size - aligned_off &&
-            (cuda_pread_full(fd, stage, read_size, aligned_off) ||
+            (g_d5_lane_diag == 4 ||
+             cuda_pread_full(fd, stage, read_size, aligned_off) ||
              (drive && cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)))) {
-            cudaError_t err = cudaMemcpyAsync(e->buf + task.dst_rel, (char *)stage + delta,
-                                              (size_t)task.bytes, cudaMemcpyHostToDevice, stream);
-            if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
-            if (err == cudaSuccess) ok = 1;
-            else (void)cudaGetLastError();
+            if (g_d5_lane_diag == 3) {
+                ok = 1;
+            } else {
+                cudaError_t err = cudaMemcpyAsync(e->buf + task.dst_rel, (char *)stage + delta,
+                                                  (size_t)task.bytes, cudaMemcpyHostToDevice, stream);
+                if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
+                if (err == cudaSuccess) ok = 1;
+                else (void)cudaGetLastError();
+            }
         }
     }
     pthread_mutex_lock(&g_stream_read_mutex);
@@ -2827,8 +2854,14 @@ static void *cuda_stream_read_worker(void *arg) {
         }
         if (spec >= 0) {
             const d5_spec_task task = cuda_d5_spec_take((uint32_t)spec);
-            const int drive = (g_stream_replica_match && g_stream_replica_fd >= 0) ?
-                cuda_stream_replica_pick(task.bytes) : 0;
+            const int replica = g_stream_replica_match && g_stream_replica_fd >= 0;
+            int drive = 0;
+            if (replica && g_d5_drive < 0) {
+                drive = cuda_stream_replica_pick(task.bytes);
+            } else if (replica) {
+                drive = g_d5_drive;
+                g_stream_replica_inflight[drive] += task.bytes;
+            }
             pthread_mutex_unlock(&g_stream_read_mutex);
             cuda_d5_spec_run(worker_id, task, drive);
             continue;
@@ -3082,6 +3115,11 @@ static int cuda_stream_read_jobs_start(cuda_stream_read_job *jobs, uint32_t coun
     }
     cuda_stream_read_profile_note_jobs(jobs, count);
     g_stream_read_active_jobs = jobs;
+    g_d5_stat_demand_starts++;
+    if (g_d5_spec_inflight) {
+        g_d5_stat_demand_starts_spec++;
+        g_d5_stat_demand_spec_chunks += g_d5_spec_inflight;
+    }
     g_stream_read_active_replica = cuda_stream_replica_build_tasks(jobs, count);
     g_stream_read_active_count = g_stream_read_active_replica ?
         g_stream_replica_task_count : count;
@@ -4689,6 +4727,9 @@ static int cuda_stream_batch_selected_prepare_from_host(
     int jobs_flushed = 0;
     uint32_t unique_job_local[DS4_ROCM_D2_MAX_PAIRS];
     for (uint32_t u = 0; u < DS4_ROCM_D2_MAX_PAIRS; u++) unique_job_local[u] = UINT32_MAX;
+    /* D5b: drop shelf entries this union does not need before anything
+     * waits on the shelf or starts demand reads. */
+    if (ok) cuda_d5_release_unneeded(model_map, layer, unique_ids, unique_count);
 
     for (uint32_t u = 0; ok && u < unique_count; u++) {
         const int32_t expert_i = unique_ids[u];
@@ -4751,6 +4792,23 @@ static int cuda_stream_batch_selected_prepare_from_host(
             if (idx < 0) {
                 ok = 0;
                 break;
+            }
+            /* D5b: a prefetched copy fills the slot instead of a read: same
+             * slot, victim and clock; still counted as a miss above.  The
+             * union slot is then resident for the launch. */
+            if (g_d5_shelf_state == 1 &&
+                cuda_d5_adopt(model_map, layer, expert_i, gate_offset, up_offset,
+                              down_offset, gate_expert_bytes, down_expert_bytes, (size_t)idx)) {
+                cuda_stream_resident_expert &entry =
+                    g_stream_resident_experts[(size_t)idx];
+                entry.last_used = ++g_stream_resident_clock;
+                gate_host[u] = entry.gate;
+                up_host[u] = entry.up;
+                down_host[u] = entry.down;
+                resident_gate_host[u] = entry.gate;
+                resident_up_host[u] = entry.up;
+                resident_count++;
+                continue;
             }
             cuda_stream_resident_expert &entry =
                 g_stream_resident_experts[(size_t)idx];
@@ -5544,7 +5602,42 @@ static int cuda_d5_diag(void) {
         v = 0;
         if (env && !strcmp(env, "probe")) v = 1;
         else if (env && !strcmp(env, "noadopt")) v = 2;
+        else if (env && !strcmp(env, "noupload")) v = 3;   /* implies noadopt */
+        else if (env && !strcmp(env, "noread")) v = 4;     /* implies noadopt */
     }
+    return v;
+}
+
+/* D5b: speculative chunk size (DS4_ROCM_D5_CHUNK_KB, default the replica
+ * chunk, 1024), whether a load first drops shelf entries it does not need
+ * (DS4_ROCM_D5_EARLYDROP, default 1), and the verify-round prefetch knobs
+ * (DS4_ROCM_D5_VERIFY_K: union budget per layer, 0 = off, default 4;
+ * DS4_ROCM_D5_VERIFY_DEPTH: per-row candidates, default 6;
+ * DS4_ROCM_D5_VERIFY_L0: probe layer 0 on the round's attention input,
+ * default 1). */
+static uint64_t g_d5_chunk;
+
+static int cuda_d5_earlydrop(void) {
+    static int v = -1;
+    if (v < 0) v = cuda_d5_env_u32("DS4_ROCM_D5_EARLYDROP", 1u, 0u, 1u);
+    return v;
+}
+
+extern "C" uint32_t ds4_gpu_d5_verify_k(void) {
+    static int v = -1;
+    if (v < 0) v = cuda_d5_env_u32("DS4_ROCM_D5_VERIFY_K", 4u, 0u, 32u);
+    return (uint32_t)v;
+}
+
+extern "C" uint32_t ds4_gpu_d5_verify_depth(void) {
+    static int v = -1;
+    if (v < 0) v = cuda_d5_env_u32("DS4_ROCM_D5_VERIFY_DEPTH", 6u, 1u, 16u);
+    return (uint32_t)v;
+}
+
+extern "C" int ds4_gpu_d5_verify_l0(void) {
+    static int v = -1;
+    if (v < 0) v = cuda_d5_env_u32("DS4_ROCM_D5_VERIFY_L0", 1u, 0u, 1u);
     return v;
 }
 
@@ -5565,7 +5658,9 @@ static void cuda_d5_print_stats(void) {
             DS4_GPU_LOG_PREFIX "D5 prefetch: diag=%d shelf=%u cap=%u k=%u depth=%u issued=%llu "
             "adopted_ready=%llu adopted_inflight=%llu dropped_ready=%llu "
             "dropped_loading=%llu failed=%llu no_slot=%llu spec_read=%.2f GiB "
-            "adopt_wait=%.1f ms adopt_copy=%.1f ms swapped=%llu\n",
+            "adopt_wait=%.1f ms adopt_copy=%.1f ms swapped=%llu drive=%d strict=%d "
+            "chunk=%llu KiB earlydrop=%d demand_sets=%llu with_spec_inflight=%llu "
+            "spec_chunks_at_demand_start=%llu\n",
             cuda_d5_diag(), g_d5_shelf_n, g_d5_cap, ds4_gpu_d5_k(), ds4_gpu_d5_depth(),
             (unsigned long long)g_d5_stat_issued,
             (unsigned long long)g_d5_stat_adopt_ready,
@@ -5575,7 +5670,11 @@ static void cuda_d5_print_stats(void) {
             (unsigned long long)g_d5_stat_failed,
             (unsigned long long)g_d5_stat_no_slot,
             (double)g_d5_spec_bytes / 1073741824.0,
-            g_d5_stat_wait_ms, g_d5_stat_copy_ms, (unsigned long long)g_d5_stat_swapped);
+            g_d5_stat_wait_ms, g_d5_stat_copy_ms, (unsigned long long)g_d5_stat_swapped,
+            g_d5_drive, g_d5_strict, (unsigned long long)(g_d5_chunk / 1024u), cuda_d5_earlydrop(),
+            (unsigned long long)g_d5_stat_demand_starts,
+            (unsigned long long)g_d5_stat_demand_starts_spec,
+            (unsigned long long)g_d5_stat_demand_spec_chunks);
 }
 
 /* Lazily allocate the shelf; 1 when usable. */
@@ -5588,8 +5687,18 @@ static int cuda_d5_shelf_ready(uint64_t slot_bytes) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "D5: no O_DIRECT model fd, prefetch off\n");
         return 0;
     }
-    g_d5_shelf_n = (uint32_t)cuda_d5_env_u32("DS4_ROCM_D5_SHELF", 4u, 1u, DS4_D5_MAX_SHELF);
+    g_d5_shelf_n = (uint32_t)cuda_d5_env_u32("DS4_ROCM_D5_SHELF", 16u, 1u, DS4_D5_MAX_SHELF);
     g_d5_cap = (uint32_t)cuda_d5_env_u32("DS4_ROCM_D5_INFLIGHT", 16u, 1u, 64u);
+    {
+        const char *dv = getenv("DS4_ROCM_D5_DRIVE");
+        g_d5_drive = (dv && !strcmp(dv, "0")) ? 0 : (dv && !strcmp(dv, "1")) ? 1 : -1;
+        g_d5_strict = cuda_d5_env_u32("DS4_ROCM_D5_STRICT", 0u, 0u, 1u);
+        g_d5_lane_diag = cuda_d5_diag() >= 3 ? cuda_d5_diag() : 0;
+        const uint64_t def_kb = g_stream_replica_chunk ? g_stream_replica_chunk / 1024u : 1024u;
+        uint64_t kb = (uint64_t)cuda_d5_env_u32("DS4_ROCM_D5_CHUNK_KB", (uint32_t)def_kb, 64u, 8192u);
+        kb = (kb + 63u) / 64u * 64u;
+        g_d5_chunk = kb * 1024u;
+    }
     if (!cuda_stream_read_pool_ensure()) return 0;
     uint64_t total = 0;
     if (!cuda_u64_mul_checked(slot_bytes, g_d5_shelf_n, &total)) return 0;
@@ -5638,7 +5747,7 @@ extern "C" int ds4_gpu_d5_prefetch(const ds4_gpu_stream_expert_table *t,
     }
     const uint64_t g = t->gate_expert_bytes, d = t->down_expert_bytes;
     if (!g || !d || !cuda_d5_shelf_ready(2u * g + d)) return 0;
-    const uint64_t chunk = g_stream_replica_chunk ? g_stream_replica_chunk : 1048576u;
+    const uint64_t chunk = g_d5_chunk ? g_d5_chunk : 1048576u;
     uint32_t queued = 0;
     pthread_mutex_lock(&g_stream_read_mutex);
     /* Every worker must already have a staging buffer that holds a chunk
@@ -5714,7 +5823,7 @@ static int cuda_d5_adopt(const void *model_map, uint32_t layer, int32_t expert,
                          uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
                          size_t resident_idx) {
     if (g_d5_shelf_state != 1 || resident_idx >= g_stream_resident_experts.size() ||
-        cuda_d5_diag() == 2) return 0;
+        cuda_d5_diag() >= 2) return 0;
     cuda_stream_resident_expert &slot = g_stream_resident_experts[resident_idx];
     char *dst = slot.base;
     if (!dst) return 0;
@@ -5818,6 +5927,38 @@ static void cuda_d5_release_upto(const void *model_map, uint32_t layer) {
     pthread_mutex_unlock(&g_stream_read_mutex);
 }
 
+/* D5b: before a load of `layer` touches the shelf, drop every entry of that
+ * layer (or an older one, or another table) whose expert the load does not
+ * select, so that no worker starts another chunk of it (it would delay the
+ * demand reads and any urgent adoption).  Chunks already in flight finish.
+ * Main thread. */
+static void cuda_d5_release_unneeded(const void *model_map, uint32_t layer,
+                                     const int32_t *ids, uint32_t n) {
+    if (g_d5_shelf_state != 1 || !cuda_d5_earlydrop()) return;
+    pthread_mutex_lock(&g_stream_read_mutex);
+    for (uint32_t i = 0; i < g_d5_shelf_n; i++) {
+        d5_shelf_entry *e = &g_d5_shelf[i];
+        if (e->state != DS4_D5_LOADING && e->state != DS4_D5_READY) continue;
+        if (e->model_map == model_map && e->layer > layer) continue;
+        int needed = 0;
+        if (e->model_map == model_map && e->layer == layer) {
+            for (uint32_t j = 0; j < n && !needed; j++) needed = ids[j] == e->expert;
+        }
+        if (needed) continue;
+        if (e->state == DS4_D5_READY) {
+            g_d5_stat_drop_ready++;
+            e->state = DS4_D5_FREE;
+        } else {
+            g_d5_stat_drop_loading++;
+            const uint32_t removed = cuda_d5_spec_unqueue(i);
+            e->tasks_left -= removed;
+            e->state = e->tasks_left ? DS4_D5_DRAINING : DS4_D5_FREE;
+        }
+        e->urgent = 0;
+    }
+    pthread_mutex_unlock(&g_stream_read_mutex);
+}
+
 /* Test hooks (tests/test_d5_prefetch_rocm.c, model-free). */
 extern "C" int ds4_gpu_test_d5_resident_bytes(const ds4_gpu_stream_expert_table *t,
                                               int32_t expert, void *out_host) {
@@ -5868,12 +6009,12 @@ static int g_d5_probe_pending;
 
 extern "C" int ds4_gpu_d5_probe_readback_start(const ds4_gpu_tensor *logits, uint32_t n) {
     g_d5_probe_pending = 0;
-    if (n == 0u || n > DS4_ROCM_MAX_N_EXPERT || !logits || logits->bytes < (uint64_t)n * sizeof(float)) {
+    if (n == 0u || n > 8u * DS4_ROCM_MAX_N_EXPERT || !logits || logits->bytes < (uint64_t)n * sizeof(float)) {
         return 0;
     }
     if (!g_d5_probe_host) {
         cudaError_t err = cudaMallocHost((void **)&g_d5_probe_host,
-                                         DS4_ROCM_MAX_N_EXPERT * sizeof(float));
+                                         8u * DS4_ROCM_MAX_N_EXPERT * sizeof(float));
         if (err != cudaSuccess) {
             g_d5_probe_host = NULL;
             return cuda_ok(err, "D5 probe pinned allocation");
@@ -6040,6 +6181,8 @@ static int cuda_stream_selected_load(
         g_d5_trace_snapshot_done = 1;
         cuda_d5_trace_snapshot();
     }
+    /* D5b: unneeded speculative chunks must not run ahead of this load. */
+    cuda_d5_release_unneeded(model_map, layer, selected_ids, n_selected);
 
     for (uint32_t i = 0; i < n_selected; i++) {
         if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {

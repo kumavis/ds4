@@ -1523,6 +1523,9 @@ enum {
     D8_DET_ROUTER, D8_DET_SHARED, D8_DET_ROUTED, D8_DET_TAIL, D8_DET_N
 };
 static double g_d8_detail_ms[D8_DET_N];
+/* D8: true while the drafter (proposal or its per-token KV bookkeeping) is
+ * issuing projections; only those may take the drafter F16 kernel. */
+static bool g_d8_draft_scope;
 
 static bool d8_env_flag(const char *name) {
     const char *v = getenv(name);
@@ -41644,9 +41647,42 @@ static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
 static bool g_ds41_dspark_verify_dense;
 #endif
 
+#ifdef DS4_ROCM_BUILD
+int ds4_gpu_d8_f16_rows(ds4_gpu_tensor *out, uint64_t out_elem0,
+        uint32_t out_stride, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t width, uint32_t outputs,
+        uint32_t rows, const ds4_gpu_tensor *in, uint64_t in_elem0,
+        uint32_t in_stride);
+
+/* D8: drafter F16 projections read each weight once for all rows (1..8)
+ * with coalesced loads.  Default on; DS4_D8_DRAFT_F16=0 restores the old
+ * per-row path.  Changes drafter rounding only (draft-side). */
+static bool d8_draft_f16_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_D8_DRAFT_F16");
+        cached = !env || !env[0] || strcmp(env, "0") != 0;
+    }
+    return cached == 1;
+}
+
+static bool d8_draft_f16_try(ds4_gpu_tensor *out, const ds4_model *m,
+                             const ds4_tensor *weight,
+                             const ds4_gpu_tensor *in, uint32_t count) {
+    if (!g_d8_draft_scope || weight->type != DS4_TENSOR_F16 || !count ||
+        count > 8u || !d8_draft_f16_enabled()) return false;
+    const uint32_t width = (uint32_t)weight->dim[0];
+    const uint32_t outputs = (uint32_t)weight->dim[1];
+    return ds4_gpu_d8_f16_rows(out, 0, outputs, m->map, m->size,
+        weight->abs_offset, width, outputs, count, in, 0, width) != 0;
+}
+#endif
+
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
 #ifdef DS4_ROCM_BUILD
+    if (d8_draft_f16_try(out, m, weight, in, 1u))
+        return !round || ds41_bf16(out, (uint32_t)weight->dim[1]);
     if (weight->type == DS4_TENSOR_F32 && weight->dim[0] == 5120u &&
         (weight->dim[1] == 128u || weight->dim[1] == 384u)) {
         const bool ok = ds4_gpu_dsv41_f32_projection_rows(out, m->map, m->size,
@@ -41680,6 +41716,8 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
     const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
     bool ok;
 #ifdef DS4_ROCM_BUILD
+    if (d8_draft_f16_try(out, m, weight, in, count))
+        return !round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16);
     if (weight->type == DS4_TENSOR_F32 && count >= 2u && count <= 6u) {
         ok = ds4_gpu_dsv41_f32_projection_rows(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
@@ -42940,6 +42978,8 @@ static bool ds41_draft_pending_range(ds41_gpu_graph *g, uint32_t r0,
     const ds4_dspark_weights *dw = d->w;
     const uint32_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM;
     if (!n) return true;
+    const bool outer_scope = g_d8_draft_scope;
+    g_d8_draft_scope = true;
     ds4_gpu_tensor *mh = ds4_gpu_tensor_view(d->mh,
         (uint64_t)r0 * d->n_target * dim * sizeof(float),
         (uint64_t)n * d->n_target * dim * sizeof(float));
@@ -42966,6 +43006,7 @@ static bool ds41_draft_pending_range(ds41_gpu_graph *g, uint32_t r0,
     ds4_gpu_tensor_free(tmp);
     ds4_gpu_tensor_free(mx);
     ds4_gpu_tensor_free(mh);
+    g_d8_draft_scope = outer_scope;
     return ok;
 }
 
@@ -43094,6 +43135,18 @@ static bool ds41_draft_attention_output(ds41_gpu_graph *g,
     uint64_t weight_row;
     if (g->tp_world != 1u ||
         !tensor_nbytes(l->attn_output_a->type, width, &weight_row)) return false;
+    bool grouped = g_d8_draft_scope && l->attn_output_a->type == DS4_TENSOR_F16 &&
+        count <= 8u && d8_draft_f16_enabled();
+    for (uint32_t group = 0; grouped && group < groups; group++)
+        grouped = ds4_gpu_d8_f16_rows(g->batch.low,
+            (uint64_t)group * DS4_N_LORA_O, groups * DS4_N_LORA_O,
+            m->map, m->size, l->attn_output_a->abs_offset +
+                (uint64_t)group * DS4_N_LORA_O * weight_row,
+            width, DS4_N_LORA_O, count, g->batch.heads,
+            (uint64_t)group * width, groups * width) != 0;
+    if (grouped)
+        return ds41_matmul_batch(g->batch.block, m, l->attn_output_b,
+                                 g->batch.low, count, false);
     for (uint32_t row = 0; row < count; row++) {
         for (uint32_t group = 0; group < groups; group++) {
             ds4_tensor slice = *l->attn_output_a;
@@ -43291,12 +43344,14 @@ static bool ds41_draft_propose(ds41_gpu_graph *g, const ds4_model *m,
         g_d8_detail_t0 = now_sec();
     }
 #endif
+    g_d8_draft_scope = true;
     for (uint32_t st = 0; ok && st < d->n_stage; st++) {
         ok = ds41_draft_stage(g, st, B);
 #ifdef DS4_ROCM_BUILD
         DS41_DRAFT_PROFILE(profile_stage[st]);
 #endif
     }
+    g_d8_draft_scope = false;
     const bool d8_detail = g_d8_detail_active;
     (void)d8_detail;
     g_d8_detail_active = false;

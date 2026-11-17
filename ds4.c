@@ -41203,6 +41203,9 @@ typedef struct {
     uint32_t n_stage, block, n_target, rank, noise_token;
     uint32_t targets[DS4_DSPARK_MAX_TARGET_LAYERS];
     uint32_t mh_pos0, mh_rows, verify_rows;
+    /* D8 lazy bookkeeping: rows [mh_pos0, mh_pos0 + mh_rows) hold captured
+     * target features whose drafter KV has not been projected/committed. */
+    bool lazy_dirty;
     uint32_t skip_left, policy_cycles, policy_drafted, policy_accepted;
     ds4_gpu_tensor *mh, *pending, *ring, *raw, *conf_proj, *markov_head_t;
     ds4_gpu_tensor *tokens, *conf, *parts, *logits, *x, *xn;
@@ -41231,6 +41234,7 @@ static void ds41_draft_reset(ds41_draft *d) {
     d->mh_pos0 = 0;
     d->mh_rows = 0;
     d->verify_rows = 0;
+    d->lazy_dirty = false;
     d->skip_left = 0;
     d->policy_cycles = 0;
     d->policy_drafted = 0;
@@ -42928,12 +42932,16 @@ static bool ds41_draft_capture(ds41_gpu_graph *g, uint32_t il,
     return true;
 }
 
-static bool ds41_draft_pending(ds41_gpu_graph *g) {
+/* Project captured rows [r0, r0 + n) of the feature window into each
+ * stage's pending drafter KV.  Every operation is row-local. */
+static bool ds41_draft_pending_range(ds41_gpu_graph *g, uint32_t r0,
+                                     uint32_t n) {
     ds41_draft *d = g->draft;
     const ds4_dspark_weights *dw = d->w;
-    const uint32_t n = d->mh_rows, dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM;
+    const uint32_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM;
     if (!n) return true;
-    ds4_gpu_tensor *mh = ds4_gpu_tensor_view(d->mh, 0,
+    ds4_gpu_tensor *mh = ds4_gpu_tensor_view(d->mh,
+        (uint64_t)r0 * d->n_target * dim * sizeof(float),
         (uint64_t)n * d->n_target * dim * sizeof(float));
     ds4_gpu_tensor *mx = ds4_gpu_tensor_view(d->rows_x, 0,
         (uint64_t)n * dim * sizeof(float));
@@ -42946,18 +42954,56 @@ static bool ds41_draft_pending(ds41_gpu_graph *g) {
     for (uint32_t st = 0; ok && st < d->n_stage; st++) {
         const ds4_layer_weights *l = &dw->stage[st].block;
         ds4_gpu_tensor *v = ds4_gpu_tensor_view(d->pending,
-            (uint64_t)st * DS41_DRAFT_WINDOW * hd * sizeof(float),
+            ((uint64_t)st * DS41_DRAFT_WINDOW + r0) * hd * sizeof(float),
             (uint64_t)n * hd * sizeof(float));
         ok = v && ds41_matmul_batch(v, d->m, l->attn_kv, mx, n, false) &&
             ds4_gpu_rms_norm_weight_rows_tensor(v, v, d->m->map, d->m->size,
                 l->attn_kv_a_norm->abs_offset, hd, n, DS4_RMS_EPS) &&
-            ds4_gpu_dsv41_rope(v, hd, 1, n, d->mh_pos0, false, false) &&
+            ds4_gpu_dsv41_rope(v, hd, 1, n, d->mh_pos0 + r0, false, false) &&
             ds4_gpu_dsv41_quantize(v, hd, n, DS4_V41_FP8_E8M0);
         ds4_gpu_tensor_free(v);
     }
     ds4_gpu_tensor_free(tmp);
     ds4_gpu_tensor_free(mx);
     ds4_gpu_tensor_free(mh);
+    return ok;
+}
+
+static bool ds41_draft_pending(ds41_gpu_graph *g) {
+    return ds41_draft_pending_range(g, 0, g->draft->mh_rows);
+}
+
+/* D8: DS4_D8_LAZY_PENDING=1 defers the per-token drafter KV projection of
+ * ordinary steps until a proposal, verification or prefill needs the ring.
+ * =1 projects the deferred rows one at a time (the same one-row launches an
+ * eager step makes, so the drafter state is bit-identical); =2 projects them
+ * as one batch (fewer launches; the batched kernels may round differently,
+ * which can only change proposals, never what verification accepts). */
+static int ds41_draft_lazy_mode(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_D8_LAZY_PENDING");
+        cached = env && env[0] ? atoi(env) : 0;
+        if (cached < 0 || cached > 2) cached = 0;
+    }
+    return cached;
+}
+
+static bool ds41_draft_commit(ds41_gpu_graph *g, uint32_t rows);
+
+static bool ds41_draft_flush(ds41_gpu_graph *g) {
+    ds41_draft *d = g->draft;
+    if (!d || !d->lazy_dirty) return true;
+    d->lazy_dirty = false;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ds41_draft_lazy_mode() == 2) {
+        ok = ok && ds41_draft_pending(g);
+    } else {
+        for (uint32_t r = 0; ok && r < d->mh_rows; r++)
+            ok = ds41_draft_pending_range(g, r, 1);
+    }
+    ok = ok && ds41_draft_commit(g, d->mh_rows);
+    if (!ds4_gpu_end_commands()) ok = false;
     return ok;
 }
 
@@ -43206,6 +43252,8 @@ static bool ds41_draft_propose(ds41_gpu_graph *g, const ds4_model *m,
     } \
 } while (0)
 #endif
+    /* Deferred drafter bookkeeping is part of this proposal's cost. */
+    if (!ds41_draft_flush(g)) return false;
     for (uint32_t t = 0; t < B; t++) {
         pre[t * hc] = 1.0f;
         tokens[t] = t ? (int)d->noise_token : t0;
@@ -43455,12 +43503,23 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         (!defer || !strcmp(defer, "1")) && queue_layers &&
         g->tp_world == 1u && !g->draft && !g->dspark && logits;
 #endif
+    const bool draft_lazy = g->draft && !g->draft->verify_rows &&
+        ds41_draft_lazy_mode() != 0;
     if (g->draft) {
         /* A scalar speculative verifier reserves the whole proposed interval
          * up front so each ordinary decode row lands in its own feature slot. */
-        if (!g->draft->verify_rows) {
-            g->draft->mh_pos0 = g->pos;
-            g->draft->mh_rows = 1;
+        ds41_draft *d = g->draft;
+        if (draft_lazy && d->lazy_dirty && d->mh_pos0 + d->mh_rows == g->pos &&
+            d->mh_rows < DS41_DRAFT_WINDOW) {
+            d->mh_rows++;
+        } else if (!d->verify_rows) {
+            if (d->lazy_dirty) {
+                const double pend_t0 = now_sec();
+                if (!ds41_draft_flush(g)) ok = false;
+                g_d8_step_pending_ms += (now_sec() - pend_t0) * 1000.0;
+            }
+            d->mh_pos0 = g->pos;
+            d->mh_rows = 1;
         }
     }
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -43522,7 +43581,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #ifdef DS4_ROCM_BUILD
     if (g->streaming && !ds4_gpu_stream_expert_cache_quiesce()) ok = false;
 #endif
-    if (ok && g->draft && !g->draft->verify_rows) {
+    if (ok && draft_lazy) {
+        g->draft->lazy_dirty = true;
+    } else if (ok && g->draft && !g->draft->verify_rows) {
         const double pend_t0 = now_sec();
         ok = ds4_gpu_begin_commands() && ds41_draft_pending(g) &&
             ds41_draft_commit(g, 1);
@@ -44052,6 +44113,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     if (!ds41_hash_tokens(g, &next_history, tokens, total_count, &ids[0][0][0]))
         return false;
     const uint32_t initial_start = g->pos;
+    if (g->draft && !encoder_only && !ds41_draft_flush(g)) return false;
     if (g->draft && !encoder_only) {
         const uint32_t keep = total_count < DS41_DRAFT_WINDOW ?
             total_count : DS41_DRAFT_WINDOW;
@@ -44816,6 +44878,10 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
     if (!d || !g->valid || n < 2u || n > d->block + 1u ||
         n > DS4_TP_BATCH_MAX_ROWS || g->pos > g->ctx || n > g->ctx - g->pos)
         return false;
+    if (!ds41_draft_flush(g)) {
+        g->valid = false;
+        return false;
+    }
 #ifdef DS4_ROCM_BUILD
     /* gfx1151's highly tuned resident one-row trunk is substantially faster
      * than its prefill kernels at DSpark's two-to-six-row verifier widths.

@@ -42585,8 +42585,77 @@ static bool ds41_balance_shared(const ds41_gpu_graph *g, const ds4_layer_weights
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && ds41_shared_balance_enabled();
 }
 
+#ifdef DS4_ROCM_BUILD
+/* D5 stage 1 probe (measurement only; DS4_ROCM_D5_PROBE=1 together with
+ * DS4_ROCM_D5_TRACE): evaluates a layer's router early on a hidden state that
+ * exists before that layer's own router input, and logs its top-16 by the
+ * router's selection score (sqrt(softplus(logit)) + bias, index tie-break):
+ *   <tag> <target_layer> <us> <id0> .. <id15>
+ * <us> is the wall time of norm + router matmul + readback between two
+ * device drains.  Scratch tensors are private; no model state is touched.
+ * Tags: P0 = layer L's attention input -> layer L+1's router,
+ *       P1 = layer L's FFN input (pre-norm) -> layer L+1's router,
+ *       P2 = layer L's attention input -> layer L's own router. */
+static int g_d5_probe_state = -1;
+static ds4_gpu_tensor *g_d5_probe_norm, *g_d5_probe_logits;
+
+static bool d5_probe_on(void) {
+    if (g_d5_probe_state < 0) {
+        const char *e = getenv("DS4_ROCM_D5_PROBE");
+        g_d5_probe_state = e && e[0] && strcmp(e, "0") && ds4_gpu_d5_trace_on() ? 1 : 0;
+    }
+    return g_d5_probe_state > 0;
+}
+
+static float d5_softplus(float x) {
+    if (x > 20.0f) return x;
+    if (x < -10.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+static bool d5_probe(const ds41_gpu_graph *g, const ds4_model *m,
+                     const ds4_layer_weights *target, uint32_t target_il,
+                     const ds4_gpu_tensor *x, const char *tag) {
+    if (g->tp_world != 1u || !g->streaming || g->draft || g->dspark) return true;
+    if (DS4_N_EXPERT != 384u || !target->ffn_norm || !target->ffn_gate_inp ||
+        !target->ffn_exp_probs_b) return true;
+    if (!g_d5_probe_norm) {
+        g_d5_probe_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        g_d5_probe_logits = ds4_gpu_tensor_alloc(384u * sizeof(float));
+        if (!g_d5_probe_norm || !g_d5_probe_logits) return false;
+    }
+    float lg[384];
+    float drain;
+    if (!ds4_gpu_tensor_read(x, 0, &drain, sizeof(drain))) return false;
+    const double t0 = now_sec();
+    if (!ds41_norm(g_d5_probe_norm, x, m, target->ffn_norm) ||
+        !ds41_matmul(g_d5_probe_logits, m, target->ffn_gate_inp, g_d5_probe_norm, false) ||
+        !ds4_gpu_tensor_read(g_d5_probe_logits, 0, lg, sizeof(lg))) return false;
+    const double us = (now_sec() - t0) * 1e6;
+    const float *bias = (const float *)((const char *)m->map +
+                                        target->ffn_exp_probs_b->abs_offset);
+    float score[384];
+    for (uint32_t e = 0; e < 384u; e++) score[e] = sqrtf(d5_softplus(lg[e])) + bias[e];
+    char line[256];
+    int n = snprintf(line, sizeof(line), "%s %u %.0f", tag, target_il, us);
+    for (uint32_t k = 0; k < 16u && n > 0 && (size_t)n < sizeof(line); k++) {
+        uint32_t best = 0;
+        for (uint32_t e = 1; e < 384u; e++)
+            if (score[e] > score[best]) best = e;
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " %u", best);
+        score[best] = -INFINITY;
+    }
+    ds4_gpu_d5_trace_write(line);
+    return true;
+}
+#endif
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
+#ifdef DS4_ROCM_BUILD
+    if (il + 1u < DS4_N_LAYER && d5_probe_on() &&
+        !d5_probe(g, m, l + 1, il + 1u, g->x, "P1")) return false;
+#endif
     uint64_t gate_row = 0, down_row = 0;
     if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
         !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
@@ -42736,6 +42805,12 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
         ds41_hc_mix(g, m, l, false) &&
         ds41_hc_sum(g->x, g->residual, g->pre, false) && ds41_norm(g->norm, g->x, m, l->attn_norm);
     if (ok) D0_TAP_ROW(g, D0_ATTN_NORM, il, g->norm, DS4_N_EMBD);
+#ifdef DS4_ROCM_BUILD
+    if (ok && d5_probe_on()) {
+        if (il + 1u < DS4_N_LAYER && !d5_probe(g, m, l + 1, il + 1u, g->x, "P0")) return false;
+        if (!d5_probe(g, m, l, il, g->x, "P2")) return false;
+    }
+#endif
     return ok;
 }
 

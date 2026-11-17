@@ -479,6 +479,13 @@ int ds4_gpu_d2_decode_mode(void);
 int ds4_gpu_d2_verify_enabled(void);
 int ds4_gpu_selected_readback_start(const ds4_gpu_tensor *selected, uint32_t n_ids);
 int ds4_gpu_selected_readback_finish(int32_t *ids, uint32_t n_ids);
+/* D5 stage 1 (measurement only): DS4_ROCM_D5_TRACE=<path> appends one line
+ * per single-token selected expert load ("S layer id0..id5 miss_mask") and a
+ * one-time resident-cache snapshot to <path>.  ds4_gpu_d5_trace_on reports
+ * whether the trace is open; ds4_gpu_d5_trace_write appends one line (the
+ * early-router probe in ds4.c uses it).  Off (unset) costs one branch. */
+int ds4_gpu_d5_trace_on(void);
+void ds4_gpu_d5_trace_write(const char *line);
 int ds4_gpu_stream_expert_cache_begin_selected_batch(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,

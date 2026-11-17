@@ -5284,6 +5284,65 @@ static int cuda_stream_layer_expert_cache_seed_selected(
     return ok;
 }
 
+/* ---- D5 stage 1: expert-selection trace (measurement only) -------------
+ * DS4_ROCM_D5_TRACE=<path>: the single-token selected load appends
+ *   S <layer> <id0> .. <id5> <miss_mask>
+ * (bit i of miss_mask = slot i was not resident), and the first such call
+ * first dumps the resident cache in LRU order (oldest first):
+ *   C <budget> <slot_count> <n_resident>
+ *   R <layer> <expert>          (n_resident lines)
+ * so an offline LRU replay can be checked against the recorded misses.
+ * Unset: one cached branch per load; nothing else changes. */
+static FILE *g_d5_trace_file;
+static int g_d5_trace_state = -1;
+static int g_d5_trace_snapshot_done;
+
+extern "C" int ds4_gpu_d5_trace_on(void) {
+    if (g_d5_trace_state < 0) {
+        const char *path = getenv("DS4_ROCM_D5_TRACE");
+        g_d5_trace_state = 0;
+        if (path && path[0] && strcmp(path, "0") != 0) {
+            g_d5_trace_file = fopen(path, "w");
+            if (g_d5_trace_file) {
+                setvbuf(g_d5_trace_file, NULL, _IOLBF, 1u << 16);
+                g_d5_trace_state = 1;
+            } else {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX "D5 trace: cannot open %s\n", path);
+            }
+        }
+    }
+    return g_d5_trace_state;
+}
+
+extern "C" void ds4_gpu_d5_trace_write(const char *line) {
+    if (ds4_gpu_d5_trace_on() && line) {
+        fputs(line, g_d5_trace_file);
+        fputc('\n', g_d5_trace_file);
+    }
+}
+
+static void cuda_d5_trace_snapshot(void) {
+    std::vector<size_t> order(g_stream_resident_experts.size());
+    for (size_t i = 0; i < order.size(); i++) order[i] = i;
+    std::sort(order.begin(), order.end(), [](size_t a, size_t b) {
+        return g_stream_resident_experts[a].last_used <
+               g_stream_resident_experts[b].last_used;
+    });
+    fprintf(g_d5_trace_file, "C %u %u %zu\n", g_stream_expert_cache_budget,
+            g_stream_expert_slot_count, order.size());
+    for (size_t i : order) {
+        fprintf(g_d5_trace_file, "R %u %d\n", g_stream_resident_experts[i].layer,
+                g_stream_resident_experts[i].expert);
+    }
+}
+
+static void cuda_d5_trace_selected(uint32_t layer, const int32_t *ids,
+                                   uint32_t n, uint32_t miss_mask) {
+    fprintf(g_d5_trace_file, "S %u", layer);
+    for (uint32_t i = 0; i < n; i++) fprintf(g_d5_trace_file, " %d", ids[i]);
+    fprintf(g_d5_trace_file, " %u\n", miss_mask);
+}
+
 static int cuda_stream_selected_load(
         const void *model_map,
         uint64_t model_size,
@@ -5353,6 +5412,11 @@ static int cuda_stream_selected_load(
     const int use_fd =
         g_model_fd >= 0 &&
         (g_model_fd_host_base == NULL || model_map == g_model_fd_host_base);
+    const int d5_trace = ds4_gpu_d5_trace_on();
+    if (d5_trace && !g_d5_trace_snapshot_done) {
+        g_d5_trace_snapshot_done = 1;
+        cuda_d5_trace_snapshot();
+    }
 
     for (uint32_t i = 0; i < n_selected; i++) {
         if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
@@ -5479,6 +5543,7 @@ static int cuda_stream_selected_load(
             }
         }
     }
+    if (d5_trace) cuda_d5_trace_selected(layer, selected_ids, n_selected, missing_mask);
 
     if (resident_mask != 0 && missing_mask == 0) {
         g_stream_selected_pending.active = 1;

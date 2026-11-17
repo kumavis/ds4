@@ -2702,10 +2702,12 @@ static double g_d5_stat_wait_ms, g_d5_stat_copy_ms;
 static int g_d5_drive = -1;
 static int g_d5_lane_diag;
 static int g_d5_strict;
+static uint32_t g_d5_cap_busy = 64;
 /* Under g_stream_read_mutex: demand job sets started while speculative
  * chunks were in flight, and the sum of those in-flight counts. */
 static uint64_t g_d5_stat_demand_starts, g_d5_stat_demand_starts_spec,
                 g_d5_stat_demand_spec_chunks;
+static uint64_t g_d5_stat_drop_stale;
 
 /* Drop all speculative work, wait for in-flight chunks, and give every shelf
  * entry its original buffer (from g_d5_shelf_mem).  Called before the
@@ -2750,7 +2752,10 @@ static int cuda_d5_spec_pick(int demand_waiting) {
         }
     }
     if (demand_waiting || g_d5_spec_inflight >= g_d5_cap) return -1;
-    if (g_d5_strict && g_stream_read_active_jobs) return -1;
+    /* While a demand job set is active (its last chunks in flight), at most
+     * g_d5_cap_busy speculative chunks may run: they share the drives with
+     * the demand tail (DS4_ROCM_D5_INFLIGHT_BUSY; STRICT = 0). */
+    if (g_stream_read_active_jobs && g_d5_spec_inflight >= g_d5_cap_busy) return -1;
     return 0;
 }
 
@@ -5658,9 +5663,9 @@ static void cuda_d5_print_stats(void) {
             DS4_GPU_LOG_PREFIX "D5 prefetch: diag=%d shelf=%u cap=%u k=%u depth=%u issued=%llu "
             "adopted_ready=%llu adopted_inflight=%llu dropped_ready=%llu "
             "dropped_loading=%llu failed=%llu no_slot=%llu spec_read=%.2f GiB "
-            "adopt_wait=%.1f ms adopt_copy=%.1f ms swapped=%llu drive=%d strict=%d "
+            "adopt_wait=%.1f ms adopt_copy=%.1f ms swapped=%llu drive=%d strict=%d cap_busy=%u "
             "chunk=%llu KiB earlydrop=%d demand_sets=%llu with_spec_inflight=%llu "
-            "spec_chunks_at_demand_start=%llu\n",
+            "spec_chunks_at_demand_start=%llu dropped_stale=%llu\n",
             cuda_d5_diag(), g_d5_shelf_n, g_d5_cap, ds4_gpu_d5_k(), ds4_gpu_d5_depth(),
             (unsigned long long)g_d5_stat_issued,
             (unsigned long long)g_d5_stat_adopt_ready,
@@ -5671,10 +5676,11 @@ static void cuda_d5_print_stats(void) {
             (unsigned long long)g_d5_stat_no_slot,
             (double)g_d5_spec_bytes / 1073741824.0,
             g_d5_stat_wait_ms, g_d5_stat_copy_ms, (unsigned long long)g_d5_stat_swapped,
-            g_d5_drive, g_d5_strict, (unsigned long long)(g_d5_chunk / 1024u), cuda_d5_earlydrop(),
+            g_d5_drive, g_d5_strict, g_d5_cap_busy, (unsigned long long)(g_d5_chunk / 1024u), cuda_d5_earlydrop(),
             (unsigned long long)g_d5_stat_demand_starts,
             (unsigned long long)g_d5_stat_demand_starts_spec,
-            (unsigned long long)g_d5_stat_demand_spec_chunks);
+            (unsigned long long)g_d5_stat_demand_spec_chunks,
+            (unsigned long long)g_d5_stat_drop_stale);
 }
 
 /* Lazily allocate the shelf; 1 when usable. */
@@ -5693,6 +5699,8 @@ static int cuda_d5_shelf_ready(uint64_t slot_bytes) {
         const char *dv = getenv("DS4_ROCM_D5_DRIVE");
         g_d5_drive = (dv && !strcmp(dv, "0")) ? 0 : (dv && !strcmp(dv, "1")) ? 1 : -1;
         g_d5_strict = cuda_d5_env_u32("DS4_ROCM_D5_STRICT", 0u, 0u, 1u);
+        g_d5_cap_busy = g_d5_strict ? 0u :
+            (uint32_t)cuda_d5_env_u32("DS4_ROCM_D5_INFLIGHT_BUSY", g_d5_cap, 0u, 64u);
         g_d5_lane_diag = cuda_d5_diag() >= 3 ? cuda_d5_diag() : 0;
         const uint64_t def_kb = g_stream_replica_chunk ? g_stream_replica_chunk / 1024u : 1024u;
         uint64_t kb = (uint64_t)cuda_d5_env_u32("DS4_ROCM_D5_CHUNK_KB", (uint32_t)def_kb, 64u, 8192u);
@@ -5773,6 +5781,22 @@ extern "C" int ds4_gpu_d5_prefetch(const ds4_gpu_stream_expert_table *t,
         if (have) continue;
         if (free_i == UINT32_MAX) {
             g_d5_stat_no_slot++;
+            /* DS4_ROCM_D5_DEBUG: dump the shelf on the first few full-shelf
+             * refusals (diagnostic only). */
+            static int dbg = -1;
+            static int dumps;
+            if (dbg < 0) dbg = getenv("DS4_ROCM_D5_DEBUG") != NULL;
+            if (dbg && dumps < 8) {
+                dumps++;
+                fprintf(stderr, DS4_GPU_LOG_PREFIX "D5 debug: shelf full for layer %u (map %p), tasks queued %u, in flight %u, demand active %d\n",
+                        t->layer, t->model_map, g_d5_task_n, g_d5_spec_inflight,
+                        g_stream_read_active_jobs != NULL);
+                for (uint32_t i = 0; i < g_d5_shelf_n; i++) {
+                    const d5_shelf_entry *q = &g_d5_shelf[i];
+                    fprintf(stderr, DS4_GPU_LOG_PREFIX "D5 debug:   [%u] state=%d layer=%u expert=%d left=%u urgent=%d map=%p\n",
+                            i, q->state, q->layer, q->expert, q->tasks_left, q->urgent, q->model_map);
+                }
+            }
             break;
         }
         const uint64_t off[3] = {t->gate_offset + (uint64_t)ex * g, t->up_offset + (uint64_t)ex * g,
@@ -5934,12 +5958,21 @@ static void cuda_d5_release_upto(const void *model_map, uint32_t layer) {
  * Main thread. */
 static void cuda_d5_release_unneeded(const void *model_map, uint32_t layer,
                                      const int32_t *ids, uint32_t n) {
-    if (g_d5_shelf_state != 1 || !cuda_d5_earlydrop()) return;
+    if (g_d5_shelf_state != 1) return;
+    const int early = cuda_d5_earlydrop();
     pthread_mutex_lock(&g_stream_read_mutex);
     for (uint32_t i = 0; i < g_d5_shelf_n; i++) {
         d5_shelf_entry *e = &g_d5_shelf[i];
         if (e->state != DS4_D5_LOADING && e->state != DS4_D5_READY) continue;
-        if (e->model_map == model_map && e->layer > layer) continue;
+        /* Prefetches are issued for the next load only (layer L+1 after
+         * layer L's load; layer 0 of a verify round just before its load),
+         * so at a load of `layer` any entry of another layer or table is
+         * stale: e.g. layer 38/39 entries of a verify round whose last
+         * layers did not reach a streamed load (seen on p-json).  Without
+         * this they filled the shelf for the rest of the run. */
+        const int stale = e->model_map != model_map || e->layer != layer;
+        if (!stale && !early) continue;
+        if (stale) g_d5_stat_drop_stale++;
         int needed = 0;
         if (e->model_map == model_map && e->layer == layer) {
             for (uint32_t j = 0; j < n && !needed; j++) needed = ids[j] == e->expert;

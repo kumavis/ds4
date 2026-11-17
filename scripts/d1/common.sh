@@ -9,7 +9,7 @@ export DS4_DIR=/data/ds4-d1 DS4_TOKEN_TIMING=1
 LOG=${LOG:-/data/ds4-bench/d1-queue.log}
 run() { tag=$1; shift; echo "$(date -Is) start $tag" >> $LOG; "$B" "$tag" "$@"; rc=$?
   d=$(ls -dt /data/ds4-bench/runs/*-"$tag" | head -1); ex=$(grep -o "EXIT=[0-9]*" "$d/run.log" | tail -1)
-  av=$(tail -1 /data/ds4-bench/results.jsonl | grep -o '"avail_min_mb": [0-9]*' | grep -o '[0-9]*$')
+  av=$(grep -F ""tag":"$tag"" /data/ds4-bench/results.jsonl | tail -1 | grep -o '"avail_min_mb": *[0-9]*' | grep -o '[0-9]*$')
   echo "$(date -Is) end $tag rc=$rc $ex avail_min_mb=${av:-?} dir=$d" >> $LOG
   [ "$ex" = "EXIT=0" ] || { echo "$(date -Is) STOP after $tag (exit)" >> $LOG; exit 1; }
   [ -n "$av" ] && [ "$av" -lt 10000 ] && { echo "$(date -Is) STOP after $tag (memory)" >> $LOG; exit 1; }

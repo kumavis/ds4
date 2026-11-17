@@ -42650,11 +42650,67 @@ static bool d5_probe(const ds41_gpu_graph *g, const ds4_model *m,
 }
 #endif
 
+#ifdef DS4_ROCM_BUILD
+/* D5 stage 2 (DS4_ROCM_D5_PREFETCH=1): before layer L's router, run layer
+ * L+1's router on layer L's FFN input (pre-norm hc sum, normalised with
+ * L+1's ffn_norm) into private scratch and copy the logits back behind an
+ * event.  After L's own router ids are back and L's demand reads started,
+ * rank them like the router does (sqrt(softplus) + bias, index tie-break),
+ * keep the first DS4_ROCM_D5_DEPTH and queue speculative reads of up to
+ * DS4_ROCM_D5_K non-resident ones.  The probe writes only its own tensors;
+ * routing, kernels and outputs are unchanged. */
+static bool d5_prefetch_applies(const ds41_gpu_graph *g, const ds4_layer_weights *l, uint32_t il) {
+    return il + 1u < DS4_N_LAYER && g->streaming && g->tp_world == 1u &&
+        ds4_gpu_d2_decode_mode() > 0 && ds4_gpu_d5_prefetch_mode() > 0 &&
+        DS4_N_EXPERT == 384u && l[1].ffn_norm && l[1].ffn_gate_inp &&
+        l[1].ffn_exp_probs_b && l[1].ffn_gate_exps &&
+        l[1].ffn_gate_exps->type == DS4_TENSOR_MXFP4;
+}
+
+static bool d5_prefetch_probe_start(const ds41_gpu_graph *g, const ds4_model *m,
+                                    const ds4_layer_weights *next) {
+    (void)g;
+    if (!g_d5_probe_norm) {
+        g_d5_probe_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        g_d5_probe_logits = ds4_gpu_tensor_alloc(384u * sizeof(float));
+        if (!g_d5_probe_norm || !g_d5_probe_logits) return false;
+    }
+    return ds41_norm(g_d5_probe_norm, g->x, m, next->ffn_norm) &&
+        ds41_matmul(g_d5_probe_logits, m, next->ffn_gate_inp, g_d5_probe_norm, false) &&
+        ds4_gpu_d5_probe_readback_start(g_d5_probe_logits, 384u);
+}
+
+static void d5_prefetch_issue(const ds41_gpu_graph *g, const ds4_model *m,
+                              const ds4_layer_weights *next, uint32_t next_il) {
+    float lg[384];
+    if (!ds4_gpu_d5_probe_readback_finish(lg, 384u)) return;
+    const ds4_tensor *bias_t = ds41_image_at(g, g->pos) ? next->ffn_exp_probs_vl :
+                                                         next->ffn_exp_probs_b;
+    ds4_gpu_stream_expert_table table;
+    if (!bias_t || !ds41_stream_table(m, next, next_il, &table)) return;
+    const float *bias = (const float *)((const char *)m->map + bias_t->abs_offset);
+    float score[384];
+    for (uint32_t e = 0; e < 384u; e++) score[e] = sqrtf(d5_softplus(lg[e])) + bias[e];
+    const uint32_t depth = ds4_gpu_d5_depth();
+    int32_t cand[16];
+    for (uint32_t r = 0; r < depth && r < 16u; r++) {
+        uint32_t best = 0;
+        for (uint32_t e = 1; e < 384u; e++)
+            if (score[e] > score[best]) best = e;
+        cand[r] = (int32_t)best;
+        score[best] = -INFINITY;
+    }
+    (void)ds4_gpu_d5_prefetch(&table, cand, depth < 16u ? depth : 16u, ds4_gpu_d5_k());
+}
+#endif
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
 #ifdef DS4_ROCM_BUILD
     if (il + 1u < DS4_N_LAYER && d5_probe_on() &&
         !d5_probe(g, m, l + 1, il + 1u, g->x, "P1")) return false;
+    const bool d5_pf = d5_prefetch_applies(g, l, il) &&
+        d5_prefetch_probe_start(g, m, l + 1);
 #endif
     uint64_t gate_row = 0, down_row = 0;
     if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
@@ -42727,6 +42783,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
 #ifdef DS4_ROCM_BUILD
     if (d2_async_readback && !ds41_stream_selected_finish_async(g, m, l, il)) return false;
+    /* D5: layer L's demand reads are queued; the probe's event precedes L's
+     * router on stream 0, so this wait is already satisfied. */
+    if (d5_pf && d2_async_readback) d5_prefetch_issue(g, m, l + 1, il + 1u);
 #endif
     bool routed_ok;
 #ifdef DS4_ROCM_BUILD

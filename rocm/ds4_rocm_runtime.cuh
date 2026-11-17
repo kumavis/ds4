@@ -397,6 +397,16 @@ static int cuda_u64_mul3_checked(uint64_t a, uint64_t b, uint64_t c, uint64_t *o
     return cuda_u64_mul_checked(a, b, &tmp) && cuda_u64_mul_checked(tmp, c, out);
 }
 
+extern "C" void ds4_rocm_perf_counters(uint64_t *sel_slots,
+                                       uint64_t *sel_misses,
+                                       uint64_t *read_wait_us,
+                                       uint64_t *read_jobs) {
+    if (sel_slots) *sel_slots = g_stream_cache_stats.selected_slots;
+    if (sel_misses) *sel_misses = g_stream_cache_stats.selected_misses;
+    if (read_wait_us) *read_wait_us = g_stream_read_profile_wait_us;
+    if (read_jobs) *read_jobs = g_stream_read_profile_jobs;
+}
+
 static int cuda_stream_cache_layer_stats_on(void) {
     if (g_stream_cache_layer_stats_enabled < 0) {
         g_stream_cache_layer_stats_enabled =

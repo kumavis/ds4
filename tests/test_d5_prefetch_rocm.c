@@ -11,7 +11,8 @@
  * Checks after every load:
  *   - every selected expert is resident and its slot holds exactly the file's
  *     bytes (gate | up | down), whether it was a hit, a read or adopted from
- *     the shelf;
+ *     the shelf (adoption swaps the shelf buffer into the slot pool; half way
+ *     the cache is released, which must hand the shelf its own buffers back);
  *   - the resident set in LRU order equals a reference LRU that knows
  *     nothing about prefetch (hit -> touch; miss -> evict the least recently
  *     used entry that is not one of the current layer's experts, insert;
@@ -171,6 +172,12 @@ int main(void) {
                 (void)ds4_gpu_d5_prefetch(&tab[(layer + 1u) % N_LAYER], &c2, 1u, 1u);
             }
             if (next_rand() % 3u == 0) usleep((useconds_t)(next_rand() % 3000u));
+        }
+        if (step == STEPS / 2u) {
+            /* the cache frees its slabs: the shelf must take its own
+             * buffers back (adoption swaps buffers with the slot pool) */
+            ds4_gpu_stream_expert_cache_release_resident();
+            ref_n = 0;
         }
         if (!ds4_gpu_stream_expert_cache_seed_selected(&tab[layer], ids, N_SEL)) {
             fprintf(stderr, "step %u: selected load failed\n", step);

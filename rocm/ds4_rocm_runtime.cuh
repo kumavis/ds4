@@ -425,6 +425,7 @@ static int cuda_stream_batch_selected_reuse_wait(const char *what);
 static int cuda_stream_batch_selected_upload_wait_host(const char *what);
 static void cuda_stream_batch_selected_stage_release(void);
 static void cuda_stream_read_pool_shutdown(void);
+static void cuda_d5_shelf_reset(void);
 
 static int cuda_u64_mul_checked(uint64_t a, uint64_t b, uint64_t *out) {
     if (!out) return 0;
@@ -757,6 +758,9 @@ static void cuda_stream_resident_cache_release(void) {
                 "streaming resident expert cache release")) {
         return;
     }
+    /* D5: adoption swaps buffers between the shelf and the slot pool; give
+     * the shelf its own buffers back before the slabs go away. */
+    cuda_d5_shelf_reset();
     for (cuda_stream_resident_expert &e : g_stream_resident_experts) {
         if (e.base && !e.pooled) (void)cudaFree(e.base);
     }
@@ -2622,16 +2626,21 @@ static void cuda_stream_replica_run_task(uint32_t worker_id,
  * Adoption (cuda_stream_selected_load, a miss of layer L): if the shelf holds
  * that expert, the cache slot is allocated exactly as for a read (same victim,
  * same clock, the miss still counts as a miss), the entry is waited for if it
- * is in flight (made urgent first), and its bytes are copied device to device
- * into the slot with a host stream sync before the slot is published.  After
- * layer L's load every shelf entry of layers <= L that was not adopted is
- * dropped: queued chunks are discarded, in-flight ones finish into the shelf
- * buffer, which is reused only once nothing is in flight for it.
+ * is in flight (made urgent first), and then, for a pooled slot, the shelf
+ * buffer and the slot's buffer swap owners (no copy: the slot's buffer is free
+ * once cuda_stream_resident_alloc's reuse wait returned); otherwise its bytes
+ * are copied device to device with a host stream sync.  After layer L's load
+ * every shelf entry of layers <= L that was not adopted is dropped: queued
+ * chunks are discarded, in-flight ones finish into the shelf buffer, which is
+ * reused only once nothing is in flight for it.  Before the resident cache
+ * frees its slabs, cuda_d5_shelf_reset waits for in-flight chunks and gives
+ * the shelf its own buffers back.
  *
- * Ordering: a shelf buffer is read (copied) only after all of its chunks were
- * uploaded with a host stream sync by their workers (tasks_left == 0); a
- * cache slot is written only after cuda_stream_resident_alloc's reuse wait,
- * and is visible to kernels only after the copy's host sync. */
+ * Ordering: a shelf buffer is published (swapped or copied) only after all of
+ * its chunks were uploaded with a host stream sync by their workers
+ * (tasks_left == 0); a cache slot is (re)filled only after
+ * cuda_stream_resident_alloc's reuse wait, and kernels see it only through the
+ * pointer table uploaded after the load. */
 enum {
     DS4_D5_MAX_SHELF = 32,
     DS4_D5_MAX_TASKS = DS4_D5_MAX_SHELF * 3u * 64u,
@@ -2668,13 +2677,35 @@ static d5_spec_task g_d5_tasks[DS4_D5_MAX_TASKS];
 static uint32_t g_d5_task_n;
 static uint32_t g_d5_spec_inflight;
 static uint32_t g_d5_urgent_tasks;
-static uint32_t g_d5_cap = 4;
+static uint32_t g_d5_cap = 16;
 static uint64_t g_d5_spec_bytes;
 /* Main thread. */
 static uint64_t g_d5_stat_issued, g_d5_stat_adopt_ready, g_d5_stat_adopt_wait,
                 g_d5_stat_drop_ready, g_d5_stat_drop_loading, g_d5_stat_failed,
                 g_d5_stat_no_slot;
+static uint64_t g_d5_stat_swapped;
 static double g_d5_stat_wait_ms, g_d5_stat_copy_ms;
+
+/* Drop all speculative work, wait for in-flight chunks, and give every shelf
+ * entry its original buffer (from g_d5_shelf_mem).  Called before the
+ * resident cache frees its slabs: after an adoption swap the shelf may hold
+ * slab memory and the cache shelf memory. */
+static void cuda_d5_shelf_reset(void) {
+    if (g_d5_shelf_state != 1) return;
+    pthread_mutex_lock(&g_stream_read_mutex);
+    g_d5_task_n = 0;
+    g_d5_urgent_tasks = 0;
+    while (g_d5_spec_inflight) {
+        pthread_cond_wait(&g_stream_read_done_cond, &g_stream_read_mutex);
+    }
+    for (uint32_t i = 0; i < g_d5_shelf_n; i++) {
+        d5_shelf_entry *e = &g_d5_shelf[i];
+        char *buf = g_d5_shelf_mem + (uint64_t)i * g_d5_shelf_slot_bytes;
+        memset(e, 0, sizeof(*e));
+        e->buf = buf;
+    }
+    pthread_mutex_unlock(&g_stream_read_mutex);
+}
 
 static int cuda_d5_env_u32(const char *name, uint32_t def, uint32_t lo, uint32_t hi) {
     const char *env = getenv(name);
@@ -5485,7 +5516,9 @@ static int cuda_stream_layer_expert_cache_seed_selected(
  * 1 or p1 = layer L's FFN input through layer L+1's router (ds4.c).
  * DS4_ROCM_D5_K (1): speculative experts per layer; DS4_ROCM_D5_DEPTH (6):
  * candidates considered (probe rank); DS4_ROCM_D5_SHELF (4): shelf slots;
- * DS4_ROCM_D5_INFLIGHT (4): speculative chunks in flight at most. */
+ * DS4_ROCM_D5_INFLIGHT (16): speculative chunks in flight at most (4 left
+ * 94% of the adopted experts still in flight at the router: code 8.40 vs
+ * 8.48 tok/s off; 16: 8.72 vs 8.46, d5x-code-on-inflight16). */
 static int g_d5_mode = -1;
 
 extern "C" int ds4_gpu_d5_prefetch_mode(void) {
@@ -5498,6 +5531,21 @@ extern "C" int ds4_gpu_d5_prefetch_mode(void) {
         }
     }
     return g_d5_mode;
+}
+
+/* DS4_ROCM_D5_DIAG (measurement only): "probe" = probe and rank but queue
+ * no reads; "noadopt" = queue reads but never adopt (every entry dropped,
+ * demand reads as usual).  Separates probe cost, read-traffic interference
+ * and the gain of adoption. */
+static int cuda_d5_diag(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *env = getenv("DS4_ROCM_D5_DIAG");
+        v = 0;
+        if (env && !strcmp(env, "probe")) v = 1;
+        else if (env && !strcmp(env, "noadopt")) v = 2;
+    }
+    return v;
 }
 
 extern "C" uint32_t ds4_gpu_d5_k(void) {
@@ -5514,11 +5562,11 @@ extern "C" uint32_t ds4_gpu_d5_depth(void) {
 
 static void cuda_d5_print_stats(void) {
     fprintf(stderr,
-            DS4_GPU_LOG_PREFIX "D5 prefetch: shelf=%u cap=%u k=%u depth=%u issued=%llu "
+            DS4_GPU_LOG_PREFIX "D5 prefetch: diag=%d shelf=%u cap=%u k=%u depth=%u issued=%llu "
             "adopted_ready=%llu adopted_inflight=%llu dropped_ready=%llu "
             "dropped_loading=%llu failed=%llu no_slot=%llu spec_read=%.2f GiB "
-            "adopt_wait=%.1f ms adopt_copy=%.1f ms\n",
-            g_d5_shelf_n, g_d5_cap, ds4_gpu_d5_k(), ds4_gpu_d5_depth(),
+            "adopt_wait=%.1f ms adopt_copy=%.1f ms swapped=%llu\n",
+            cuda_d5_diag(), g_d5_shelf_n, g_d5_cap, ds4_gpu_d5_k(), ds4_gpu_d5_depth(),
             (unsigned long long)g_d5_stat_issued,
             (unsigned long long)g_d5_stat_adopt_ready,
             (unsigned long long)g_d5_stat_adopt_wait,
@@ -5527,7 +5575,7 @@ static void cuda_d5_print_stats(void) {
             (unsigned long long)g_d5_stat_failed,
             (unsigned long long)g_d5_stat_no_slot,
             (double)g_d5_spec_bytes / 1073741824.0,
-            g_d5_stat_wait_ms, g_d5_stat_copy_ms);
+            g_d5_stat_wait_ms, g_d5_stat_copy_ms, (unsigned long long)g_d5_stat_swapped);
 }
 
 /* Lazily allocate the shelf; 1 when usable. */
@@ -5541,7 +5589,7 @@ static int cuda_d5_shelf_ready(uint64_t slot_bytes) {
         return 0;
     }
     g_d5_shelf_n = (uint32_t)cuda_d5_env_u32("DS4_ROCM_D5_SHELF", 4u, 1u, DS4_D5_MAX_SHELF);
-    g_d5_cap = (uint32_t)cuda_d5_env_u32("DS4_ROCM_D5_INFLIGHT", 4u, 1u, 64u);
+    g_d5_cap = (uint32_t)cuda_d5_env_u32("DS4_ROCM_D5_INFLIGHT", 16u, 1u, 64u);
     if (!cuda_stream_read_pool_ensure()) return 0;
     uint64_t total = 0;
     if (!cuda_u64_mul_checked(slot_bytes, g_d5_shelf_n, &total)) return 0;
@@ -5583,7 +5631,8 @@ static int cuda_d5_entry_matches(const d5_shelf_entry *e, const void *model_map,
  * number queued. */
 extern "C" int ds4_gpu_d5_prefetch(const ds4_gpu_stream_expert_table *t,
                                    const int32_t *cands, uint32_t n_cands, uint32_t k) {
-    if (!t || !cands || !g_ssd_streaming_mode || ds4_gpu_d5_prefetch_mode() == 0) return 0;
+    if (!t || !cands || !g_ssd_streaming_mode || ds4_gpu_d5_prefetch_mode() == 0 ||
+        cuda_d5_diag() == 1) return 0;
     if (g_model_fd < 0 || (g_model_fd_host_base != NULL && t->model_map != g_model_fd_host_base)) {
         return 0;
     }
@@ -5662,8 +5711,13 @@ extern "C" int ds4_gpu_d5_prefetch(const ds4_gpu_stream_expert_table *t,
  * holds the expert, 0 when the caller must read it as usual.  Main thread. */
 static int cuda_d5_adopt(const void *model_map, uint32_t layer, int32_t expert,
                          uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
-                         uint64_t gate_expert_bytes, uint64_t down_expert_bytes, char *dst) {
-    if (g_d5_shelf_state != 1 || !dst) return 0;
+                         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                         size_t resident_idx) {
+    if (g_d5_shelf_state != 1 || resident_idx >= g_stream_resident_experts.size() ||
+        cuda_d5_diag() == 2) return 0;
+    cuda_stream_resident_expert &slot = g_stream_resident_experts[resident_idx];
+    char *dst = slot.base;
+    if (!dst) return 0;
     d5_shelf_entry *e = NULL;
     uint32_t ei = 0;
     pthread_mutex_lock(&g_stream_read_mutex);
@@ -5697,12 +5751,33 @@ static int cuda_d5_adopt(const void *model_map, uint32_t layer, int32_t expert,
     }
     /* READY now: no worker touches this entry any more. */
     const int failed = e->failed;
+    const uint64_t bytes = 2u * gate_expert_bytes + down_expert_bytes;
+    int swapped = 0;
+    if (!failed && slot.pooled && slot.bytes == bytes && g_d5_shelf_slot_bytes == bytes) {
+        /* Hand the shelf buffer to the cache and keep the slot's buffer (free
+         * now: cuda_stream_resident_alloc waited for its reuse event) as the
+         * shelf buffer.  Both are slot-sized; cuda_d5_shelf_reset restores
+         * the shelf's own buffers before the slabs are freed. */
+        char *mine = e->buf;
+        e->buf = slot.base;
+        slot.base = mine;
+        slot.gate = mine;
+        slot.up = mine + gate_expert_bytes;
+        slot.down = mine + 2u * gate_expert_bytes;
+        swapped = 1;
+    }
     e->state = DS4_D5_FREE;
     e->urgent = 0;
     pthread_mutex_unlock(&g_stream_read_mutex);
     if (failed) {
         g_d5_stat_failed++;
         return 0;
+    }
+    if (swapped) {
+        if (waited) g_d5_stat_adopt_wait++;
+        else g_d5_stat_adopt_ready++;
+        g_d5_stat_swapped++;
+        return 1;
     }
     const double c0 = cuda_wall_sec();
     cudaError_t err = cudaMemcpyAsync(dst, e->buf,
@@ -6050,8 +6125,7 @@ static int cuda_stream_selected_load(
          * read.  Same slot, victim and clock as a read; still a miss. */
         if (g_d5_shelf_state == 1 &&
             cuda_d5_adopt(model_map, layer, selected_ids[i], gate_offset, up_offset,
-                          down_offset, gate_expert_bytes, down_expert_bytes,
-                          g_stream_resident_experts[(size_t)idx].base)) {
+                          down_offset, gate_expert_bytes, down_expert_bytes, (size_t)idx)) {
             resident_mask |= 1u << i;
             d5_adopted_mask |= 1u << i;
             continue;

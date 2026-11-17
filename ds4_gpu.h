@@ -502,9 +502,9 @@ int ds4_gpu_d5_probe_readback_finish(float *out, uint32_t n);
 int ds4_gpu_d5_prefetch(const ds4_gpu_stream_expert_table *table,
                         const int32_t *candidates, uint32_t n_candidates, uint32_t k);
 /* D5b: verify-round prefetch knobs (DS4_ROCM_D5_VERIFY_K union budget per
- * layer, 0 = off, default 4; DS4_ROCM_D5_VERIFY_DEPTH per-row candidates,
+ * layer, 0 = off, default 2; DS4_ROCM_D5_VERIFY_DEPTH per-row candidates,
  * default 6; DS4_ROCM_D5_VERIFY_L0 layer-0 probe on the attention input,
- * default 1).  Active only with DS4_ROCM_D5_PREFETCH. */
+ * default 0).  Active only with DS4_ROCM_D5_PREFETCH. */
 uint32_t ds4_gpu_d5_verify_k(void);
 uint32_t ds4_gpu_d5_verify_depth(void);
 int ds4_gpu_d5_verify_l0(void);

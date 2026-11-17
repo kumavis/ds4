@@ -5616,10 +5616,11 @@ static int cuda_d5_diag(void) {
 /* D5b: speculative chunk size (DS4_ROCM_D5_CHUNK_KB, default the replica
  * chunk, 1024), whether a load first drops shelf entries it does not need
  * (DS4_ROCM_D5_EARLYDROP, default 1), and the verify-round prefetch knobs
- * (DS4_ROCM_D5_VERIFY_K: union budget per layer, 0 = off, default 4;
+ * (DS4_ROCM_D5_VERIFY_K: union budget per layer, 0 = off, default 2;
  * DS4_ROCM_D5_VERIFY_DEPTH: per-row candidates, default 6;
  * DS4_ROCM_D5_VERIFY_L0: probe layer 0 on the round's attention input,
- * default 1). */
+ * default 0).  Defaults from the d5bf-* DSpark runs (D5.md section 5):
+ * K=2 beat 4/8/16 on code and json, the layer-0 probe did not help. */
 static uint64_t g_d5_chunk;
 
 static int cuda_d5_earlydrop(void) {
@@ -5630,7 +5631,7 @@ static int cuda_d5_earlydrop(void) {
 
 extern "C" uint32_t ds4_gpu_d5_verify_k(void) {
     static int v = -1;
-    if (v < 0) v = cuda_d5_env_u32("DS4_ROCM_D5_VERIFY_K", 4u, 0u, 32u);
+    if (v < 0) v = cuda_d5_env_u32("DS4_ROCM_D5_VERIFY_K", 2u, 0u, 32u);
     return (uint32_t)v;
 }
 
@@ -5642,7 +5643,7 @@ extern "C" uint32_t ds4_gpu_d5_verify_depth(void) {
 
 extern "C" int ds4_gpu_d5_verify_l0(void) {
     static int v = -1;
-    if (v < 0) v = cuda_d5_env_u32("DS4_ROCM_D5_VERIFY_L0", 1u, 0u, 1u);
+    if (v < 0) v = cuda_d5_env_u32("DS4_ROCM_D5_VERIFY_L0", 0u, 0u, 1u);
     return v;
 }
 

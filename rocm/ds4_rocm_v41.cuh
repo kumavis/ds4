@@ -3033,4 +3033,84 @@ extern "C" int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, 
     return cuda_ok(cudaGetLastError(), "V4.1 norm BF16 launch");
 }
 
+
+/* D8: drafter F16 projections with F32 activations for 1..8 rows.  One wave
+ * per output row walks the weight row once with 16-byte loads and applies it
+ * to every activation row, so a five-row proposal reads each F16 matrix once
+ * instead of once per row, and the one-row 15360-wide main projection no
+ * longer takes the uncoalesced ordered-chunks kernel.  Rows may be strided
+ * (grouped output-A).  Draft-side only; the target never calls this. */
+template <uint32_t ROWS>
+__global__ static void d8_f16_rows_wave_kernel(float *out, const __half *w,
+        const float *x, uint32_t in_dim, uint32_t out_dim,
+        uint32_t x_stride, uint32_t out_stride) {
+    const uint32_t lane = threadIdx.x & 31u, wave = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x * (blockDim.x >> 5u) + wave;
+    if (row >= out_dim) return;
+    const __half *wr = w + (uint64_t)row * in_dim;
+    float acc[ROWS];
+#pragma unroll
+    for (uint32_t t = 0; t < ROWS; t++) acc[t] = 0.0f;
+    for (uint32_t k = lane * 8u; k < in_dim; k += 256u) {
+        const uint4 raw = *reinterpret_cast<const uint4 *>(wr + k);
+        const __half2 *h = reinterpret_cast<const __half2 *>(&raw);
+        float wf[8];
+#pragma unroll
+        for (uint32_t j = 0; j < 4u; j++) {
+            const float2 f = __half22float2(h[j]);
+            wf[2u * j] = f.x; wf[2u * j + 1u] = f.y;
+        }
+#pragma unroll
+        for (uint32_t t = 0; t < ROWS; t++) {
+            const float *xr = x + (uint64_t)t * x_stride + k;
+            const float4 a = *reinterpret_cast<const float4 *>(xr);
+            const float4 b = *reinterpret_cast<const float4 *>(xr + 4u);
+            float s = acc[t];
+            s = __fmaf_rn(wf[0], a.x, s); s = __fmaf_rn(wf[1], a.y, s);
+            s = __fmaf_rn(wf[2], a.z, s); s = __fmaf_rn(wf[3], a.w, s);
+            s = __fmaf_rn(wf[4], b.x, s); s = __fmaf_rn(wf[5], b.y, s);
+            s = __fmaf_rn(wf[6], b.z, s); s = __fmaf_rn(wf[7], b.w, s);
+            acc[t] = s;
+        }
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < ROWS; t++) {
+        const float v = warp_sum_f32(acc[t]);
+        if (lane == 0u) out[(uint64_t)t * out_stride + row] = v;
+    }
+}
+
+/* Returns 0 (caller falls back) for shapes or alignments it does not cover. */
+extern "C" int ds4_gpu_d8_f16_rows(ds4_gpu_tensor *out, uint64_t out_elem0,
+        uint32_t out_stride, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t width, uint32_t outputs,
+        uint32_t rows, const ds4_gpu_tensor *in, uint64_t in_elem0,
+        uint32_t in_stride) {
+    uint64_t weight_bytes = 0;
+    if (!out || !in || !model_map || !rows || rows > 8u || !width ||
+        !outputs || width % 256u || in_stride < width || out_stride < outputs ||
+        !cuda_u64_mul3_checked(width, outputs, sizeof(uint16_t), &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes)) return 0;
+    const uint64_t in_need = (in_elem0 + (uint64_t)(rows - 1u) * in_stride + width) * 4u;
+    const uint64_t out_need = (out_elem0 + (uint64_t)(rows - 1u) * out_stride + outputs) * 4u;
+    if (in->bytes < in_need || out->bytes < out_need) return 0;
+    const __half *w = (const __half *)cuda_model_range_ptr(model_map,
+        weight_offset, weight_bytes, "D8 drafter F16 rows");
+    if (!w) return 0;
+    const float *x = (const float *)in->ptr + in_elem0;
+    float *y = (float *)out->ptr + out_elem0;
+    if (((uintptr_t)w % 16u) || ((uintptr_t)x % 16u) || (in_stride % 4u)) return 0;
+    const uint32_t blocks = (outputs + 7u) / 8u;
+#define D8_F16_ROWS_CASE(R) case R: d8_f16_rows_wave_kernel<R><<<blocks, 256u>>>( \
+        y, w, x, width, outputs, in_stride, out_stride); break;
+    switch (rows) {
+    D8_F16_ROWS_CASE(1) D8_F16_ROWS_CASE(2) D8_F16_ROWS_CASE(3)
+    D8_F16_ROWS_CASE(4) D8_F16_ROWS_CASE(5) D8_F16_ROWS_CASE(6)
+    D8_F16_ROWS_CASE(7) D8_F16_ROWS_CASE(8)
+    default: return 0;
+    }
+#undef D8_F16_ROWS_CASE
+    return cuda_ok(cudaGetLastError(), "D8 drafter F16 rows");
+}
+
 #endif

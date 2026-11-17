@@ -2964,6 +2964,17 @@ static bool ds4_dspark_rocm_gfx1151_fast_path(void) {
 #endif
 }
 
+/* dspark-study: DS4_ROCM_DSPARK_SSD_EXPERIMENT=1 lets V4.1 DSpark run with
+ * SSD streaming on ROCm. Unqualified; for measurement only. */
+static DS4_MAYBE_UNUSED bool ds41_dspark_ssd_experiment(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_DSPARK_SSD_EXPERIMENT");
+        cached = env && env[0] == '1';
+    }
+    return cached == 1;
+}
+
 typedef struct {
     uint32_t stages;
     uint32_t block_size;
@@ -43280,7 +43291,8 @@ static bool ds41_draft_slots(ds41_gpu_graph *g, uint32_t pos,
 static bool ds41_draft_init(ds41_gpu_graph *g,
                             const ds4_dspark_weights *dw,
                             const ds4_model *dm) {
-    if (g->streaming || !dw->n_stages || !dw->block_size ||
+    if ((g->streaming && !ds41_dspark_ssd_experiment()) ||
+        !dw->n_stages || !dw->block_size ||
         dw->block_size > DS4_DSPARK_MAX_BLOCK_SIZE ||
         !dw->target_layer_count || dw->missing_tensors ||
         dw->invalid_tensors || dw->metadata_errors || !dw->n_expert ||
@@ -74011,8 +74023,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
 #ifdef DS4_ROCM_BUILD
+        /* Study switch (dspark-study): admit single-host DSpark with SSD
+         * streaming. Off by default; the resident rule is unchanged. */
         const bool resident_dspark = opt->dspark && opt->mtp_path &&
-            opt->mtp_path[0] && !opt->ssd_streaming &&
+            opt->mtp_path[0] &&
+            (!opt->ssd_streaming || ds41_dspark_ssd_experiment()) &&
             !opt->cuda_tensor_parallel &&
             (!gpu_cfg || gpu_cfg->n_gpus <= 1);
 #endif

@@ -1508,6 +1508,27 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+/* D8 attribution (opt-in, read by no decision):
+ *   DS4_D8_STEP_TRACE=1      one "D8_STEP" line per ds4_session_eval with wall
+ *                            ms, the DSpark bookkeeping ms inside it, and the
+ *                            stream-cache counters it moved;
+ *   DS4_D8_PROPOSE_DETAIL=1  with DS4_ROCM_DSPARK_V41_PROPOSE_PROFILE, also
+ *                            split each drafter stage into its sub-steps (a
+ *                            synchronisation after each one). */
+static double g_d8_step_pending_ms;
+static bool g_d8_detail_active;
+static double g_d8_detail_t0;
+enum {
+    D8_DET_PRE, D8_DET_APROJ, D8_DET_ATTN, D8_DET_AOUT, D8_DET_AFTER,
+    D8_DET_ROUTER, D8_DET_SHARED, D8_DET_ROUTED, D8_DET_TAIL, D8_DET_N
+};
+static double g_d8_detail_ms[D8_DET_N];
+
+static bool d8_env_flag(const char *name) {
+    const char *v = getenv(name);
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
 /* =========================================================================
  * Metal Routed Expert Locality Profiler.
  * =========================================================================
@@ -42869,6 +42890,16 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 
 /* ---- DeepSeek V4.1 DSpark resident drafting ---- */
 
+/* D8 proposal detail: synchronise and charge the elapsed time to `cat`. */
+static bool d8_mark(int cat) {
+    if (!g_d8_detail_active) return true;
+    const bool ok = ds4_gpu_synchronize() != 0;
+    const double t = now_sec();
+    g_d8_detail_ms[cat] += (t - g_d8_detail_t0) * 1000.0;
+    g_d8_detail_t0 = t;
+    return ok;
+}
+
 static bool ds41_draft_capture(ds41_gpu_graph *g, uint32_t il,
                                const ds4_gpu_tensor *residual,
                                uint32_t pos0, uint32_t count) {
@@ -43070,7 +43101,8 @@ static bool ds41_draft_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             b->selected, b->route_weights,
             b->route_probs, m->map, m->size, l->ffn_exp_probs_b->abs_offset,
             0, 0, 0, 0, true, false, b->route_logits, g->prefill_tokens,
-            n_exp, n_used, DS4_EXPERT_WEIGHT_SCALE, count));
+            n_exp, n_used, DS4_EXPERT_WEIGHT_SCALE, count) &&
+        d8_mark(D8_DET_ROUTER));
     DS41_DRAFT_MOE_STEP("shared gate", ds41_matmul_batch(
         b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true));
     DS41_DRAFT_MOE_STEP("shared up", ds41_matmul_batch(
@@ -43081,7 +43113,8 @@ static bool ds41_draft_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     DS41_DRAFT_MOE_STEP("shared BF16 QDQ", ds4_gpu_dsv41_quantize(
         b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16));
     DS41_DRAFT_MOE_STEP("shared down", ds41_matmul_batch(
-        b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true));
+        b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true) &&
+        d8_mark(D8_DET_SHARED));
     DS41_DRAFT_MOE_STEP("routed experts", ds4_gpu_routed_moe_batch_tensor(
             b->routed, b->gate, b->up,
             b->mid, b->experts, m->map, m->size,
@@ -43091,13 +43124,14 @@ static bool ds41_draft_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             down_row * DS4_N_EMBD, down_row, DS4_N_EMBD, DS4_N_FF_EXP,
             DS4_N_EMBD, b->selected, b->route_weights, n_exp, n_used,
             DS4_SWIGLU_CLAMP_EXP, b->norm, DS4_N_LAYER + stage,
-            count, &mid_f16, true));
+            count, &mid_f16, true) && d8_mark(D8_DET_ROUTED));
     DS41_DRAFT_MOE_STEP("expert sum", ds4_gpu_add_tensor(
         b->block, b->routed, b->shared, count * DS4_N_EMBD));
     DS41_DRAFT_MOE_STEP("block BF16 QDQ", ds4_gpu_dsv41_quantize(
         b->block, DS4_N_EMBD, count, DS4_V41_BF16));
     DS41_DRAFT_MOE_STEP("HC expand/BF16", ds41_hc_expand_bf16_rows(
-        b->residual, b->block, b->after_attn, b->ffn_split, count));
+        b->residual, b->block, b->after_attn, b->ffn_split, count) &&
+        d8_mark(D8_DET_TAIL));
 #undef DS41_DRAFT_MOE_STEP
     return true;
 }
@@ -43123,18 +43157,18 @@ static bool ds41_draft_stage(ds41_gpu_graph *g, uint32_t stage,
     DS41_DRAFT_STAGE_STEP("HC weighted sum/BF16", ds41_hc_sum_bf16_rows(
         b->x, b->residual, stage ? b->ffn_split : b->pre, stage != 0, count));
     DS41_DRAFT_STAGE_STEP("attention norm", ds41_norm_batch(
-        b->norm, b->x, m, l->attn_norm, count));
+        b->norm, b->x, m, l->attn_norm, count) && d8_mark(D8_DET_PRE));
     DS41_DRAFT_STAGE_STEP("attention projections", ds41_attention_project_batch(
-        g, m, l, count));
+        g, m, l, count) && d8_mark(D8_DET_APROJ));
     DS41_DRAFT_STAGE_STEP("attention", ds41_draft_attention(
-        g, stage, l, count));
+        g, stage, l, count) && d8_mark(D8_DET_ATTN));
     DS41_DRAFT_STAGE_STEP("attention output", ds41_draft_attention_output(
-        g, m, l, count));
+        g, m, l, count) && d8_mark(D8_DET_AOUT));
     DS41_DRAFT_STAGE_STEP("after-attention HC", ds41_after_attention_batch(
 #ifdef DS4_ROCM_BUILD
             g,
 #endif
-            b, m, l, count));
+            b, m, l, count) && d8_mark(D8_DET_AFTER));
     DS41_DRAFT_STAGE_STEP("MoE", ds41_draft_moe_batch(
         g, m, l, stage, count));
 #undef DS41_DRAFT_STAGE_STEP
@@ -43203,6 +43237,11 @@ static bool ds41_draft_propose(ds41_gpu_graph *g, const ds4_model *m,
             (uint32_t)tokens[t], dim, hc);
 #ifdef DS4_ROCM_BUILD
     DS41_DRAFT_PROFILE(profile_setup);
+    if (profile && d8_env_flag("DS4_D8_PROPOSE_DETAIL")) {
+        memset(g_d8_detail_ms, 0, sizeof(g_d8_detail_ms));
+        g_d8_detail_active = true;
+        g_d8_detail_t0 = now_sec();
+    }
 #endif
     for (uint32_t st = 0; ok && st < d->n_stage; st++) {
         ok = ds41_draft_stage(g, st, B);
@@ -43210,6 +43249,9 @@ static bool ds41_draft_propose(ds41_gpu_graph *g, const ds4_model *m,
         DS41_DRAFT_PROFILE(profile_stage[st]);
 #endif
     }
+    const bool d8_detail = g_d8_detail_active;
+    (void)d8_detail;
+    g_d8_detail_active = false;
     ok = ok && ds4_gpu_hc_weighted_sum_split_tensor(d->x,
             g->batch.residual, g->batch.ffn_split, dim, hc) &&
         ds4_gpu_rms_norm_weight_rows_tensor(d->xn, d->x,
@@ -43262,6 +43304,16 @@ static bool ds41_draft_propose(ds41_gpu_graph *g, const ds4_model *m,
             profile_markov * 1000.0, profile_read * 1000.0,
             (profile_setup + stages + profile_collapse + profile_logits +
              profile_markov + profile_read) * 1000.0);
+        if (d8_detail)
+            fprintf(stderr,
+                "ds4: D8 propose detail (3 stages) pre=%.3f attn_proj=%.3f "
+                "attn=%.3f attn_out=%.3f after_attn=%.3f router=%.3f "
+                "shared=%.3f routed=%.3f tail=%.3f ms\n",
+                g_d8_detail_ms[D8_DET_PRE], g_d8_detail_ms[D8_DET_APROJ],
+                g_d8_detail_ms[D8_DET_ATTN], g_d8_detail_ms[D8_DET_AOUT],
+                g_d8_detail_ms[D8_DET_AFTER], g_d8_detail_ms[D8_DET_ROUTER],
+                g_d8_detail_ms[D8_DET_SHARED], g_d8_detail_ms[D8_DET_ROUTED],
+                g_d8_detail_ms[D8_DET_TAIL]);
     }
 #undef DS41_DRAFT_PROFILE
 #endif
@@ -43471,9 +43523,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (g->streaming && !ds4_gpu_stream_expert_cache_quiesce()) ok = false;
 #endif
     if (ok && g->draft && !g->draft->verify_rows) {
+        const double pend_t0 = now_sec();
         ok = ds4_gpu_begin_commands() && ds41_draft_pending(g) &&
             ds41_draft_commit(g, 1);
         if (!ds4_gpu_end_commands()) ok = false;
+        g_d8_step_pending_ms += (now_sec() - pend_t0) * 1000.0;
     }
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
     /* Even a failed GPU layer must finish the reader before this graph (or
@@ -81683,6 +81737,8 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     return rc;
 }
 
+void ds4_rocm_perf_counters(uint64_t *, uint64_t *, uint64_t *, uint64_t *) __attribute__((weak));
+
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
@@ -81690,7 +81746,24 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
         probe_mtp = false;
     }
 #endif
-    return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    static int step_trace = -1;
+    if (step_trace < 0) step_trace = d8_env_flag("DS4_D8_STEP_TRACE");
+    if (!step_trace || !s)
+        return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    uint64_t s0 = 0, m0 = 0, w0 = 0, j0 = 0, s1 = 0, m1 = 0, w1 = 0, j1 = 0;
+    if (ds4_rocm_perf_counters) ds4_rocm_perf_counters(&s0, &m0, &w0, &j0);
+    const int pos = (int)s->checkpoint.len;
+    g_d8_step_pending_ms = 0.0;
+    const double t0 = now_sec();
+    const int rc = ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    const double ms = (now_sec() - t0) * 1000.0;
+    if (ds4_rocm_perf_counters) ds4_rocm_perf_counters(&s1, &m1, &w1, &j1);
+    fprintf(stderr, "D8_STEP pos=%d tok=%d dspark=%d ms=%.3f pend_ms=%.3f "
+            "slots=%llu misses=%llu wait_ms=%.3f jobs=%llu rc=%d\n",
+            pos, token, (int)!probe_mtp, ms, g_d8_step_pending_ms,
+            (unsigned long long)(s1 - s0), (unsigned long long)(m1 - m0),
+            (double)(w1 - w0) / 1000.0, (unsigned long long)(j1 - j0), rc);
+    return rc;
 }
 
 #ifndef DS4_NO_GPU
@@ -88851,10 +88924,15 @@ static int ds41_session_spec(ds4_session *s, int first_token,
      * the next 64 independent decisions; that coarse backoff is retained only
      * for the explicit fixed-threshold policy. */
     /* Honor measured-region backoff before entering the proposal graph. */
-    const bool proposed = ds41_draft_should_propose(
+    /* D8 diagnostic: DS4_D8_NO_PROPOSE=1 keeps the session and all of its
+     * per-step drafter bookkeeping but never drafts, so every step is an
+     * ordinary step inside a DSpark session (same tokens as plain decode). */
+    static int d8_no_propose = -1;
+    if (d8_no_propose < 0) d8_no_propose = d8_env_flag("DS4_D8_NO_PROPOSE");
+    const bool proposed = !d8_no_propose && ds41_draft_should_propose(
         draftable, cost_scheduled, tp_verify, d->skip_left,
         ds41_draft_adapt_off());
-    if (draftable && !proposed) {
+    if (draftable && !proposed && !d8_no_propose) {
         d->skip_left--;
         if (stats) s->dspark_stats.scheduler_skips++;
     }

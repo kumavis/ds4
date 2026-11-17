@@ -71,7 +71,9 @@ enum {
     DS4_ROCM_STREAM_READ_DEFAULT_WORKERS = 16u,
     DS4_ROCM_STREAM_READ_MAX_JOBS = DS4_ROCM_MAX_N_EXPERT * 3u,
     DS4_ROCM_STREAM_CACHE_LAYER_STATS_MAX = 128u,
-    DS4_ROCM_COMPRESSOR_MAX_RATIO = 128u
+    DS4_ROCM_COMPRESSOR_MAX_RATIO = 128u,
+    /* D2 verify overlap: at most 6 rows x 8 experts (pairs and union). */
+    DS4_ROCM_D2_MAX_PAIRS = 48u
 };
 #define DS4_ROCM_EXPERT_WEIGHT_SCALE 1.5f
 #define DS4_ROCM_EXPERT_WEIGHT_SCALE_TOL 1.0e-6f
@@ -1911,7 +1913,16 @@ typedef struct cuda_stream_read_job {
     int count_reads;
     uint64_t read_bytes;
     uint64_t direct_bytes;
+    /* D2: set under g_stream_read_mutex once the worker(s) finished the job
+     * (read and, on success, upload with a host stream sync).  Lets the
+     * owner consume part of an active job set before all of it completes. */
+    int done;
 } cuda_stream_read_job;
+
+/* D2: active partial waiters (cuda_stream_read_jobs_wait_units); while any
+ * exists, workers broadcast g_stream_read_done_cond after every job instead
+ * of only after the last one.  Under g_stream_read_mutex. */
+static uint32_t g_stream_read_unit_waiters;
 
 struct cuda_stream_batch_selected_pending {
     int active;
@@ -2572,8 +2583,10 @@ static void cuda_stream_replica_run_task(uint32_t worker_id,
         job->direct = 1;
         job->host_raw = NULL;
         job->host_buf = NULL;
+        job->done = 1;
         if (profile) g_stream_read_profile_jobs++;
         if (!job->ok) g_stream_read_active_ok = 0;
+        if (g_stream_read_unit_waiters) pthread_cond_broadcast(&g_stream_read_done_cond);
     }
     g_stream_read_active_done++;
     if (g_stream_read_active_done >= g_stream_read_active_count) {
@@ -2642,8 +2655,11 @@ static void *cuda_stream_read_worker(void *arg) {
             g_stream_read_profile_upload_us += upload_us;
         }
         if (!job->ok) g_stream_read_active_ok = 0;
+        job->done = 1;
         g_stream_read_active_done++;
-        if (g_stream_read_active_done >= g_stream_read_active_count) {
+        if (g_stream_read_unit_waiters) {
+            pthread_cond_broadcast(&g_stream_read_done_cond);
+        } else if (g_stream_read_active_done >= g_stream_read_active_count) {
             pthread_cond_signal(&g_stream_read_done_cond);
         }
         pthread_mutex_unlock(&g_stream_read_mutex);
@@ -2773,6 +2789,7 @@ static int cuda_stream_read_jobs_prepare(cuda_stream_read_job *jobs, uint32_t co
         jobs[i].uploaded = 0;
         jobs[i].errnum = 0;
         jobs[i].direct = 0;
+        jobs[i].done = 0;
         jobs[i].host_raw = NULL;
         jobs[i].host_buf = NULL;
         if (jobs[i].bytes > max_bytes) max_bytes = jobs[i].bytes;
@@ -2885,6 +2902,62 @@ static int cuda_stream_read_jobs_wait(cuda_stream_read_job *jobs, uint32_t count
         }
     }
     return ok;
+}
+
+/*
+ * D2: partial wait on the active job set.  A "unit" is a run of jobs
+ * jobs[unit_first[u] .. unit_first[u] + unit_jobs) (for an expert miss: its
+ * gate and up matrices).  Blocks until at least one unit in want_mask has all
+ * its jobs done, and returns the mask of such units.  The job set stays
+ * active; the owner still ends it with cuda_stream_read_jobs_wait.  A done
+ * job that failed (ok == 0) or was not uploaded by its worker is reported in
+ * *failed so the caller stops consuming units and lets the full wait report
+ * it.  Returns 0 with *failed set when jobs is not the active set.
+ */
+static uint64_t cuda_stream_read_jobs_wait_units(
+        cuda_stream_read_job *jobs,
+        uint32_t count,
+        const uint32_t *unit_first,
+        uint32_t unit_jobs,
+        uint32_t n_units,
+        uint64_t want_mask,
+        int *failed) {
+    *failed = 0;
+    if (!jobs || n_units == 0 || n_units > 64u || want_mask == 0) return 0;
+    const int profile = g_stream_read_profile_enabled == 1;
+    const double wait_t0 = profile ? cuda_wall_sec() : 0.0;
+    uint64_t ready = 0;
+    pthread_mutex_lock(&g_stream_read_mutex);
+    if (g_stream_read_active_jobs != jobs) {
+        pthread_mutex_unlock(&g_stream_read_mutex);
+        *failed = 1;
+        return 0;
+    }
+    g_stream_read_unit_waiters++;
+    for (;;) {
+        for (uint32_t u = 0; u < n_units; u++) {
+            if (!(want_mask & (1ull << u))) continue;
+            int all_done = 1;
+            for (uint32_t j = 0; j < unit_jobs; j++) {
+                const uint32_t k = unit_first[u] + j;
+                if (k >= count) { *failed = 1; all_done = 0; break; }
+                const cuda_stream_read_job *job = &jobs[k];
+                if (!job->done) { all_done = 0; break; }
+                if (!job->ok || !job->uploaded) { *failed = 1; all_done = 0; break; }
+            }
+            if (all_done) ready |= 1ull << u;
+        }
+        if (ready || *failed) break;
+        pthread_cond_wait(&g_stream_read_done_cond, &g_stream_read_mutex);
+    }
+    g_stream_read_unit_waiters--;
+    if (profile) {
+        g_stream_read_profile_wait_calls++;
+        g_stream_read_profile_wait_us +=
+            cuda_stream_read_profile_us(cuda_wall_sec() - wait_t0);
+    }
+    pthread_mutex_unlock(&g_stream_read_mutex);
+    return *failed ? 0 : ready;
 }
 
 static int cuda_stream_read_jobs_parallel(cuda_stream_read_job *jobs, uint32_t count) {
@@ -5689,6 +5762,137 @@ static int cuda_stream_selected_apply_ptrs(
     *down_ptrs = g_stream_selected_cache.down_ptrs;
     g_routed_moe_selected_override_n = 0;
     return 1;
+}
+
+/*
+ * D2 (single-token decode overlap).  DS4_ROCM_D2_DECODE:
+ *   1 (default)  async router readback (ds4.c) + resident-first routed MXFP4
+ *                experts: gate/up of the resident route slots is enqueued
+ *                while the missing experts are still being read, each missing
+ *                slot's gate/up as soon as its gate and up matrices are
+ *                uploaded, then mid quantize and the fused down in route
+ *                order exactly as before;
+ *   readback     async router readback only;
+ *   0            the previous sequential path (blocking readback, wait for
+ *                all reads, then all six experts).
+ */
+static int cuda_stream_d2_decode_mode(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_D2_DECODE");
+        if (!env || !env[0] || !strcmp(env, "1")) cached = 2;
+        else if (!strcmp(env, "readback")) cached = 1;
+        else cached = 0;
+    }
+    return cached;
+}
+
+/*
+ * D2: zero-copy decode without waiting for the missing experts.  Same
+ * admission and outputs as cuda_stream_selected_apply_ptrs, but only when the
+ * pending load still has reads in flight; the pending load stays active.  The
+ * caller must, in this order:
+ *   - make stream 0 wait for the pointer-table upload
+ *     (cuda_stream_selected_wait_upload_ready);
+ *   - launch only kernels that read resident slots (resident_mask) until
+ *     cuda_stream_selected_overlap_wait reported a missing slot ready (its
+ *     gate and up jobs read and uploaded with a host stream sync);
+ *   - call cuda_stream_selected_finish_pending_missing(0) (all jobs, down
+ *     included) before launching anything that reads a missing slot's down;
+ *   - record the reuse event after the last kernel (mark_inflight), also on
+ *     failure.
+ * Slot reuse is unchanged from apply_ptrs: every hand-off host-waits on the
+ * reuse event, and this layer's slots are never victims while it is current.
+ * Returns 1 with the masks set, 0 if not applicable (caller takes
+ * cuda_stream_selected_apply_ptrs).
+ */
+static int cuda_stream_selected_apply_ptrs_overlap(
+        const void *model_map,
+        uint32_t layer,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        const ds4_gpu_tensor **selected_exec,
+        const char **gate_w,
+        const char **up_w,
+        const char **down_w,
+        const char ***gate_ptrs,
+        const char ***up_ptrs,
+        const char ***down_ptrs,
+        uint32_t *resident_mask,
+        uint32_t *missing_mask) {
+    if (cuda_stream_d2_decode_mode() < 2 ||
+        !g_ssd_streaming_mode ||
+        cuda_stream_selected_compact_forced() ||
+        !selected_exec || !gate_w || !up_w || !down_w ||
+        !gate_ptrs || !up_ptrs || !down_ptrs || !resident_mask || !missing_mask ||
+        g_stream_selected_cache.loaded ||
+        !g_stream_selected_cache.gate_ptrs ||
+        !g_stream_selected_cache.up_ptrs ||
+        !g_stream_selected_cache.down_ptrs ||
+        !g_stream_selected_cache.slot_ids ||
+        g_stream_selected_pending.missing_mask == 0 ||
+        g_stream_selected_pending.read_job_count == 0 ||
+        !cuda_stream_selected_pending_matches(model_map,
+                                              layer,
+                                              n_total_expert,
+                                              n_selected,
+                                              gate_expert_bytes,
+                                              down_expert_bytes)) {
+        return 0;
+    }
+    if (g_stream_selected_cache.model_map != model_map ||
+        g_stream_selected_cache.layer != layer ||
+        g_stream_selected_cache.n_selected != n_selected) {
+        return 0;
+    }
+    /* Missing slots own 3 consecutive jobs (gate, up, down) in route order. */
+    uint32_t n_missing = 0;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        if (g_stream_selected_pending.missing_mask & (1u << i)) n_missing++;
+    }
+    if (n_missing * 3u != g_stream_selected_pending.read_job_count) return 0;
+    *selected_exec = &g_stream_selected_cache.slot_tensor;
+    *gate_w = g_stream_selected_cache.gate;
+    *up_w = g_stream_selected_cache.up;
+    *down_w = g_stream_selected_cache.down;
+    *gate_ptrs = g_stream_selected_cache.gate_ptrs;
+    *up_ptrs = g_stream_selected_cache.up_ptrs;
+    *down_ptrs = g_stream_selected_cache.down_ptrs;
+    *resident_mask = g_stream_selected_pending.resident_mask;
+    *missing_mask = g_stream_selected_pending.missing_mask;
+    g_routed_moe_selected_override_n = 0;
+    return 1;
+}
+
+/* D2: wait until at least one route slot in want_mask (missing slots of the
+ * active overlap load) has its gate and up uploaded; returns those slots.
+ * 0 means failure: the caller stops and finishes the load (which reports). */
+static uint32_t cuda_stream_selected_overlap_wait(uint32_t want_mask) {
+    if (!g_stream_selected_pending.active || want_mask == 0) return 0;
+    uint32_t unit_first[DS4_ROCM_N_EXPERT_USED];
+    uint32_t unit_slot[DS4_ROCM_N_EXPERT_USED];
+    uint32_t n_units = 0, k = 0;
+    uint64_t want_units = 0;
+    for (uint32_t i = 0; i < g_stream_selected_pending.n_selected; i++) {
+        if (!(g_stream_selected_pending.missing_mask & (1u << i))) continue;
+        unit_first[n_units] = 3u * k++;
+        unit_slot[n_units] = i;
+        if (want_mask & (1u << i)) want_units |= 1ull << n_units;
+        n_units++;
+    }
+    int failed = 0;
+    const uint64_t ready = cuda_stream_read_jobs_wait_units(
+            g_stream_selected_pending.read_jobs,
+            g_stream_selected_pending.read_job_count,
+            unit_first, 2u, n_units, want_units, &failed);
+    if (failed) return 0;
+    uint32_t slots = 0;
+    for (uint32_t u = 0; u < n_units; u++) {
+        if (ready & (1ull << u)) slots |= 1u << unit_slot[u];
+    }
+    return slots;
 }
 
 static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {

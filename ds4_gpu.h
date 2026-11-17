@@ -461,6 +461,18 @@ int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         uint32_t                           n_tokens,
         uint32_t                           n_selected);
 #endif
+#ifdef DS4_ROCM_BUILD
+/* D2 (overlap expert-miss reads with compute, ROCm SSD streaming).
+ * ds4_gpu_d2_decode_mode: 0 = sequential single-token decode
+ * (DS4_ROCM_D2_DECODE=0), 1 = asynchronous router readback only
+ * (=readback), 2 = readback + resident-first MXFP4 experts (default).
+ * ds4_gpu_selected_readback_start enqueues a D2H copy of n_ids router ids
+ * into pinned memory on stream 0 and records an event; _finish waits for that
+ * event only (no device drain) and returns the ids. */
+int ds4_gpu_d2_decode_mode(void);
+int ds4_gpu_selected_readback_start(const ds4_gpu_tensor *selected, uint32_t n_ids);
+int ds4_gpu_selected_readback_finish(int32_t *ids, uint32_t n_ids);
+#endif
 #if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
 typedef struct ds4_gpu_stream_expert_memory {
     uint64_t dynamic_bytes, layer_bytes, selected_bytes, pinned_bytes;

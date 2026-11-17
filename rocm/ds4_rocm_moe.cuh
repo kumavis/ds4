@@ -3341,6 +3341,107 @@ __global__ static void moe_gate_up_mid_decode_mxfp4_qwarp32_kernel(
     }
 }
 
+/* D2: the pairs to run in one launch of the pair-list gate/up kernel below,
+ * passed by value (no device buffer whose lifetime could race). */
+struct moe_mxfp4_pair_list {
+    uint8_t pair[48];
+};
+
+/* D2: moe_gate_up_mid_decode_mxfp4_qwarp32_kernel<true> restricted to a list
+ * of (row, expert) pairs: blockIdx.y indexes the list instead of being the
+ * pair itself.  Everything a block computes depends only on its pair, and the
+ * body below is the Indirect body of that kernel verbatim, so every pair it
+ * runs is bitwise what the full launch writes for that pair.  Used to run the
+ * resident pairs while missing experts are still being read, then the
+ * missing ones as they land (tests/test_mxfp4_overlap_rocm.c checks it). */
+__global__ static void moe_gate_up_mid_decode_mxfp4_qwarp32_pairs_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp,
+        moe_mxfp4_pair_list list) {
+    constexpr uint32_t rows_per_wave = 1u;
+    constexpr uint32_t waves_per_block = 8u;
+    constexpr uint32_t rows_per_block = rows_per_wave * waves_per_block;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    const uint32_t block_lane = lane >> 1u;
+    const uint32_t half = lane & 1u;
+    const uint32_t first_row = blockIdx.x * rows_per_block + wave * rows_per_wave;
+    const uint32_t pair = list.pair[blockIdx.y];
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const uint32_t expert = (uint32_t)expert_i;
+    const char *gate_expert = ((const char *const *)gate_base)[expert];
+    const char *up_expert = ((const char *const *)up_base)[expert];
+    if (!gate_expert || !up_expert) {
+        if (lane == 0u && first_row < expert_mid_dim) {
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + first_row;
+            if (write_aux) gate_out[off] = up_out[off] = 0.f;
+            mid_out[off] = 0.f;
+        }
+        return;
+    }
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    float gate[rows_per_wave] = {0.0f};
+    float up[rows_per_wave] = {0.0f};
+    const uint32_t mxfp4_blocks = xq_blocks * 8u;
+
+    for (uint32_t mb = block_lane; mb < mxfp4_blocks; mb += 16u) {
+        const cuda_block_q8_K *yb = xqb + (mb >> 3u);
+        #pragma unroll
+        for (uint32_t rr = 0; rr < rows_per_wave; rr++) {
+            const uint32_t row = first_row + rr;
+            if (row >= expert_mid_dim) continue;
+            const cuda_block_mxfp4 *gate_blocks =
+                (const cuda_block_mxfp4 *)(gate_expert + (uint64_t)row * gate_row_bytes);
+            const cuda_block_mxfp4 *up_blocks =
+                (const cuda_block_mxfp4 *)(up_expert + (uint64_t)row * gate_row_bytes);
+            const uint32_t subblock = mb & 7u;
+            gate[rr] += dev_dot_mxfp4_q8_K_half_block(
+                gate_blocks + mb, yb, subblock, half);
+            up[rr] += dev_dot_mxfp4_q8_K_half_block(
+                up_blocks + mb, yb, subblock, half);
+        }
+    }
+
+    #pragma unroll
+    for (uint32_t rr = 0; rr < rows_per_wave; rr++) {
+        const uint32_t row = first_row + rr;
+        if (row >= expert_mid_dim) continue;
+        gate[rr] = warp_sum_f32(gate[rr]);
+        up[rr] = warp_sum_f32(up[rr]);
+        if (lane == 0u) {
+            float g = gate[rr];
+            float u = up[rr];
+            if (clamp > 1.0e-6f) {
+                if (g > clamp) g = clamp;
+                if (u > clamp) u = clamp;
+                if (u < -clamp) u = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = g;
+                up_out[off] = u;
+            }
+            mid_out[off] = (g / (1.0f + expf(-g))) * u *
+                weights[(uint64_t)tok * n_expert + slot];
+        }
+    }
+}
+
 __global__ static void moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel(
         float *gate_out,
         float *up_out,

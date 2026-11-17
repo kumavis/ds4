@@ -675,6 +675,19 @@ static int routed_moe_mxfp4_stream_down_per_row(void) {
  *            route order (decode's fold), see the down mode above.
  * Launch only; the caller owns the stream-cache ordering (upload wait before,
  * reuse event after). */
+static int routed_moe_mxfp4_ptrs_rows_tail_launch(
+        float *out,
+        const float *mid,
+        const char *const *down_ptrs,
+        cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_row_bytes,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        int down_per_row);
+
 static int routed_moe_mxfp4_ptrs_rows_launch(
         float *out,
         float *gate,
@@ -697,7 +710,6 @@ static int routed_moe_mxfp4_ptrs_rows_launch(
         float clamp,
         int down_per_row) {
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
-    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
     const uint32_t pair_count = n_tokens * n_expert;
     dim3 gate_grid((expert_mid_dim + 7u) / 8u, pair_count, 1);
     moe_gate_up_mid_decode_mxfp4_qwarp32_kernel<true><<<gate_grid, 256>>>(
@@ -717,6 +729,144 @@ static int routed_moe_mxfp4_ptrs_rows_launch(
             0u,
             clamp);
     if (!cuda_ok(cudaGetLastError(), "routed_moe streaming rows mxfp4 gate/up launch")) return 0;
+    return routed_moe_mxfp4_ptrs_rows_tail_launch(out, mid, down_ptrs, midq, selected,
+                                                  down_row_bytes, expert_mid_dim, out_dim,
+                                                  n_expert, n_tokens, down_per_row);
+}
+
+/* D2: gate/up of the listed (row, expert) pairs only, with the pair-list
+ * twin of the kernel above (bitwise the same per pair).  n may be 0. */
+static int routed_moe_mxfp4_gate_up_pairs_launch(
+        float *gate,
+        float *up,
+        float *mid,
+        const char *const *gate_ptrs,
+        const char *const *up_ptrs,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_gate_up,
+        float clamp,
+        const uint8_t *pairs,
+        uint32_t n) {
+    if (n == 0u) return 1;
+    moe_mxfp4_pair_list list;
+    memset(&list, 0, sizeof(list));
+    if (n > sizeof(list.pair)) return 0;
+    for (uint32_t i = 0; i < n; i++) list.pair[i] = pairs[i];
+    dim3 grid((expert_mid_dim + 7u) / 8u, n, 1);
+    moe_gate_up_mid_decode_mxfp4_qwarp32_pairs_kernel<<<grid, 256>>>(
+            gate, up, mid,
+            (const char *)gate_ptrs,
+            (const char *)up_ptrs,
+            xq, selected, weights,
+            gate_row_bytes,
+            expert_in_dim / CUDA_QK_K,
+            expert_mid_dim,
+            n_expert,
+            write_gate_up,
+            clamp,
+            list);
+    return cuda_ok(cudaGetLastError(), "routed_moe mxfp4 pair-list gate/up launch");
+}
+
+/* D2 (single-token decode overlap): the routed MXFP4 experts of one token
+ * whose missing route slots are still being read.  xq holds Q8_K(x); stream
+ * 0 already waits for the pointer-table upload.  Order of work:
+ *   1. gate/up of the resident slots (pair-list kernel), enqueued at once;
+ *   2. for each batch of missing slots whose gate and up jobs finished (read
+ *      and uploaded, host-synchronised by the read worker), their gate/up;
+ *   3. finish the pending load: every job, down included, uploaded;
+ *   4. mid quantize over all six pairs and the fused down
+ *      moe_down_mxfp4_sum6_qwarp32_kernel<false, true> in route order: the
+ *      exact launches of the sequential zero-copy path.
+ * Each pair's mid is bitwise what the full gate/up launch writes, and steps 4
+ * are unchanged, so the output equals the sequential path bit for bit.  The
+ * caller records the reuse event afterwards, also on failure. */
+static int routed_moe_mxfp4_decode_overlap_launch(
+        float *out,
+        float *gate,
+        float *up,
+        float *mid,
+        const char *const *gate_ptrs,
+        const char *const *up_ptrs,
+        const char *const *down_ptrs,
+        const cuda_block_q8_K *xq,
+        cuda_block_q8_K *midq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_row_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t write_gate_up,
+        float clamp,
+        uint32_t resident_mask,
+        uint32_t missing_mask) {
+    uint8_t list[DS4_ROCM_N_EXPERT_USED];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < n_expert; i++) {
+        if (resident_mask & (1u << i)) list[n++] = (uint8_t)i;
+    }
+    int ok = routed_moe_mxfp4_gate_up_pairs_launch(
+            gate, up, mid, gate_ptrs, up_ptrs, xq, selected, weights,
+            gate_row_bytes, expert_in_dim, expert_mid_dim, n_expert,
+            write_gate_up, clamp, list, n);
+    uint32_t remaining = missing_mask;
+    while (ok && remaining) {
+        const uint32_t ready = cuda_stream_selected_overlap_wait(remaining) & remaining;
+        if (!ready) break;
+        n = 0;
+        for (uint32_t i = 0; i < n_expert; i++) {
+            if (ready & (1u << i)) list[n++] = (uint8_t)i;
+        }
+        ok = routed_moe_mxfp4_gate_up_pairs_launch(
+                gate, up, mid, gate_ptrs, up_ptrs, xq, selected, weights,
+                gate_row_bytes, expert_in_dim, expert_mid_dim, n_expert,
+                write_gate_up, clamp, list, n);
+        remaining &= ~ready;
+    }
+    /* All reads and uploads (down too) complete before any later launch. */
+    if (!cuda_stream_selected_finish_pending_missing(0)) return 0;
+    if (!ok) return 0;
+    if (remaining) {
+        n = 0;
+        for (uint32_t i = 0; i < n_expert; i++) {
+            if (remaining & (1u << i)) list[n++] = (uint8_t)i;
+        }
+        if (!routed_moe_mxfp4_gate_up_pairs_launch(
+                gate, up, mid, gate_ptrs, up_ptrs, xq, selected, weights,
+                gate_row_bytes, expert_in_dim, expert_mid_dim, n_expert,
+                write_gate_up, clamp, list, n)) return 0;
+    }
+    return routed_moe_mxfp4_ptrs_rows_tail_launch(out, mid, down_ptrs, midq, selected,
+                                                  down_row_bytes, expert_mid_dim, out_dim,
+                                                  n_expert, 1u, 1);
+}
+
+/* Mid quantize and down for routed_moe_mxfp4_ptrs_rows_launch (all pairs'
+ * mid written).  With n_tokens == 1 and down_per_row these are exactly the
+ * one-token zero-copy decode launches. */
+static int routed_moe_mxfp4_ptrs_rows_tail_launch(
+        float *out,
+        const float *mid,
+        const char *const *down_ptrs,
+        cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_row_bytes,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        int down_per_row) {
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    const uint32_t pair_count = n_tokens * n_expert;
     dim3 midq_grid(midq_blocks, pair_count, 1);
     q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, mid, expert_mid_dim, pair_count);
     if (!cuda_ok(cudaGetLastError(), "routed_moe streaming rows mxfp4 mid quantize launch")) return 0;
@@ -926,7 +1076,30 @@ static int routed_moe_launch(
         down->bytes >= (uint64_t)(expert_in_dim / CUDA_QK_K) * sizeof(cuda_block_q8_K) &&
         gate->bytes >= (uint64_t)n_expert * (expert_mid_dim / CUDA_QK_K) * sizeof(cuda_block_q8_K);
     int zero_copy_selected = 0;
-    if (zero_copy_eligible) {
+    /* D2: MXFP4 with misses still being read: resident-first overlap. */
+    int zero_copy_overlap = 0;
+    uint32_t overlap_resident_mask = 0;
+    uint32_t overlap_missing_mask = 0;
+    if (zero_copy_eligible && mxfp4_path) {
+        zero_copy_overlap =
+            cuda_stream_selected_apply_ptrs_overlap(model_map,
+                                                    layer_index,
+                                                    n_total_expert,
+                                                    n_expert,
+                                                    gate_expert_bytes,
+                                                    down_expert_bytes,
+                                                    &selected_exec,
+                                                    &gate_w,
+                                                    &up_w,
+                                                    &down_w,
+                                                    &gate_slot_ptrs,
+                                                    &up_slot_ptrs,
+                                                    &down_slot_ptrs,
+                                                    &overlap_resident_mask,
+                                                    &overlap_missing_mask);
+        zero_copy_selected = zero_copy_overlap;
+    }
+    if (zero_copy_eligible && !zero_copy_overlap) {
         zero_copy_selected =
             cuda_stream_selected_apply_ptrs(model_map,
                                             layer_index,
@@ -1164,6 +1337,40 @@ static int routed_moe_launch(
         if (!use_rocm_mmq_gateup) {
             q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
+        }
+        if (zero_copy_overlap) {
+            /* D2: resident-first single-token MXFP4 experts (see
+             * routed_moe_mxfp4_decode_overlap_launch); the pending load is
+             * always finished before this returns. */
+            if (ok) {
+                ok = routed_moe_mxfp4_decode_overlap_launch(
+                        (float *)out->ptr,
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_slot_ptrs,
+                        up_slot_ptrs,
+                        down_slot_ptrs,
+                        xq,
+                        midq,
+                        (const int32_t *)selected_exec->ptr,
+                        (const float *)weights->ptr,
+                        gate_row_bytes,
+                        down_row_bytes,
+                        expert_in_dim,
+                        expert_mid_dim,
+                        out_dim,
+                        n_expert,
+                        write_gate_up,
+                        clamp,
+                        overlap_resident_mask,
+                        overlap_missing_mask);
+            } else {
+                (void)cuda_stream_selected_finish_pending_missing(0);
+            }
+            /* Ordering guarantee 3: reuse event after the last slot reader. */
+            const int inflight_ok = cuda_stream_selected_mark_inflight();
+            return ok && inflight_ok;
         }
         if (!ok && (batch_stream_selected || batch_stream_split_selected)) {
             /* Ordering: the reuse fence follows any work that may read the
@@ -3609,6 +3816,213 @@ extern "C" int ds4_gpu_test_mxfp4_stream_rows(
         cuda_ok(cudaMemcpy(out_rows_host, out_a, out_bytes, cudaMemcpyDeviceToHost), "test out a down") &&
         cuda_ok(cudaMemcpy(out_ref_host, out_b, out_bytes, cudaMemcpyDeviceToHost), "test out b down");
     void *frees[] = {x, w, sel, scratch, mid_a, mid_b, out_a, out_b, xq_a, xq_b, midq_a, midq_b,
+                     (void *)tables[0], (void *)tables[1], (void *)tables[2]};
+    for (size_t i = 0; i < sizeof(frees) / sizeof(frees[0]); i++) if (frees[i]) (void)cudaFree(frees[i]);
+    for (uint32_t k = 0; k < 3u; k++)
+        for (uint32_t u = 0; u < n_union; u++) if (slots[k][u]) (void)cudaFree(slots[k][u]);
+    return ok;
+}
+
+/* ---- D2: asynchronous router readback and pending union loads ---------- */
+
+static int32_t *g_d2_readback_host;
+static cudaEvent_t g_d2_readback_event;
+static uint32_t g_d2_readback_n;
+static int g_d2_readback_pending;
+
+extern "C" int ds4_gpu_d2_decode_mode(void) {
+    return cuda_stream_d2_decode_mode();
+}
+
+/* Enqueue the D2H copy of the router ids into a pinned mailbox behind an
+ * event on stream 0.  The caller enqueues independent work (the shared
+ * expert) and then calls _finish, which waits for this event only.  The
+ * mailbox is rewritten only by the next _start, after _finish consumed it. */
+extern "C" int ds4_gpu_selected_readback_start(const ds4_gpu_tensor *selected,
+                                               uint32_t n_ids) {
+    g_d2_readback_pending = 0;
+    if (n_ids == 0u || n_ids > DS4_ROCM_D2_MAX_PAIRS ||
+        !cuda_tensor_has_i32(selected, n_ids)) {
+        return 0;
+    }
+    if (!g_d2_readback_host) {
+        cudaError_t err = cudaMallocHost((void **)&g_d2_readback_host,
+                                         DS4_ROCM_D2_MAX_PAIRS * sizeof(int32_t));
+        if (err != cudaSuccess) {
+            g_d2_readback_host = NULL;
+            return cuda_ok(err, "D2 router readback pinned allocation");
+        }
+    }
+    if (!g_d2_readback_event &&
+        !cuda_ok(cudaEventCreateWithFlags(&g_d2_readback_event, cudaEventDisableTiming),
+                 "D2 router readback event creation")) {
+        g_d2_readback_event = NULL;
+        return 0;
+    }
+    if (!cuda_ok(cudaMemcpyAsync(g_d2_readback_host, selected->ptr,
+                                 (size_t)n_ids * sizeof(int32_t),
+                                 cudaMemcpyDeviceToHost, 0),
+                 "D2 router readback enqueue") ||
+        !cuda_ok(cudaEventRecord(g_d2_readback_event, 0),
+                 "D2 router readback event record")) {
+        return 0;
+    }
+    g_d2_readback_n = n_ids;
+    g_d2_readback_pending = 1;
+    return 1;
+}
+
+extern "C" int ds4_gpu_selected_readback_finish(int32_t *ids, uint32_t n_ids) {
+    if (!ids || !g_d2_readback_pending || g_d2_readback_n != n_ids) {
+        g_d2_readback_pending = 0;
+        return 0;
+    }
+    g_d2_readback_pending = 0;
+    if (!cuda_ok(cudaEventSynchronize(g_d2_readback_event), "D2 router readback wait")) {
+        return 0;
+    }
+    memcpy(ids, g_d2_readback_host, (size_t)n_ids * sizeof(int32_t));
+    return 1;
+}
+
+/* Test hook for tests/test_mxfp4_overlap_rocm.c (model-free).  Same setup as
+ * ds4_gpu_test_mxfp4_stream_rows.  On identical inputs runs
+ *   (a) the reference: n_tokens == 1, the sequential zero-copy decode
+ *       launches (gate/up<true> over all pairs, mid quantize, down<false,
+ *       true>); n_tokens > 1, D1's routed_moe_mxfp4_ptrs_rows_launch;
+ *   (b) the D2 order: gate/up through routed_moe_mxfp4_gate_up_pairs_launch
+ *       in groups (group[pair] = 0..n_groups-1, launched in group order,
+ *       like resident-first then misses as they land), then
+ *       routed_moe_mxfp4_ptrs_rows_tail_launch (with down_per_row forced on
+ *       for one row, as the decode overlap path does).
+ * Returns mid and out of both; outputs are poisoned differently first. */
+extern "C" int ds4_gpu_test_mxfp4_overlap(
+        const void *gate_host,
+        const void *up_host,
+        const void *down_host,
+        uint32_t n_union,
+        const float *x_host,
+        const int32_t *selected_host,
+        const float *weights_host,
+        uint32_t n_tokens,
+        uint32_t n_expert,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        float clamp,
+        int down_per_row,
+        const uint8_t *group,
+        uint32_t n_groups,
+        float *mid_d2_host,
+        float *mid_ref_host,
+        float *out_d2_host,
+        float *out_ref_host) {
+    if (!gate_host || !up_host || !down_host || !x_host || !selected_host ||
+        !weights_host || !group || n_union == 0u || n_union > 64u || n_tokens == 0u ||
+        n_tokens > DS4_ROCM_MXFP4_STREAM_MAX_ROWS ||
+        n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT_USED ||
+        n_tokens * n_expert > DS4_ROCM_D2_MAX_PAIRS ||
+        expert_in_dim % CUDA_QK_K != 0u || expert_mid_dim % CUDA_QK_K != 0u ||
+        out_dim == 0u) return 0;
+    const uint64_t gate_row_bytes = (uint64_t)expert_in_dim / 32u * 17u;
+    const uint64_t down_row_bytes = (uint64_t)expert_mid_dim / 32u * 17u;
+    const uint64_t gate_expert_bytes = gate_row_bytes * expert_mid_dim;
+    const uint64_t down_expert_bytes = down_row_bytes * out_dim;
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    const uint32_t pairs = n_tokens * n_expert;
+    const size_t mid_bytes = (size_t)pairs * expert_mid_dim * sizeof(float);
+    const size_t out_bytes = (size_t)n_tokens * out_dim * sizeof(float);
+    int ok = 1;
+    char *slots[3][64] = {{0}};
+    const char *tables_host[3][64] = {{0}};
+    const char **tables[3] = {0};
+    float *x = NULL, *w = NULL, *scratch = NULL;
+    float *mid_a = NULL, *mid_b = NULL, *out_a = NULL, *out_b = NULL;
+    int32_t *sel = NULL;
+    cuda_block_q8_K *xq = NULL, *midq_a = NULL, *midq_b = NULL;
+    const void *src[3] = {gate_host, up_host, down_host};
+    const uint64_t eb[3] = {gate_expert_bytes, gate_expert_bytes, down_expert_bytes};
+    for (uint32_t k = 0; ok && k < 3u; k++) {
+        for (uint32_t u = 0; ok && u < n_union; u++) {
+            ok = cuda_ok(cudaMalloc((void **)&slots[k][u], (size_t)eb[k]), "test slot alloc") &&
+                 cuda_ok(cudaMemcpy(slots[k][u], (const char *)src[k] + (uint64_t)u * eb[k],
+                                    (size_t)eb[k], cudaMemcpyHostToDevice), "test slot upload");
+            tables_host[k][u] = slots[k][u];
+        }
+        ok = ok && cuda_ok(cudaMalloc((void **)&tables[k], n_union * sizeof(char *)), "test table alloc") &&
+             cuda_ok(cudaMemcpy((void *)tables[k], tables_host[k], n_union * sizeof(char *),
+                                cudaMemcpyHostToDevice), "test table upload");
+    }
+    ok = ok &&
+        cuda_ok(cudaMalloc((void **)&x, (size_t)n_tokens * expert_in_dim * sizeof(float)), "test x") &&
+        cuda_ok(cudaMalloc((void **)&w, pairs * sizeof(float)), "test w") &&
+        cuda_ok(cudaMalloc((void **)&sel, pairs * sizeof(int32_t)), "test sel") &&
+        cuda_ok(cudaMalloc((void **)&scratch, mid_bytes), "test scratch") &&
+        cuda_ok(cudaMalloc((void **)&mid_a, mid_bytes), "test mid a") &&
+        cuda_ok(cudaMalloc((void **)&mid_b, mid_bytes), "test mid b") &&
+        cuda_ok(cudaMalloc((void **)&out_a, out_bytes), "test out a") &&
+        cuda_ok(cudaMalloc((void **)&out_b, out_bytes), "test out b") &&
+        cuda_ok(cudaMalloc((void **)&xq, (size_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K)), "test xq") &&
+        cuda_ok(cudaMalloc((void **)&midq_a, (size_t)pairs * midq_blocks * sizeof(cuda_block_q8_K)), "test midq a") &&
+        cuda_ok(cudaMalloc((void **)&midq_b, (size_t)pairs * midq_blocks * sizeof(cuda_block_q8_K)), "test midq b");
+    ok = ok &&
+        cuda_ok(cudaMemcpy(x, x_host, (size_t)n_tokens * expert_in_dim * sizeof(float), cudaMemcpyHostToDevice), "test x up") &&
+        cuda_ok(cudaMemcpy(w, weights_host, pairs * sizeof(float), cudaMemcpyHostToDevice), "test w up") &&
+        cuda_ok(cudaMemcpy(sel, selected_host, pairs * sizeof(int32_t), cudaMemcpyHostToDevice), "test sel up") &&
+        cuda_ok(cudaMemset(mid_a, 0xff, mid_bytes), "test poison") &&
+        cuda_ok(cudaMemset(out_a, 0xff, out_bytes), "test poison") &&
+        cuda_ok(cudaMemset(mid_b, 0x7e, mid_bytes), "test poison") &&
+        cuda_ok(cudaMemset(out_b, 0x7e, out_bytes), "test poison");
+    if (ok) {
+        q8_K_quantize_kernel<<<dim3(xq_blocks, n_tokens, 1), 256>>>(xq, x, expert_in_dim, n_tokens);
+        ok = cuda_ok(cudaGetLastError(), "test x quantize");
+    }
+    /* (a) reference */
+    if (ok && n_tokens == 1u) {
+        moe_gate_up_mid_decode_mxfp4_qwarp32_kernel<true><<<
+                dim3((expert_mid_dim + 7u) / 8u, n_expert, 1), 256>>>(
+                scratch, scratch, mid_b,
+                (const char *)tables[0], (const char *)tables[1], xq,
+                sel, w, 0, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, 0u, clamp);
+        q8_K_quantize_kernel<<<dim3(midq_blocks, n_expert, 1), 256>>>(
+                midq_b, mid_b, expert_mid_dim, n_expert);
+        moe_down_mxfp4_sum6_qwarp32_kernel<false, true><<<
+                dim3((out_dim + 7u) / 8u, 1u, 1), 256>>>(
+                out_b, (const char *)tables[2], midq_b, sel, 0, down_row_bytes,
+                midq_blocks, out_dim, n_expert);
+        ok = cuda_ok(cudaGetLastError(), "test decode reference launch");
+    } else if (ok) {
+        ok = routed_moe_mxfp4_ptrs_rows_launch(out_b, scratch, scratch, mid_b,
+                                               tables[0], tables[1], tables[2],
+                                               xq, midq_b, sel, w,
+                                               gate_row_bytes, down_row_bytes,
+                                               expert_in_dim, expert_mid_dim, out_dim,
+                                               n_expert, n_tokens, clamp, down_per_row);
+    }
+    /* (b) D2 order */
+    for (uint32_t g = 0; ok && g < n_groups; g++) {
+        uint8_t list[DS4_ROCM_D2_MAX_PAIRS];
+        uint32_t n = 0;
+        for (uint32_t p = 0; p < pairs; p++) if (group[p] == g) list[n++] = (uint8_t)p;
+        ok = routed_moe_mxfp4_gate_up_pairs_launch(scratch, scratch, mid_a,
+                                                   tables[0], tables[1], xq, sel, w,
+                                                   gate_row_bytes, expert_in_dim,
+                                                   expert_mid_dim, n_expert, 0u, clamp,
+                                                   list, n);
+    }
+    if (ok) {
+        ok = routed_moe_mxfp4_ptrs_rows_tail_launch(out_a, mid_a, tables[2], midq_a, sel,
+                                                    down_row_bytes, expert_mid_dim, out_dim,
+                                                    n_expert, n_tokens,
+                                                    n_tokens == 1u ? 1 : down_per_row);
+    }
+    ok = ok && cuda_ok(cudaDeviceSynchronize(), "test sync") &&
+        cuda_ok(cudaMemcpy(mid_d2_host, mid_a, mid_bytes, cudaMemcpyDeviceToHost), "test mid a down") &&
+        cuda_ok(cudaMemcpy(mid_ref_host, mid_b, mid_bytes, cudaMemcpyDeviceToHost), "test mid b down") &&
+        cuda_ok(cudaMemcpy(out_d2_host, out_a, out_bytes, cudaMemcpyDeviceToHost), "test out a down") &&
+        cuda_ok(cudaMemcpy(out_ref_host, out_b, out_bytes, cudaMemcpyDeviceToHost), "test out b down");
+    void *frees[] = {x, w, sel, scratch, mid_a, mid_b, out_a, out_b, xq, midq_a, midq_b,
                      (void *)tables[0], (void *)tables[1], (void *)tables[2]};
     for (size_t i = 0; i < sizeof(frees) / sizeof(frees[0]); i++) if (frees[i]) (void)cudaFree(frees[i]);
     for (uint32_t k = 0; k < 3u; k++)

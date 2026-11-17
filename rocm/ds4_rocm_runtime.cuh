@@ -1941,6 +1941,14 @@ struct cuda_stream_batch_selected_pending {
     uint64_t down_expert_bytes;
     cuda_stream_read_job read_jobs[DS4_ROCM_STREAM_READ_MAX_JOBS];
     uint32_t read_job_count;
+    /* D2 (verify overlap): host copy of the pair -> union-slot map and, per
+     * union slot, whether it is missing and the index of its first read job
+     * (gate, up, down follow).  Valid only when host_pairs_valid. */
+    int host_pairs_valid;
+    uint32_t n_pairs;
+    uint8_t pair_unique[DS4_ROCM_D2_MAX_PAIRS];
+    uint8_t unique_missing[DS4_ROCM_D2_MAX_PAIRS];
+    uint32_t unique_job[DS4_ROCM_D2_MAX_PAIRS];
 };
 
 static cuda_stream_batch_selected_pending g_stream_batch_selected_pending;
@@ -3083,6 +3091,111 @@ static int cuda_stream_batch_selected_finish_pending_missing(void) {
     memset(&g_stream_batch_selected_pending, 0,
            sizeof(g_stream_batch_selected_pending));
     return 1;
+}
+
+/*
+ * D2 (verify overlap): DS4_ROCM_D2_VERIFY=0 restores D1's verify rows
+ * (blocking union readback, synchronous reads, then all pairs).
+ */
+static int cuda_stream_d2_verify_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_D2_VERIFY");
+        cached = !(env && env[0] == '0');
+    }
+    return cached;
+}
+
+/*
+ * D2: hand the launcher a pending batch union load (started by
+ * ds4_gpu_stream_expert_cache_begin_selected_batch after an asynchronous
+ * router readback) without waiting for its reads.  The union pointer tables
+ * and the compact (pair -> union slot) table are on the device behind the
+ * batch upload-ready event.  The caller must make stream 0 wait for that
+ * event, read only resident union slots until cuda_stream_batch_selected_
+ * overlap_wait reported a missing slot's gate and up uploaded, finish the
+ * pending load (all jobs, down included) before the down kernel, and record
+ * the batch reuse event after the last kernel, also on failure.  Every slot
+ * hand-off (resident_alloc / evict_at / cache_release) host-waits on that
+ * event (cuda_stream_resident_reclaim_wait), and this load's union is
+ * excluded from the victims while it is allocated.
+ */
+static int cuda_stream_batch_selected_apply_overlap(
+        const void *model_map,
+        uint32_t layer,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        uint32_t n_tokens,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        const ds4_gpu_tensor **selected_exec,
+        const char ***gate_ptrs,
+        const char ***up_ptrs,
+        const char ***down_ptrs,
+        uint32_t *unique_out) {
+    if (!cuda_stream_d2_verify_enabled() ||
+        !selected_exec || !gate_ptrs || !up_ptrs || !down_ptrs || !unique_out ||
+        !g_stream_batch_selected_pending.host_pairs_valid ||
+        g_stream_batch_selected_pending.n_pairs != n_tokens * n_selected ||
+        !cuda_stream_batch_selected_pending_matches(model_map,
+                                                    layer,
+                                                    n_total_expert,
+                                                    n_selected,
+                                                    n_tokens,
+                                                    gate_offset,
+                                                    up_offset,
+                                                    down_offset,
+                                                    gate_expert_bytes,
+                                                    down_expert_bytes) ||
+        g_stream_batch_selected_cache.model_map != model_map ||
+        g_stream_batch_selected_cache.layer != layer ||
+        g_stream_batch_selected_cache.n_tokens != n_tokens ||
+        g_stream_batch_selected_cache.n_selected != n_selected ||
+        g_stream_batch_selected_cache.n_unique != g_stream_batch_selected_pending.n_unique ||
+        !g_stream_batch_selected_cache.selected_ids ||
+        !g_stream_batch_selected_cache.gate_ptrs ||
+        !g_stream_batch_selected_cache.up_ptrs ||
+        !g_stream_batch_selected_cache.down_ptrs) {
+        return 0;
+    }
+    *selected_exec = &g_stream_batch_selected_cache.selected_tensor;
+    *gate_ptrs = g_stream_batch_selected_cache.gate_ptrs;
+    *up_ptrs = g_stream_batch_selected_cache.up_ptrs;
+    *down_ptrs = g_stream_batch_selected_cache.down_ptrs;
+    *unique_out = g_stream_batch_selected_pending.n_unique;
+    return 1;
+}
+
+/* D2: wait until at least one missing union slot in want_mask has its gate
+ * and up uploaded; returns those union slots.  0 means failure (the caller
+ * finishes the load, which reports). */
+static uint64_t cuda_stream_batch_selected_overlap_wait(uint64_t want_mask) {
+    const cuda_stream_batch_selected_pending &p = g_stream_batch_selected_pending;
+    if (!p.active || !p.host_pairs_valid || want_mask == 0) return 0;
+    uint32_t unit_first[DS4_ROCM_D2_MAX_PAIRS];
+    uint32_t unit_slot[DS4_ROCM_D2_MAX_PAIRS];
+    uint32_t n_units = 0;
+    uint64_t want_units = 0;
+    for (uint32_t u = 0; u < p.n_unique && u < DS4_ROCM_D2_MAX_PAIRS; u++) {
+        if (!p.unique_missing[u]) continue;
+        unit_first[n_units] = p.unique_job[u];
+        unit_slot[n_units] = u;
+        if (want_mask & (1ull << u)) want_units |= 1ull << n_units;
+        n_units++;
+    }
+    int failed = 0;
+    const uint64_t ready = cuda_stream_read_jobs_wait_units(
+            g_stream_batch_selected_pending.read_jobs,
+            p.read_job_count, unit_first, 2u, n_units, want_units, &failed);
+    if (failed) return 0;
+    uint64_t slots = 0;
+    for (uint32_t i = 0; i < n_units; i++) {
+        if (ready & (1ull << i)) slots |= 1ull << unit_slot[i];
+    }
+    return slots;
 }
 
 static void cuda_stream_batch_selected_abort_pending(void) {
@@ -4346,6 +4459,9 @@ static int cuda_stream_batch_selected_prepare_from_host(
     const char *missing_up_host[DS4_ROCM_MAX_N_EXPERT] = {0};
     uint32_t resident_count = 0;
     uint32_t missing_count = 0;
+    int jobs_flushed = 0;
+    uint32_t unique_job_local[DS4_ROCM_D2_MAX_PAIRS];
+    for (uint32_t u = 0; u < DS4_ROCM_D2_MAX_PAIRS; u++) unique_job_local[u] = UINT32_MAX;
 
     for (uint32_t u = 0; ok && u < unique_count; u++) {
         const int32_t expert_i = unique_ids[u];
@@ -4413,11 +4529,13 @@ static int cuda_stream_batch_selected_prepare_from_host(
                 g_stream_resident_experts[(size_t)idx];
             if (use_fd) {
                 if (read_job_count + 3u > DS4_ROCM_STREAM_READ_MAX_JOBS) {
+                    jobs_flushed = 1;
                     if (!cuda_stream_flush_read_jobs(read_jobs, &read_job_count)) {
                         ok = 0;
                         break;
                     }
                 }
+                if (u < DS4_ROCM_D2_MAX_PAIRS) unique_job_local[u] = read_job_count;
                 read_jobs[read_job_count++] =
                     {entry.gate, gate_offset + gate_rel, gate_expert_bytes,
                      NULL, NULL, 0, 0};
@@ -4509,6 +4627,21 @@ static int cuda_stream_batch_selected_prepare_from_host(
         memcpy(g_stream_batch_selected_pending.read_jobs,
                read_jobs,
                (size_t)read_job_count * sizeof(read_jobs[0]));
+        if (use_fd && !jobs_flushed &&
+            n_ids64 <= DS4_ROCM_D2_MAX_PAIRS && unique_count <= DS4_ROCM_D2_MAX_PAIRS) {
+            g_stream_batch_selected_pending.host_pairs_valid = 1;
+            g_stream_batch_selected_pending.n_pairs = (uint32_t)n_ids64;
+            for (uint64_t i = 0; i < n_ids64; i++) {
+                g_stream_batch_selected_pending.pair_unique[i] = (uint8_t)compact_ids[i];
+            }
+            for (uint32_t u = 0; u < unique_count; u++) {
+                g_stream_batch_selected_pending.unique_missing[u] = unique_missing[u];
+                g_stream_batch_selected_pending.unique_job[u] = unique_job_local[u];
+                if (unique_missing[u] && unique_job_local[u] == UINT32_MAX) {
+                    g_stream_batch_selected_pending.host_pairs_valid = 0;
+                }
+            }
+        }
         if (use_fd && read_job_count != 0 &&
             !cuda_stream_read_jobs_start(
                     g_stream_batch_selected_pending.read_jobs,

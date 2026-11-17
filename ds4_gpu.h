@@ -466,12 +466,24 @@ int ds4_gpu_stream_expert_cache_prepare_selected_batch(
  * ds4_gpu_d2_decode_mode: 0 = sequential single-token decode
  * (DS4_ROCM_D2_DECODE=0), 1 = asynchronous router readback only
  * (=readback), 2 = readback + resident-first MXFP4 experts (default).
+ * ds4_gpu_d2_verify_enabled: 0 with DS4_ROCM_D2_VERIFY=0 (D1 verify rows).
  * ds4_gpu_selected_readback_start enqueues a D2H copy of n_ids router ids
  * into pinned memory on stream 0 and records an event; _finish waits for that
- * event only (no device drain) and returns the ids. */
+ * event only (no device drain) and returns the ids.
+ * ds4_gpu_stream_expert_cache_begin_selected_batch classifies the union of
+ * n_tokens x n_selected ids, starts the missing experts' reads (not waiting)
+ * and uploads the union tables; the batched routed MoE launch of the same
+ * layer and shape then consumes it.  No-op (returns 1) when the layer's
+ * experts are not streamed per expert. */
 int ds4_gpu_d2_decode_mode(void);
+int ds4_gpu_d2_verify_enabled(void);
 int ds4_gpu_selected_readback_start(const ds4_gpu_tensor *selected, uint32_t n_ids);
 int ds4_gpu_selected_readback_finish(int32_t *ids, uint32_t n_ids);
+int ds4_gpu_stream_expert_cache_begin_selected_batch(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_tokens,
+        uint32_t                           n_selected);
 #endif
 #if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
 typedef struct ds4_gpu_stream_expert_memory {

@@ -850,6 +850,90 @@ static int routed_moe_mxfp4_decode_overlap_launch(
                                                   n_expert, 1u, 1);
 }
 
+/* D2 (verify overlap): routed_moe_mxfp4_ptrs_rows_launch for a pending union
+ * load whose missing experts are still being read: gate/up of every pair
+ * whose union slot is resident first, then the pairs of each missing union
+ * slot as its gate and up land, then (all jobs finished) the unchanged tail.
+ * Bitwise equal to the D1 launch on the same inputs.  The caller records the
+ * batch reuse event afterwards, also on failure. */
+static int routed_moe_mxfp4_rows_overlap_launch(
+        float *out,
+        float *gate,
+        float *up,
+        float *mid,
+        const char *const *gate_ptrs,
+        const char *const *up_ptrs,
+        const char *const *down_ptrs,
+        const cuda_block_q8_K *xq,
+        cuda_block_q8_K *midq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_row_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        float clamp,
+        int down_per_row) {
+    const uint32_t pair_count = n_tokens * n_expert;
+    const cuda_stream_batch_selected_pending &p = g_stream_batch_selected_pending;
+    if (!p.active || !p.host_pairs_valid || p.n_pairs != pair_count ||
+        pair_count > DS4_ROCM_D2_MAX_PAIRS) {
+        (void)cuda_stream_batch_selected_finish_pending_missing();
+        return 0;
+    }
+    /* Copy the host maps: finishing the load clears the pending state. */
+    uint8_t pair_unique[DS4_ROCM_D2_MAX_PAIRS];
+    uint8_t unique_missing[DS4_ROCM_D2_MAX_PAIRS];
+    const uint32_t n_unique = p.n_unique;
+    memcpy(pair_unique, p.pair_unique, sizeof(pair_unique));
+    memcpy(unique_missing, p.unique_missing, sizeof(unique_missing));
+    uint8_t list[DS4_ROCM_D2_MAX_PAIRS];
+    uint32_t n = 0;
+    uint64_t remaining = 0;
+    for (uint32_t u = 0; u < n_unique; u++) {
+        if (unique_missing[u]) remaining |= 1ull << u;
+    }
+    for (uint32_t i = 0; i < pair_count; i++) {
+        if (!unique_missing[pair_unique[i]]) list[n++] = (uint8_t)i;
+    }
+    int ok = routed_moe_mxfp4_gate_up_pairs_launch(
+            gate, up, mid, gate_ptrs, up_ptrs, xq, selected, weights,
+            gate_row_bytes, expert_in_dim, expert_mid_dim, n_expert,
+            0u, clamp, list, n);
+    while (ok && remaining) {
+        const uint64_t ready = cuda_stream_batch_selected_overlap_wait(remaining) & remaining;
+        if (!ready) break;
+        n = 0;
+        for (uint32_t i = 0; i < pair_count; i++) {
+            if (ready & (1ull << pair_unique[i])) list[n++] = (uint8_t)i;
+        }
+        ok = routed_moe_mxfp4_gate_up_pairs_launch(
+                gate, up, mid, gate_ptrs, up_ptrs, xq, selected, weights,
+                gate_row_bytes, expert_in_dim, expert_mid_dim, n_expert,
+                0u, clamp, list, n);
+        remaining &= ~ready;
+    }
+    /* All reads and uploads (down too) complete before any later launch. */
+    if (!cuda_stream_batch_selected_finish_pending_missing()) return 0;
+    if (!ok) return 0;
+    if (remaining) {
+        n = 0;
+        for (uint32_t i = 0; i < pair_count; i++) {
+            if (remaining & (1ull << pair_unique[i])) list[n++] = (uint8_t)i;
+        }
+        if (!routed_moe_mxfp4_gate_up_pairs_launch(
+                gate, up, mid, gate_ptrs, up_ptrs, xq, selected, weights,
+                gate_row_bytes, expert_in_dim, expert_mid_dim, n_expert,
+                0u, clamp, list, n)) return 0;
+    }
+    return routed_moe_mxfp4_ptrs_rows_tail_launch(out, mid, down_ptrs, midq, selected,
+                                                  down_row_bytes, expert_mid_dim, out_dim,
+                                                  n_expert, n_tokens, down_per_row);
+}
+
 /* Mid quantize and down for routed_moe_mxfp4_ptrs_rows_launch (all pairs'
  * mid written).  With n_tokens == 1 and down_per_row these are exactly the
  * one-token zero-copy decode launches. */
@@ -1027,7 +1111,36 @@ static int routed_moe_launch(
                                                &stream_batch_resident_count,
                                                &stream_batch_missing_count,
                                                &stream_batch_unique);
+    /* D2: MXFP4 verify rows whose union load was started (asynchronous
+     * router readback, reads in flight) by
+     * ds4_gpu_stream_expert_cache_begin_selected_batch take the overlap
+     * launch; otherwise D1's synchronous prepare below. */
+    const int batch_stream_overlap =
+        !stream_full_layer &&
+        !full_table_cached &&
+        !batch_stream_split_selected &&
+        n_tokens > 1u &&
+        mxfp4_path && g_ssd_streaming_mode &&
+        n_tokens <= DS4_ROCM_MXFP4_STREAM_MAX_ROWS &&
+        routed_moe_mxfp4_batch_stream_enabled() &&
+        n_expert <= DS4_ROCM_N_EXPERT_USED &&
+        cuda_stream_batch_selected_apply_overlap(model_map,
+                                                 layer_index,
+                                                 n_total_expert,
+                                                 n_expert,
+                                                 n_tokens,
+                                                 gate_offset,
+                                                 up_offset,
+                                                 down_offset,
+                                                 gate_expert_bytes,
+                                                 down_expert_bytes,
+                                                 &selected_exec,
+                                                 &gate_slot_ptrs,
+                                                 &up_slot_ptrs,
+                                                 &down_slot_ptrs,
+                                                 &stream_batch_unique);
     const int batch_stream_selected =
+        batch_stream_overlap || (
         !stream_full_layer &&
         !full_table_cached &&
         !batch_stream_split_selected &&
@@ -1053,7 +1166,7 @@ static int routed_moe_launch(
                                            &gate_slot_ptrs,
                                            &up_slot_ptrs,
                                            &down_slot_ptrs,
-                                           &stream_batch_unique);
+                                           &stream_batch_unique));
     /* The one-token resident/missing split can expose partially updated
      * selected-expert state to the default stream. Keep the asynchronous
      * read overlap, then use the deterministic compact table below. */
@@ -1191,6 +1304,7 @@ static int routed_moe_launch(
         (down->bytes < xq_bytes || gate->bytes < midq_bytes)) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "SSD streaming MXFP4 rows: Q8_K scratch too small "
                         "(layer=%u tokens=%u)\n", layer_index, n_tokens);
+        if (batch_stream_overlap) (void)cuda_stream_batch_selected_finish_pending_missing();
         (void)cuda_stream_batch_selected_mark_inflight();
         return 0;
     }
@@ -1375,8 +1489,35 @@ static int routed_moe_launch(
         if (!ok && (batch_stream_selected || batch_stream_split_selected)) {
             /* Ordering: the reuse fence follows any work that may read the
              * union slots, also when a launch failed. */
+            if (batch_stream_overlap) (void)cuda_stream_batch_selected_finish_pending_missing();
             (void)cuda_stream_batch_selected_mark_inflight();
             return 0;
+        }
+        if (ok && batch_stream_overlap) {
+            /* D2: verify rows, resident union slots first (bitwise D1). */
+            ok = routed_moe_mxfp4_rows_overlap_launch(
+                    (float *)out->ptr,
+                    (float *)gate->ptr,
+                    (float *)up->ptr,
+                    (float *)mid->ptr,
+                    gate_slot_ptrs,
+                    up_slot_ptrs,
+                    down_slot_ptrs,
+                    xq,
+                    midq,
+                    (const int32_t *)selected_exec->ptr,
+                    (const float *)weights->ptr,
+                    gate_row_bytes,
+                    down_row_bytes,
+                    expert_in_dim,
+                    expert_mid_dim,
+                    out_dim,
+                    n_expert,
+                    n_tokens,
+                    clamp,
+                    routed_moe_mxfp4_stream_down_per_row());
+            const int inflight_ok = cuda_stream_batch_selected_mark_inflight();
+            return ok && inflight_ok;
         }
         if (ok && batch_stream_selected && mxfp4_path) {
             /* D1: DSpark verify rows on streamed MXFP4 experts, read in place
@@ -3834,6 +3975,10 @@ extern "C" int ds4_gpu_d2_decode_mode(void) {
     return cuda_stream_d2_decode_mode();
 }
 
+extern "C" int ds4_gpu_d2_verify_enabled(void) {
+    return cuda_stream_d2_verify_enabled();
+}
+
 /* Enqueue the D2H copy of the router ids into a pinned mailbox behind an
  * event on stream 0.  The caller enqueues independent work (the shared
  * expert) and then calls _finish, which waits for this event only.  The
@@ -3883,6 +4028,64 @@ extern "C" int ds4_gpu_selected_readback_finish(int32_t *ids, uint32_t n_ids) {
     }
     memcpy(ids, g_d2_readback_host, (size_t)n_ids * sizeof(int32_t));
     return 1;
+}
+
+/* Start the union load of a verify batch without waiting for its reads (the
+ * launcher's batch_stream_overlap consumes it).  Skipped (returns 1, nothing
+ * pending) where the launcher would not read per-expert slots: no SSD
+ * streaming, a full-layer cache for this layer, or a fully cached table. */
+extern "C" int ds4_gpu_stream_expert_cache_begin_selected_batch(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *selected_ids,
+        uint32_t n_tokens,
+        uint32_t n_selected) {
+    if (!table || !selected_ids) return 0;
+    if (!g_ssd_streaming_mode || n_tokens < 2u ||
+        n_tokens > DS4_ROCM_MXFP4_STREAM_MAX_ROWS ||
+        n_selected == 0u || n_selected > DS4_ROCM_N_EXPERT_USED) {
+        return 1;
+    }
+    const char *gw = NULL, *uw = NULL, *dw = NULL;
+    if (cuda_stream_layer_expert_cache_apply(table->model_map, table->layer,
+                                             table->n_total_expert,
+                                             table->gate_offset, table->up_offset,
+                                             table->down_offset,
+                                             table->gate_expert_bytes,
+                                             table->down_expert_bytes,
+                                             &gw, &uw, &dw)) {
+        return 1;
+    }
+    uint64_t gate_bytes = 0, down_bytes = 0;
+    if (!cuda_u64_mul_checked(table->n_total_expert, table->gate_expert_bytes, &gate_bytes) ||
+        !cuda_u64_mul_checked(table->n_total_expert, table->down_expert_bytes, &down_bytes)) {
+        return 0;
+    }
+    if (routed_moe_full_table_is_cached(table->model_map, table->gate_offset,
+                                        table->up_offset, table->down_offset,
+                                        gate_bytes, down_bytes)) {
+        return 1;
+    }
+    const ds4_gpu_tensor *selected_exec = NULL;
+    const char **gate_ptrs = NULL, **up_ptrs = NULL, **down_ptrs = NULL;
+    uint32_t unique = 0;
+    return cuda_stream_batch_selected_prepare_from_host(table->model_map,
+                                                        table->model_size,
+                                                        table->layer,
+                                                        selected_ids,
+                                                        n_tokens,
+                                                        table->n_total_expert,
+                                                        n_selected,
+                                                        table->gate_offset,
+                                                        table->up_offset,
+                                                        table->down_offset,
+                                                        table->gate_expert_bytes,
+                                                        table->down_expert_bytes,
+                                                        &selected_exec,
+                                                        &gate_ptrs,
+                                                        &up_ptrs,
+                                                        &down_ptrs,
+                                                        &unique,
+                                                        1);
 }
 
 /* Test hook for tests/test_mxfp4_overlap_rocm.c (model-free).  Same setup as

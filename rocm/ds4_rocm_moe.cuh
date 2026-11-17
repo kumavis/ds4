@@ -4953,6 +4953,53 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
     if (lane == 0u) out[(uint64_t)tok * out_dim + row] = acc;
 }
 
+/* Zero-copy single-token variant of moe_down_q2K_sum_rows_w32_kernel: same
+ * math and the same slot (route) order of the accumulation; the expert base
+ * comes from the per-slot pointer table.  Unlike the _ptrs_batch kernel it
+ * has no NULL-slot skip, so the control flow matches the compact kernel. */
+__global__ static void moe_down_q2K_sum_rows_w32_ptrs_kernel(
+        float *out,
+        const char * const *down_slots,
+        const float *mid,
+        const int32_t *selected,
+        uint32_t n_tokens,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint64_t down_row_bytes,
+        uint32_t n_expert) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= n_tokens) return;
+
+    float acc = 0.0f;
+    const uint32_t nb = expert_mid_dim >> 8u;
+#pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        int32_t slot_i = selected[(uint64_t)tok * n_expert + slot];
+        if (slot_i < 0) slot_i = 0;
+        const unsigned char *dr = (const unsigned char *)down_slots[(uint32_t)slot_i] + (uint64_t)row * down_row_bytes;
+        const float *mr = mid + ((uint64_t)tok * n_expert + slot) * expert_mid_dim;
+        for (uint32_t b = 0; b < nb; b++) {
+            const unsigned char *db = dr + (uint64_t)b * 84u;
+            float d, dmin;
+            q2_K_scale_broadcast_w32(db, &d, &dmin);
+            const uint64_t mbase = (uint64_t)b * 256u;
+#pragma unroll
+            for (uint32_t kk = 0; kk < 8u; kk++) {
+                const uint32_t i = lane + (kk << 5u);
+                acc += q2_K_dequant_256_scaled_w32(db, lane, kk, d, dmin) * mr[mbase + i];
+            }
+        }
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = acc;
+}
+
 __global__ static void moe_gate_up_mid_q2K_rows_w32_ptrs_kernel(
         float *gate_out,
         float *up_out,

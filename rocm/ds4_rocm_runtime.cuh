@@ -2440,6 +2440,8 @@ static int cuda_stream_replica_build_tasks(cuda_stream_read_job *jobs, uint32_t 
         if (piece == 0) piece = 1;
         g_stream_replica_left[i] = 0;
         g_stream_replica_failed[i] = 0;
+        jobs[i].read_bytes = 0;
+        jobs[i].direct_bytes = 0;
         uint64_t rel = 0;
         do {
             uint64_t n = bytes - rel;
@@ -2490,6 +2492,7 @@ static void cuda_stream_replica_run_task(uint32_t worker_id,
     int errnum = 0;
     int direct = 0;
     int fallback = 0;
+    uint64_t returned = 0; /* syscall bytes, for count_reads jobs */
     void *host_buf = stage;
     if (!stage || !stream || task.bytes == 0 || !job->dst) {
         errnum = EINVAL;
@@ -2507,12 +2510,14 @@ static void cuda_stream_replica_run_task(uint32_t worker_id,
                  cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off))) {
                 host_buf = (char *)stage + delta;
                 direct = 1;
+                returned = read_size;
                 ok = 1;
             }
         }
         if (!ok && task.bytes <= stage_bytes &&
             cuda_pread_full(g_model_fd, stage, task.bytes, off)) {
             host_buf = stage;
+            returned = task.bytes;
             ok = 1;
         }
         if (!ok) errnum = errno ? errno : EIO;
@@ -2542,6 +2547,12 @@ static void cuda_stream_replica_run_task(uint32_t worker_id,
     g_stream_replica_drive_tasks[drive]++;
     g_stream_replica_drive_us[drive] += cuda_stream_read_profile_us(upload_t0 - read_t0);
     if (fallback) g_stream_replica_fallbacks++;
+    if (job->count_reads) {
+        /* V4.1 layer-load diagnostics (read-/direct-returned bytes); partial
+         * reads of a failed attempt are not counted on this path. */
+        job->read_bytes += returned;
+        if (direct) job->direct_bytes += returned;
+    }
     if (profile) {
         g_stream_read_profile_bytes += task.bytes;
         g_stream_read_profile_read_us += cuda_stream_read_profile_us(upload_t0 - read_t0);

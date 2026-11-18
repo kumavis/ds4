@@ -344,7 +344,25 @@ def guard(rec, ctx, budget_s, prompt_tokens, est_next, max_tokens, target):
     return None
 
 
-def run_grow(rec, payload, ctx, budget_s, step_label, session, target, max_turns, src=None):
+# ds4's rendered-chat tokenizer (special_token_at in ds4.c) turns these ASCII
+# spellings into special tokens even inside user/tool text, and the disk KV
+# cache keys checkpoints by the decoded token text, which spells them in
+# canonical form. A client that resends its history verbatim therefore misses
+# every checkpoint after the first such string. Rewriting them to the
+# canonical spelling gives the same token IDs (same model input) and lets the
+# text key match. Applied only when history is rebuilt from a transcript
+# (restore scenarios); recorded as norm=true.
+NORM = [("<|user|>", "<｜User｜>"), ("<|assistant|>", "<｜Assistant｜>"), ("<|system|>", "<｜System｜>"),
+        ("[gMASK]", "<｜begin▁of▁sentence｜>")]
+
+
+def nz(s):
+    for a, b in NORM:
+        s = s.replace(a, b)
+    return s
+
+
+def run_grow(rec, payload, ctx, budget_s, step_label, session, target, max_turns, src=None, norm=False):
     ev = payload["sessions"][session]["events"]
     messages = [{"role": "system", "content": payload["system"]}]
     transcript = {"system_sha": hashlib.sha256(payload["system"].encode()).hexdigest()[:16],
@@ -352,12 +370,14 @@ def run_grow(rec, payload, ctx, budget_s, step_label, session, target, max_turns
     prompt_tokens, reason = None, "events-exhausted"
     ratio = 0.85  # true tokens / est tokens (0.82 on the first S1 turn), learnt as we go
     first = 0
+    f = nz if norm else (lambda s: s)
     if src:
         # continue a session saved by an earlier server session: the full
         # history incl. the model's replies, then the next payload events
         T = json.load(open(src))
+        messages[0]["content"] = f(messages[0]["content"])
         for t in T["turns"]:
-            messages += [{"role": "user", "content": t["user"]}, {"role": "assistant", "content": t["reply"]}]
+            messages += [{"role": "user", "content": f(t["user"])}, {"role": "assistant", "content": f(t["reply"])}]
         transcript["turns"] = list(T["turns"])
         transcript["continued_from"] = src
         last = T["turns"][-1]
@@ -379,7 +399,7 @@ def run_grow(rec, payload, ctx, budget_s, step_label, session, target, max_turns
             break
         messages.append({"role": "user", "content": e["text"]})
         r, row = rec.turn(step_label, session, idx, e["i"], messages, e["max_tokens"],
-                          {"est_tokens": e["est_tokens"], "items": e["items"]})
+                          {"est_tokens": e["est_tokens"], "items": e["items"], "norm": bool(src and norm)})
         if r.error or not r.usage:
             reason = "error"
             messages.pop()
@@ -401,16 +421,17 @@ def run_grow(rec, payload, ctx, budget_s, step_label, session, target, max_turns
     return reason
 
 
-def run_resume(rec, payload, ctx, budget_s, step_label, src_dir, src_label, at, turns, salt):
+def run_resume(rec, payload, ctx, budget_s, step_label, src_dir, src_label, at, turns, salt, norm=True):
+    f = nz if norm else (lambda s: s)
     tr = json.load(open(os.path.join(src_dir, f"transcript-{src_label}.json")))
     T = tr["turns"]
     k = min(range(len(T)), key=lambda j: abs(T[j]["prompt_tokens"] - at))
-    system = payload["system"]
+    system = f(payload["system"])
     if salt:
         system = f"Session {hashlib.sha256((step_label + str(at)).encode()).hexdigest()[:12]} (cold-prefill control).\n" + system
     messages = [{"role": "system", "content": system}]
     for j in range(k):
-        messages += [{"role": "user", "content": T[j]["user"]}, {"role": "assistant", "content": T[j]["reply"]}]
+        messages += [{"role": "user", "content": f(T[j]["user"])}, {"role": "assistant", "content": f(T[j]["reply"])}]
     transcript = {"resumed_from": src_dir, "label": src_label, "turn": k, "turns": []}
     reason = "done"
     for n in range(turns):
@@ -425,7 +446,7 @@ def run_resume(rec, payload, ctx, budget_s, step_label, src_dir, src_label, at, 
         messages.append({"role": "user", "content": T[j]["user"]})
         r, row = rec.turn(step_label, tr.get("session", 0), j, T[j]["event"], messages, T[j]["max_tokens"],
                           {"resume_src_turn": j, "resume_src_reply_sha": T[j]["reply_sha"],
-                           "resume_src_prompt_tokens": T[j]["prompt_tokens"], "salt": bool(salt)})
+                           "resume_src_prompt_tokens": T[j]["prompt_tokens"], "salt": bool(salt), "norm": norm})
         if r.error or not r.usage:
             reason = "error"
             break
@@ -438,6 +459,14 @@ def run_resume(rec, payload, ctx, budget_s, step_label, src_dir, src_label, at, 
 
 def run_multi(rec, payload, ctx, budget_s, step_label, n, target, stagger_s, max_turns):
     reasons = {}
+    # Lock-time policy: with batched sessions on this backend a second session's
+    # prefill runs token by token (~10 tok/s) and starves the others' decode
+    # (measured with n=2, d14-s3-mx-b2). Four sessions' first turns alone would
+    # hold the GPU lock for an estimated 70-80 min, so n>=4 is skipped while this
+    # flag file exists; the memory plan for 4 sessions is in d14-s4-mx-ctx128k-b4.
+    if n >= 4 and os.path.exists("/data/ds4-bench/d14-skip-multi4"):
+        say(f"{step_label}: skipped by policy (lock time), see the flag file")
+        return "skipped-by-policy"
 
     def worker(s):
         time.sleep(stagger_s * s)
@@ -474,6 +503,19 @@ def cmd_run(a):
     status["t_ready"] = rec.t_ready
     say(f"server ready after {ready:.0f} s of waiting")
     budget = a.budget_min * 60 if a.budget_min else None
+    # Lock-time policy: on V4.1 ROCm the prefill cap comes from the context size
+    # only (ds41_prefill_limit), so --prefill-chunk is ignored (measured with
+    # 4096: prefill_chunk=2048 in the server log, same TTFT). Skip the 8192 rerun
+    # while this flag file exists.
+    try:
+        cmdline = open(f"/proc/{read_pid(pid_file)}/cmdline", "rb").read().split(b"\0")
+    except OSError:
+        cmdline = []
+    if os.path.exists("/data/ds4-bench/d14-skip-pc8192") and b"--prefill-chunk" in cmdline \
+            and cmdline[cmdline.index(b"--prefill-chunk") + 1] == b"8192":
+        say("all steps skipped by policy: --prefill-chunk is ignored on V4.1 ROCm (see the flag file)")
+        status["steps"].append({"spec": "all", "label": "all", "end": "skipped-by-policy", "s": 0})
+        a.step = []
     try:
         for spec in a.step:
             kind, kv = step_args(spec)
@@ -482,10 +524,10 @@ def cmd_run(a):
             if kind == "grow":
                 src = os.path.join(kv["from"], f"transcript-{kv.get('src_label', 'grow')}.json") if kv.get("from") else None
                 why = run_grow(rec, payload, a.ctx, budget, label, int(kv.get("session", 0)),
-                               int(kv["target"]), int(kv.get("max_turns", 0)), src)
+                               int(kv["target"]), int(kv.get("max_turns", 0)), src, kv.get("norm", "1") == "1")
             elif kind == "resume":
                 why = run_resume(rec, payload, a.ctx, budget, label, kv["from"], kv.get("src_label", "grow"),
-                                 int(kv["at"]), int(kv.get("turns", 1)), kv.get("salt") == "1")
+                                 int(kv["at"]), int(kv.get("turns", 1)), kv.get("salt") == "1", kv.get("norm", "1") == "1")
             elif kind == "multi":
                 why = run_multi(rec, payload, a.ctx, budget, label, int(kv["n"]), int(kv["target"]),
                                 float(kv.get("stagger_s", 0)), int(kv.get("max_turns", 0)))
@@ -590,8 +632,16 @@ def parse_segment(seg, expert_mib):
         d["d8_dspark_steps"] = sum(1 for s in steps if s.get("dspark") == 1)
         d["reply_tok_sha"] = hashlib.sha256(",".join(str(s.get("tok")) for s in steps).encode()).hexdigest()[:16]
     # DSpark rounds
+    # ds4 prints one line per DSpark round: "DSpark V4.1 cycle pos=P drafted=N accepted=M"
+    cyc = [kvs(l.split("cycle", 1)[1]) for l in lines if "DSpark V4.1 cycle " in l]
+    if cyc:
+        d["dspark_rounds"] = len(cyc)
+        d["dspark_proposed"] = sum(c.get("drafted", 0) for c in cyc)
+        d["dspark_accepted"] = sum(c.get("accepted", 0) for c in cyc)
+        d["dspark_accept_rate"] = round(d["dspark_accepted"] / d["dspark_proposed"], 4) if d["dspark_proposed"] else None
+        d["dspark_avg_accept"] = round(d["dspark_accepted"] / len(cyc), 3)
     rounds = [l for l in lines if "V4.1 DSpark proposed=" in l]
-    if rounds:
+    if rounds and not cyc:
         ps = [kvs(l.split("DSpark", 1)[1]) for l in rounds]
         d["dspark_rounds"] = len(ps)
         d["dspark_proposed"] = sum(p.get("proposed", 0) for p in ps)
@@ -792,7 +842,7 @@ def cmd_finalize(a):
             "http_status": t.get("http_status"), "error": t.get("error"),
             "resume_src_turn": t.get("resume_src_turn"), "resume_src_reply_sha": t.get("resume_src_reply_sha"),
             "resume_match": (t.get("reply_sha") == t.get("resume_src_reply_sha")) if t.get("resume_src_reply_sha") else None,
-            "salt": t.get("salt"), "est_tokens": t.get("est_tokens"),
+            "salt": t.get("salt"), "norm": t.get("norm"), "est_tokens": t.get("est_tokens"),
             "chunk_times": ct,
         })
         rec.update(window_stats(rows, t["t_send"], t["t_end"]))

@@ -83,6 +83,38 @@ def cmd_scen(recs, prefix):
               f"{'; '.join(r.get('startup_errors') or [])[:200] or '-'} |")
 
 
+def toks(run_dir, off):
+    """Generated token IDs of one turn from the D8_STEP lines of its log segment."""
+    import re
+    with open(run_dir + "/server.log", "rb") as fh:
+        fh.seek(off[0])
+        seg = fh.read(off[1] - off[0]).decode("utf-8", "replace")
+    return [int(m) for m in re.findall(r"D8_STEP pos=\d+ tok=(\d+)", seg)]
+
+
+def cmd_resume(recs, tags):
+    """Restored and cold turns against the original turn: leading identical tokens."""
+    import glob
+    print("| tag | step | turn | prompt | reused | TTFT s | new tok | prefill t/s | kv load ms | identical leading tokens / compared | same text |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|")
+    for r in recs:
+        if r.get("kind") != "turn" or r.get("tag") not in tags or r.get("resume_src_turn") is None:
+            continue
+        rd = r["run_dir"]
+        rows = [json.loads(l) for l in open(rd + "/turns.jsonl")]
+        me = next(x for x in rows if x["step"] == r["step"] and x["turn"] == r["turn"])
+        src = json.load(open(glob.glob(rd + "/transcript-" + r["step"] + ".json")[0]))["resumed_from"]
+        srows = [json.loads(l) for l in open(src + "/turns.jsonl")]
+        so = next((x for x in srows if x["turn"] == r["turn"] and x["step"] == "grow"), None)
+        a = toks(rd, me["log_off"])
+        b = toks(src, so["log_off"]) if so else []
+        n = 0
+        while n < min(len(a), len(b)) and a[n] == b[n]:
+            n += 1
+        print(f"| {r['tag']} | {r['step']} | {r['turn']} | {r['prompt_tokens']} | {r['reused_tokens']} | {f(r['ttft_s'])} | "
+              f"{r['new_tokens']} | {f(r.get('prefill_tps'))} | {f(r.get('kv_load_ms'))} | {n} / {min(len(a), len(b))} | {r.get('resume_match')} |")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", default="/data/ds4-bench/sessions.jsonl")
@@ -92,6 +124,8 @@ def main():
     recs = load(a.results)
     if a.cmd == "turns":
         cmd_turns(recs, set(a.args))
+    elif a.cmd == "resume":
+        cmd_resume(recs, set(a.args))
     elif a.cmd == "buckets":
         cmd_buckets(recs, a.args)
     else:

@@ -42751,8 +42751,8 @@ static void d5_prefetch_issue(const ds41_gpu_graph *g, const ds4_model *m,
  * Rbar[il] = mean range of committed rows; 0 until one exists (a row then
  * uses its own range).  Counters print at exit. */
 enum { DS41_RP_ROWS = 8 };
-static double g_rp_rsum[DS4_N_LAYER];
-static uint64_t g_rp_rcnt[DS4_N_LAYER];
+static double g_rp_rsum[64];   /* >= DS4_N_LAYER (40) */
+static uint64_t g_rp_rcnt[64];
 static bool g_rp_txn;            /* transaction open */
 static bool g_rp_txn_verify;     /* ... and it is a verify round */
 static uint32_t g_rp_row;        /* row index for single-row routing */
@@ -42795,7 +42795,7 @@ static bool ds41_rp_on(const ds41_gpu_graph *g) {
         atexit(ds41_rp_print);
     }
     return g->streaming && g->tp_world == 1u && DS4_N_EXPERT == 384u &&
-        ds4_gpu_route_prior_lambda() > 0.0f;
+        DS4_N_LAYER <= 64u && ds4_gpu_route_prior_lambda() > 0.0f;
 }
 
 static bool ds41_rp_open(const ds41_gpu_graph *g, const ds4_model *m, bool verify) {

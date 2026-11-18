@@ -13,6 +13,8 @@
  *     bytes (gate | up | down), whether it was a hit, a read or adopted from
  *     the shelf (adoption swaps the shelf buffer into the slot pool; half way
  *     the cache is released, which must hand the shelf its own buffers back);
+ *   - every fourth load is a 2-row batch (DSpark verify) union load, which
+ *     adopts from the shelf through the batch path (D5b);
  *   - the resident set in LRU order equals a reference LRU that knows
  *     nothing about prefetch (hit -> touch; miss -> evict the least recently
  *     used entry that is not one of the current layer's experts, insert;
@@ -66,6 +68,32 @@ static void ref_touch(uint32_t key) {
     if (i == ref_n) return;
     memmove(&ref[i], &ref[i + 1], (ref_n - i - 1u) * sizeof(ref[0]));
     ref[ref_n - 1u] = key;
+}
+
+/* batch union load (cuda_stream_batch_selected_prepare_from_host): unique ids
+ * in first-appearance order; hit -> touch; miss -> evict the least recently
+ * used entry not in the union, insert (most recent). */
+static void ref_access_union(uint32_t layer, const int32_t *uniq, uint32_t n) {
+    for (uint32_t s = 0; s < n; s++) {
+        const uint32_t key = layer * N_EXP + (uint32_t)uniq[s];
+        int found = 0;
+        for (uint32_t i = 0; i < ref_n; i++) found |= ref[i] == key;
+        if (found) {
+            ref_touch(key);
+            continue;
+        }
+        if (ref_n >= BUDGET) {
+            for (uint32_t i = 0; i < ref_n; i++) {
+                int cur = 0;
+                for (uint32_t j = 0; j < n; j++) cur |= ref[i] == layer * N_EXP + (uint32_t)uniq[j];
+                if (cur) continue;
+                memmove(&ref[i], &ref[i + 1], (ref_n - i - 1u) * sizeof(ref[0]));
+                ref_n--;
+                break;
+            }
+        }
+        ref[ref_n++] = key;
+    }
 }
 
 static void ref_access(uint32_t layer, const int32_t *ids, uint32_t n) {
@@ -179,12 +207,49 @@ int main(void) {
             ds4_gpu_stream_expert_cache_release_resident();
             ref_n = 0;
         }
-        if (!ds4_gpu_stream_expert_cache_seed_selected(&tab[layer], ids, N_SEL)) {
-            fprintf(stderr, "step %u: selected load failed\n", step);
-            bad = 1;
-            break;
+        /* every fourth step: a 2-row batch (verify-round) union load of
+         * these ids plus one more row, which also adopts from the shelf */
+        const int batch = step % 4u == 3u;
+        if (batch) {
+            int32_t rows[2 * N_SEL];
+            int32_t uniq[2 * N_SEL];
+            uint32_t nu = 0;
+            for (uint32_t s = 0; s < N_SEL; s++) rows[s] = ids[s];
+            for (uint32_t s = 0; s < N_SEL; s++) {
+                int dup;
+                do {
+                    rows[N_SEL + s] = (int32_t)(next_rand() % N_EXP);
+                    dup = 0;
+                    for (uint32_t j = 0; j < s; j++) dup |= rows[N_SEL + j] == rows[N_SEL + s];
+                } while (dup);
+            }
+            for (uint32_t i = 0; i < 2 * N_SEL; i++) {
+                int dup = 0;
+                for (uint32_t j = 0; j < nu; j++) dup |= uniq[j] == rows[i];
+                if (!dup) uniq[nu++] = rows[i];
+            }
+            if (!ds4_gpu_stream_expert_cache_prepare_selected_batch(&tab[layer], rows, 2u, N_SEL)) {
+                fprintf(stderr, "step %u: batch load failed\n", step);
+                bad = 1;
+                break;
+            }
+            /* the batch union path leaves its demand reads pending for the
+             * routed launch; finish them before reading the slots */
+            if (!ds4_gpu_stream_expert_cache_finish_pending_batch()) {
+                fprintf(stderr, "step %u: batch finish failed\n", step);
+                bad = 1;
+                break;
+            }
+            ds4_gpu_synchronize();
+            ref_access_union(layer, uniq, nu);
+        } else {
+            if (!ds4_gpu_stream_expert_cache_seed_selected(&tab[layer], ids, N_SEL)) {
+                fprintf(stderr, "step %u: selected load failed\n", step);
+                bad = 1;
+                break;
+            }
+            ref_access(layer, ids, N_SEL);
         }
-        ref_access(layer, ids, N_SEL);
         for (uint32_t s = 0; s < N_SEL; s++) {
             const uint64_t e = (uint64_t)ids[s];
             if (!ds4_gpu_test_d5_resident_bytes(&tab[layer], ids[s], got)) {

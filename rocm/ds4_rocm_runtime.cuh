@@ -5578,7 +5578,7 @@ static int cuda_stream_layer_expert_cache_seed_selected(
  * DS4_ROCM_D5_PREFETCH: unset or 0 = off (no shelf, no probe, today's path);
  * 1 or p1 = layer L's FFN input through layer L+1's router (ds4.c).
  * DS4_ROCM_D5_K (1): speculative experts per layer; DS4_ROCM_D5_DEPTH (6):
- * candidates considered (probe rank); DS4_ROCM_D5_SHELF (4): shelf slots;
+ * candidates considered (probe rank); DS4_ROCM_D5_SHELF (16): shelf slots;
  * DS4_ROCM_D5_INFLIGHT (16): speculative chunks in flight at most (4 left
  * 94% of the adopted experts still in flight at the router: code 8.40 vs
  * 8.48 tok/s off; 16: 8.72 vs 8.46, d5x-code-on-inflight16). */
@@ -5659,6 +5659,111 @@ extern "C" uint32_t ds4_gpu_d5_depth(void) {
     return (uint32_t)v;
 }
 
+/* int3: thermal limit for speculative reads (DS4_ROCM_D5_TEMP_LIMIT_C,
+ * default 84; 0 = no limit).  Speculative reads are optional, so holding them
+ * back never changes what the model computes; demand reads are never limited.
+ * A detached monitor thread reads the hottest NVMe
+ * (/sys/class/nvme/nvme*\/hwmon*\/temp1_input, millidegrees) once a second
+ * and keeps g_d5_temp_hold: set at >= limit, cleared at <= limit - 3 C.  The
+ * prefetch path only loads that flag.  Started on the first prefetch call
+ * (one synchronous first reading, so the limit applies from the start). */
+#include <glob.h>
+enum { DS4_D5_TEMP_HYST_C = 3, DS4_D5_TEMP_MAX_SENSORS = 16 };
+static int g_d5_temp_limit = -1;           /* -1 unset, 0 off */
+static int g_d5_temp_state = -1;           /* -1 not started, 0 no monitor, 1 running */
+static int g_d5_temp_hold;                 /* atomic: speculative issue held back */
+static int g_d5_temp_cur_c = -1;           /* atomic: last hottest reading */
+static int g_d5_temp_max_c = -1;           /* atomic: hottest reading seen */
+static uint64_t g_d5_temp_engaged;         /* atomic: transitions into hold */
+static uint64_t g_d5_stat_temp_held;       /* main thread: prefetch calls held back */
+static uint64_t g_d5_stat_temp_held_cands; /* main thread: candidates in those calls */
+static char g_d5_temp_paths[DS4_D5_TEMP_MAX_SENSORS][128];
+static uint32_t g_d5_temp_n;
+
+static int cuda_d5_temp_limit(void) {
+    if (g_d5_temp_limit < 0) g_d5_temp_limit = cuda_d5_env_u32("DS4_ROCM_D5_TEMP_LIMIT_C", 84u, 0u, 150u);
+    return g_d5_temp_limit;
+}
+
+static int cuda_d5_temp_read(void) {
+    int best = -1;
+    for (uint32_t i = 0; i < g_d5_temp_n; i++) {
+        FILE *f = fopen(g_d5_temp_paths[i], "r");
+        if (!f) continue;
+        long v = 0;
+        if (fscanf(f, "%ld", &v) == 1 && v / 1000 > best) best = (int)(v / 1000);
+        fclose(f);
+    }
+    return best;
+}
+
+static void cuda_d5_temp_update(int c) {
+    if (c < 0) return;
+    const int lim = cuda_d5_temp_limit();
+    __atomic_store_n(&g_d5_temp_cur_c, c, __ATOMIC_RELAXED);
+    if (c > __atomic_load_n(&g_d5_temp_max_c, __ATOMIC_RELAXED))
+        __atomic_store_n(&g_d5_temp_max_c, c, __ATOMIC_RELAXED);
+    const int hold = __atomic_load_n(&g_d5_temp_hold, __ATOMIC_RELAXED);
+    if (!hold && c >= lim) {
+        __atomic_store_n(&g_d5_temp_hold, 1, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&g_d5_temp_engaged, 1u, __ATOMIC_RELAXED);
+    } else if (hold && c <= lim - DS4_D5_TEMP_HYST_C) {
+        __atomic_store_n(&g_d5_temp_hold, 0, __ATOMIC_RELEASE);
+    }
+}
+
+static void *cuda_d5_temp_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        sleep(1);
+        cuda_d5_temp_update(cuda_d5_temp_read());
+    }
+    return NULL;
+}
+
+static void cuda_d5_temp_start(void) {
+    g_d5_temp_state = 0;
+    if (cuda_d5_temp_limit() == 0) return;
+    glob_t gl;
+    memset(&gl, 0, sizeof(gl));
+    if (glob("/sys/class/nvme/nvme*/hwmon*/temp1_input", 0, NULL, &gl) == 0) {
+        for (size_t i = 0; i < gl.gl_pathc && g_d5_temp_n < DS4_D5_TEMP_MAX_SENSORS; i++) {
+            if (strlen(gl.gl_pathv[i]) < sizeof(g_d5_temp_paths[0]))
+                strcpy(g_d5_temp_paths[g_d5_temp_n++], gl.gl_pathv[i]);
+        }
+    }
+    globfree(&gl);
+    if (g_d5_temp_n == 0) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D5: no NVMe temperature sensor, no thermal limit\n");
+        return;
+    }
+    cuda_d5_temp_update(cuda_d5_temp_read());
+    pthread_t th;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&th, &attr, cuda_d5_temp_thread, NULL) == 0) {
+        g_d5_temp_state = 1;
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D5 thermal limit: speculative reads held at >= %d C "
+                "(resume <= %d C), %u NVMe sensors, now %d C\n",
+                cuda_d5_temp_limit(), cuda_d5_temp_limit() - DS4_D5_TEMP_HYST_C, g_d5_temp_n,
+                __atomic_load_n(&g_d5_temp_cur_c, __ATOMIC_RELAXED));
+    } else {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D5: thermal monitor thread failed, no thermal limit\n");
+        __atomic_store_n(&g_d5_temp_hold, 0, __ATOMIC_RELEASE);
+    }
+    pthread_attr_destroy(&attr);
+}
+
+/* 1 when this speculative issue must be held back (main thread). */
+static int cuda_d5_temp_held(uint32_t n_cands) {
+    if (g_d5_temp_state < 0) cuda_d5_temp_start();
+    if (g_d5_temp_state != 1 || !__atomic_load_n(&g_d5_temp_hold, __ATOMIC_ACQUIRE)) return 0;
+    g_d5_stat_temp_held++;
+    g_d5_stat_temp_held_cands += n_cands;
+    return 1;
+}
+
 static void cuda_d5_print_stats(void) {
     fprintf(stderr,
             DS4_GPU_LOG_PREFIX "D5 prefetch: diag=%d shelf=%u cap=%u k=%u depth=%u issued=%llu "
@@ -5682,6 +5787,26 @@ static void cuda_d5_print_stats(void) {
             (unsigned long long)g_d5_stat_demand_starts_spec,
             (unsigned long long)g_d5_stat_demand_spec_chunks,
             (unsigned long long)g_d5_stat_drop_stale);
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "D5 thermal: limit=%d C monitor=%d held=%llu held_cands=%llu "
+            "engaged=%llu nvme_max=%d C\n",
+            cuda_d5_temp_limit(), g_d5_temp_state,
+            (unsigned long long)g_d5_stat_temp_held,
+            (unsigned long long)g_d5_stat_temp_held_cands,
+            (unsigned long long)__atomic_load_n(&g_d5_temp_engaged, __ATOMIC_RELAXED),
+            __atomic_load_n(&g_d5_temp_max_c, __ATOMIC_RELAXED));
+}
+
+/* int3: bytes the shelf will allocate when prefetch engages (D4 charges them
+ * in its fixed memory term).  0 when D5 never allocates a shelf: prefetch off,
+ * DIAG=probe (no reads), or O_DIRECT disabled.  Same knob and default as
+ * cuda_d5_shelf_ready. */
+extern "C" uint64_t ds4_gpu_d5_shelf_plan_bytes(uint64_t slot_bytes) {
+    if (ds4_gpu_d5_prefetch_mode() == 0 || cuda_d5_diag() == 1 ||
+        cuda_stream_read_direct_disabled() || slot_bytes == 0) return 0;
+    const uint64_t n = (uint64_t)cuda_d5_env_u32("DS4_ROCM_D5_SHELF", 16u, 1u, DS4_D5_MAX_SHELF);
+    uint64_t total = 0;
+    return cuda_u64_mul_checked(slot_bytes, n, &total) ? total : 0;
 }
 
 /* Lazily allocate the shelf; 1 when usable. */
@@ -5756,6 +5881,8 @@ extern "C" int ds4_gpu_d5_prefetch(const ds4_gpu_stream_expert_table *t,
     }
     const uint64_t g = t->gate_expert_bytes, d = t->down_expert_bytes;
     if (!g || !d || !cuda_d5_shelf_ready(2u * g + d)) return 0;
+    /* int3: NVMe thermal limit (shelf stays allocated; nothing queued). */
+    if (cuda_d5_temp_held(n_cands)) return 0;
     const uint64_t chunk = g_d5_chunk ? g_d5_chunk : 1048576u;
     uint32_t queued = 0;
     pthread_mutex_lock(&g_stream_read_mutex);

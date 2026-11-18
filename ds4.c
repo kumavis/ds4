@@ -72223,7 +72223,7 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
  * ~0.5 GiB, both inside the 2 GiB runtime allowance).  See D4.md.
  * ========================================================================= */
 typedef struct {
-    uint64_t baseline, fixed, reserve, graph, staging, support, gtt_cap, mem_cap;
+    uint64_t baseline, fixed, reserve, graph, staging, support, gtt_cap, mem_cap, d5_shelf;
     uint32_t ctx, sessions, dynamic_slots, total_slots, legacy_dynamic;
 } ds41_mem_cache_plan;
 
@@ -72284,6 +72284,20 @@ static DS4_MAYBE_UNUSED bool ds41_mem_cache_plan_compute(ds4_engine *e, int ctx_
                ds4_add_sat_u64(p->support,
                ds4_add_sat_u64(p->graph,
                ds4_add_sat_u64(p->staging, 2u * gib)))));
+    /* int3: the D5 prefetch shelf (device memory outside the cache, allocated
+     * on the first prefetch) is part of the fixed charge when prefetch is on,
+     * so the cache gets correspondingly fewer slots.  Its slots are one MXFP4
+     * routed expert each (gate + up + down); prefetch only engages on MXFP4
+     * layers.  Prefetch off: 0, the plan is unchanged. */
+    for (uint32_t il = 0; il < DS4_N_LAYER && !p->d5_shelf; il++) {
+        const ds4_layer_weights *lw = &e->weights.layer[il];
+        uint64_t slot = 0;
+        if (lw->ffn_gate_exps && lw->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
+            streaming_layer_routed_expert_bytes(lw, &slot))
+            p->d5_shelf = ds4_gpu_d5_shelf_plan_bytes(slot);
+        if (lw->ffn_gate_exps && lw->ffn_gate_exps->type == DS4_TENSOR_MXFP4) break;
+    }
+    if (p->d5_shelf) p->fixed = ds4_add_sat_u64(p->fixed, p->d5_shelf);
     const uint64_t mem_need = ds4_add_sat_u64(p->fixed, p->reserve);
     p->mem_cap = p->baseline > mem_need ? p->baseline - mem_need : 0;
     const uint64_t alloc_reserve = ds41_rocm_stream_reserve_bytes(p->baseline);
@@ -72323,6 +72337,9 @@ static DS4_MAYBE_UNUSED bool ds41_mem_cache_plan_compute(ds4_engine *e, int ctx_
             ds4_bytes_to_gib(non_routed_bytes), ds4_bytes_to_gib(e->vision_model.size),
             ds4_bytes_to_gib(p->support), ds4_bytes_to_gib(p->graph), p->ctx, p->sessions,
             ds4_bytes_to_gib(p->staging));
+    if (p->d5_shelf)
+        fprintf(stderr, "ds4:   fixed includes the D5 prefetch shelf %.2f GiB (%.1f MiB)\n",
+                ds4_bytes_to_gib(p->d5_shelf), (double)p->d5_shelf / 1048576.0);
     fprintf(stderr,
             "ds4:   dynamic slots %u (%.2f GiB; legacy sizing would give %u), "
             "%u total with the %u-slot staging; limited by %s\n",

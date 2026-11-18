@@ -506,6 +506,9 @@ int ds4_gpu_d5_prefetch(const ds4_gpu_stream_expert_table *table,
  * default 6; DS4_ROCM_D5_VERIFY_L0 layer-0 probe on the attention input,
  * default 0).  Active only with DS4_ROCM_D5_PREFETCH. */
 uint32_t ds4_gpu_d5_verify_k(void);
+/* int3: device bytes the D5 shelf allocates once prefetch engages (0 when
+ * it never does); the V4.1 memory-sized cache charges them. */
+uint64_t ds4_gpu_d5_shelf_plan_bytes(uint64_t slot_bytes);
 uint32_t ds4_gpu_d5_verify_depth(void);
 int ds4_gpu_d5_verify_l0(void);
 int ds4_gpu_stream_expert_cache_begin_selected_batch(

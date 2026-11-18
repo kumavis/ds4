@@ -828,7 +828,17 @@ def cmd_finalize(a):
     twin_tag = os.environ.get("D17_TWIN_TAG") or None
     twin_dir = latest_run_dir(a.results, twin_tag) if twin_tag and a.results != "-" else None
     twin_rows = turn_rows(twin_dir) if twin_dir else []
-    base["output_class"] = os.environ.get("DS4_OUTPUT_CLASS") or None
+    # Same vocabulary as /data/ds4-env/outclass.py: a declared class wins
+    # (DS4_OUTPUT_CLASS: fp-order, approx-*, lowprec-*); otherwise derived:
+    # plain, or dspark-<verify>. The legacy value "exact" (early D17 runs)
+    # means "no declared change", i.e. derived.
+    declared = os.environ.get("DS4_OUTPUT_CLASS") or ""
+    if declared and declared != "exact":
+        base["output_class"] = declared
+    elif "--dspark" in a.flags:
+        base["output_class"] = "dspark-" + (st.get("dspark_verify") or "fast")
+    else:
+        base["output_class"] = "plain"
     base["twin_tag"] = twin_tag
     base["twin_run_dir"] = twin_dir
     for t in turns:

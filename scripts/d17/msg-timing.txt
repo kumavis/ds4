@@ -1,0 +1,7 @@
+perf(d17b): split the union load time (sync, readback, prepare, read) in the union sweep log line
+
+Development instrumentation for the union-loading sweep: which part of a
+union load is GPU wait for attention and router, the selected-ID readback,
+the resident copies, and the disk read.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

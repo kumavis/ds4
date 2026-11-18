@@ -41,4 +41,12 @@ for p in code json translate; do
 done
 ( export "${W[@]}" DS4_REF_TAG=d20w-ref-code; DS4_NOTE="d20w wmma gate DSpark exact code" run d20w-dsp-code-exact 512 $P --nothink --dspark --mtp-model $DSP --dspark-verify exact )
 echo "$(date -Is) EXACT d20w-dsp-code-exact tf_agree=$(num d20w-dsp-code-exact div_tf_agree) bitexact=$(num d20w-dsp-code-exact div_bitexact_frac) maxabs=$(num d20w-dsp-code-exact div_logit_maxabs)" >> $LOG
+
+# threshold sweep (rows per expert at which the WMMA kernels take over),
+# profiled, at 2,048 + 842 and 325 rows
+for mn in 2 64; do
+  for f in p2890 p300; do
+    ( export "${W[@]}" DS4_ROCM_D20_WMMA_MIN=$mn DS4_ROCM_D20_PROF=1; DS4_NOTE="d20w wmma min $mn profile $f" run d20w-min$mn-prof-$f 8 /data/ds4-bench/d20-$f.txt ) || exit 1
+  done
+done
 echo "$(date -Is) QUEUE DONE (q4)" >> $LOG

@@ -6489,52 +6489,53 @@ __global__ static void d20_wmma_mxfp4_kernel(
     const char *w0 = w0_base + (uint64_t)expert * expert_bytes + (uint64_t)arow * row_bytes;
     const char *w1 = PAIR ? w1_base + (uint64_t)expert * expert_bytes + (uint64_t)arow * row_bytes : w0;
     const uint64_t block_bytes = row_bytes / n_blocks;
-    float g04[8], g26[8], g15[8], g37[8], u04[8], u26[8], u15[8], u37[8];
+    /* One pass per matrix (gate, then up) to keep register pressure down;
+     * per pass the quarter-warp tree is built as t0 = s04 + s26,
+     * t1 = s15 + s37, result t0 + t1, with s_ab = a_a + a_b. */
+    float res[PAIR ? 2 : 1][8];
     const uint32_t order[8] = {0u, 4u, 2u, 6u, 1u, 5u, 3u, 7u};
     #pragma unroll
-    for (uint32_t oi = 0; oi < 8u; oi++) {
-        const uint32_t g = order[oi];
-        float ga[8], ua[8];
-        #pragma unroll
-        for (uint32_t i = 0; i < 8u; i++) { ga[i] = 0.0f; ua[i] = 0.0f; }
-        for (uint32_t b = g; b < n_blocks; b += 8u) {
-            const int8_t *q = have ? arow_act[b].qs : NULL;
-            const float ds = have ? arow_act[b].d : 0.0f;
-            float chunk[8];
-            d20_wmma_block_chunk(w0 + (uint64_t)b * block_bytes, q, lane, chunk);
+    for (uint32_t m = 0; m < (PAIR ? 2u : 1u); m++) {
+        const char *wm = m ? w1 : w0;
+        float t0[8], t1[8], pp[8];
+        for (uint32_t oi = 0; oi < 8u; oi++) {
+            const uint32_t g = order[oi];
+            float ga[8];
             #pragma unroll
-            for (uint32_t i = 0; i < 8u; i++) ga[i] += 0.5f * ds * chunk[i];
-            if (PAIR) {
-                d20_wmma_block_chunk(w1 + (uint64_t)b * block_bytes, q, lane, chunk);
+            for (uint32_t i = 0; i < 8u; i++) ga[i] = 0.0f;
+            for (uint32_t b = g; b < n_blocks; b += 8u) {
+                const int8_t *q = have ? arow_act[b].qs : NULL;
+                const float ds = have ? arow_act[b].d : 0.0f;
+                float chunk[8];
+                d20_wmma_block_chunk(wm + (uint64_t)b * block_bytes, q, lane, chunk);
                 #pragma unroll
-                for (uint32_t i = 0; i < 8u; i++) ua[i] += 0.5f * ds * chunk[i];
+                for (uint32_t i = 0; i < 8u; i++) ga[i] += 0.5f * ds * chunk[i];
+            }
+            #pragma unroll
+            for (uint32_t i = 0; i < 8u; i++) {
+                if ((oi & 1u) == 0u) pp[i] = ga[i];
+                else pp[i] = pp[i] + ga[i];
+                if (oi == 1u) t0[i] = pp[i];
+                else if (oi == 3u) t0[i] = t0[i] + pp[i];
+                else if (oi == 5u) t1[i] = pp[i];
+                else if (oi == 7u) t1[i] = t1[i] + pp[i];
             }
         }
-        /* partial sums in the quarter-warp tree's order */
         #pragma unroll
-        for (uint32_t i = 0; i < 8u; i++) {
-            if (oi == 0u) { g04[i] = ga[i]; u04[i] = ua[i]; }
-            else if (oi == 1u) { g04[i] = g04[i] + ga[i]; u04[i] = u04[i] + ua[i]; }
-            else if (oi == 2u) { g26[i] = ga[i]; u26[i] = ua[i]; }
-            else if (oi == 3u) { g26[i] = g26[i] + ga[i]; u26[i] = u26[i] + ua[i]; }
-            else if (oi == 4u) { g15[i] = ga[i]; u15[i] = ua[i]; }
-            else if (oi == 5u) { g15[i] = g15[i] + ga[i]; u15[i] = u15[i] + ua[i]; }
-            else if (oi == 6u) { g37[i] = ga[i]; u37[i] = ua[i]; }
-            else { g37[i] = g37[i] + ga[i]; u37[i] = u37[i] + ua[i]; }
-        }
+        for (uint32_t i = 0; i < 8u; i++) res[m][i] = t0[i] + t1[i];
     }
     if (!have) return;
     #pragma unroll
     for (uint32_t i = 0; i < 8u; i++) {
         const uint32_t row = r0 + 2u * i + (lane >> 4u);
         if (row >= out_rows) continue;
-        float gv = (g04[i] + g26[i]) + (g15[i] + g37[i]);
+        float gv = res[0][i];
         const uint64_t off = (uint64_t)pair * out_rows + row;
         if (!PAIR) {
             out[off] = gv;
             continue;
         }
-        float uv = (u04[i] + u26[i]) + (u15[i] + u37[i]);
+        float uv = res[PAIR ? 1 : 0][i];
         if (clamp > 1.0e-6f) {
             if (gv > clamp) gv = clamp;
             if (uv > clamp) uv = clamp;

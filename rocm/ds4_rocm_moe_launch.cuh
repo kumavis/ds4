@@ -4630,12 +4630,26 @@ extern "C" int ds4_gpu_test_d20_wmma(uint32_t kind, uint32_t count, uint32_t see
         for (int k = 0; ok && k < (gu ? 3 : 1); k++) {
             ok = cuda_ok(cudaMemcpy(x.data(), o[k], out_bytes, cudaMemcpyDeviceToHost), "d x") &&
                  cuda_ok(cudaMemcpy(y.data(), o[3 + k], out_bytes, cudaMemcpyDeviceToHost), "d y");
+            uint64_t worst = 0;
+            size_t worst_off = 0;
             for (uint32_t i = 0; i < count; i++)
                 for (uint32_t r = 0; r < rows; r++) {
                     const size_t off = (size_t)pairs[i] * rows + r;
-                    d += x[off] != y[off];
+                    if (x[off] != y[off]) {
+                        d++;
+                        const int64_t xi = (int32_t)x[off], yi = (int32_t)y[off];
+                        const uint64_t u = (uint64_t)(xi > yi ? xi - yi : yi - xi);
+                        if (u > worst) { worst = u; worst_off = off; }
+                    }
                     tot++;
                 }
+            if (worst) {
+                float xv, yv;
+                memcpy(&xv, &x[worst_off], 4);
+                memcpy(&yv, &y[worst_off], 4);
+                fprintf(stderr, "d20 wmma test kind %u count %u output %d: worst %llu ulp at pair-row %zu: tile8 %.9g wmma %.9g\n",
+                        kind, count, k, (unsigned long long)worst, worst_off, xv, yv);
+            }
         }
         *n_diff = d;
         *n_total = tot;

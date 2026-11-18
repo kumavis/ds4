@@ -42747,6 +42747,122 @@ static void d5_prefetch_issue(const ds41_gpu_graph *g, const ds4_model *m,
 }
 #endif
 
+#ifdef DS4_ROCM_BUILD
+/* D16: cache-conditional routing (see rocm/ds4_rocm_router.cuh).  Host side:
+ * routing transactions and the per-layer range estimate Rbar.
+ *  - A decode step (ds41_graph_step outside a verify round) is one
+ *    transaction: residency snapshot at its start, its row's ranges commit at
+ *    its end.
+ *  - A verify round (batched or scalar) is one transaction: one snapshot when
+ *    the round opens, used by every row and layer; only the rows the round
+ *    commits (ds41_draft_rollback's accepted count) add their ranges to Rbar.
+ *  - Prefill and the drafter route unbiased; prefill ranges do not feed Rbar.
+ * Rbar[il] = mean range of committed rows; 0 until one exists (a row then
+ * uses its own range).  Counters print at exit. */
+enum { DS41_RP_ROWS = 8 };
+static double g_rp_rsum[DS4_N_LAYER];
+static uint64_t g_rp_rcnt[DS4_N_LAYER];
+static bool g_rp_txn;            /* transaction open */
+static bool g_rp_txn_verify;     /* ... and it is a verify round */
+static uint32_t g_rp_row;        /* row index for single-row routing */
+static int g_rp_state = -1;
+static uint64_t g_rp_rows[2], g_rp_rowlayers[2], g_rp_swapped_rl[2], g_rp_swapped_picks[2];
+static uint64_t g_rp_by_rank[2][8];
+static double g_rp_drift[2];
+static uint64_t g_rp_verify_rounds, g_rp_verify_rows, g_rp_verify_misses;
+static uint64_t g_rp_snap_sum, g_rp_snaps;
+
+static void ds41_rp_print(void) {
+    if (!(ds4_gpu_route_prior_lambda() > 0.0f) && !g_rp_verify_rows) return;
+    for (int k = 0; k < 2; k++) {
+        const double rl = g_rp_rowlayers[k] ? (double)g_rp_rowlayers[k] : 1.0;
+        fprintf(stderr,
+                "ds4: D16 route prior %s: lambda=%g keep=%u rows=%llu row_layers=%llu "
+                "swapped_row_layers=%llu (%.4f) swapped_picks=%llu (%.4f per row-layer) "
+                "by_unbiased_rank=%llu/%llu/%llu/%llu/%llu/%llu drift_mean=%.6f\n",
+                k ? "verify (committed rows)" : "decode",
+                (double)ds4_gpu_route_prior_lambda(), ds4_gpu_route_prior_keep(),
+                (unsigned long long)g_rp_rows[k], (unsigned long long)g_rp_rowlayers[k],
+                (unsigned long long)g_rp_swapped_rl[k], (double)g_rp_swapped_rl[k] / rl,
+                (unsigned long long)g_rp_swapped_picks[k], (double)g_rp_swapped_picks[k] / rl,
+                (unsigned long long)g_rp_by_rank[k][0], (unsigned long long)g_rp_by_rank[k][1],
+                (unsigned long long)g_rp_by_rank[k][2], (unsigned long long)g_rp_by_rank[k][3],
+                (unsigned long long)g_rp_by_rank[k][4], (unsigned long long)g_rp_by_rank[k][5],
+                g_rp_drift[k] / rl);
+    }
+    fprintf(stderr, "ds4: D16 verify rounds=%llu verified_rows=%llu verify_batch_misses=%llu "
+                    "(%.3f per verified row) mean_snapshot_resident=%.1f\n",
+            (unsigned long long)g_rp_verify_rounds, (unsigned long long)g_rp_verify_rows,
+            (unsigned long long)g_rp_verify_misses,
+            g_rp_verify_rows ? (double)g_rp_verify_misses / (double)g_rp_verify_rows : 0.0,
+            g_rp_snaps ? (double)g_rp_snap_sum / (double)g_rp_snaps : 0.0);
+}
+
+static bool ds41_rp_on(const ds41_gpu_graph *g) {
+    if (g_rp_state < 0) {
+        g_rp_state = 1;
+        atexit(ds41_rp_print);
+    }
+    return g->streaming && g->tp_world == 1u && DS4_N_EXPERT == 384u &&
+        ds4_gpu_route_prior_lambda() > 0.0f;
+}
+
+static bool ds41_rp_open(const ds41_gpu_graph *g, const ds4_model *m, bool verify) {
+    if (!ds41_rp_on(g)) return true;
+    float rbar[DS4_N_LAYER];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        rbar[il] = g_rp_rcnt[il] ? (float)(g_rp_rsum[il] / (double)g_rp_rcnt[il]) : 0.0f;
+    if (!ds4_gpu_route_prior_open(m->map, DS4_N_LAYER, rbar)) return false;
+    g_rp_txn = true;
+    g_rp_txn_verify = verify;
+    g_rp_row = 0;
+    g_rp_snap_sum += ds4_gpu_route_prior_snapshot_count();
+    g_rp_snaps++;
+    return true;
+}
+
+/* Close the open transaction, committing its first `rows` rows. */
+static bool ds41_rp_commit(uint32_t rows) {
+    if (!g_rp_txn) return true;
+    const int k = g_rp_txn_verify ? 1 : 0;
+    g_rp_txn = false;
+    g_rp_txn_verify = false;
+    if (!rows) return true;
+    if (rows > DS41_RP_ROWS) return false;
+    float st[DS41_RP_ROWS * DS4_N_LAYER * 4];
+    if (!ds4_gpu_route_prior_stats(st, rows, DS4_N_LAYER)) return false;
+    for (uint32_t r = 0; r < rows; r++) {
+        g_rp_rows[k]++;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const float *x = st + ((uint64_t)r * DS4_N_LAYER + il) * 4u;
+            g_rp_rsum[il] += x[0];
+            g_rp_rcnt[il]++;
+            const uint32_t dropped = (uint32_t)x[1];
+            g_rp_rowlayers[k]++;
+            if (dropped) g_rp_swapped_rl[k]++;
+            for (uint32_t b = 0; b < 6u; b++)
+                if (dropped & (1u << b)) { g_rp_by_rank[k][b]++; g_rp_swapped_picks[k]++; }
+            g_rp_drift[k] += x[2];
+        }
+    }
+    return true;
+}
+
+static bool ds41_rp_apply(ds41_gpu_graph *g, const ds4_model *m, uint64_t bias_offset,
+                          ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                          ds4_gpu_tensor *probs, uint32_t il, uint32_t rows, uint32_t row_offset) {
+    if (!g_rp_txn) return true;
+    return ds4_gpu_route_prior_apply(selected, weights, probs, m->map, m->size, bias_offset,
+                                     il, DS4_N_LAYER, rows, row_offset, DS4_N_EXPERT,
+                                     DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE) != 0;
+}
+#else
+static bool ds41_rp_open(const ds41_gpu_graph *g, const ds4_model *m, bool verify) {
+    (void)g; (void)m; (void)verify;
+    return true;
+}
+#endif
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
 #ifdef DS4_ROCM_BUILD
@@ -42769,6 +42885,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
 #ifdef DS4_ROCM_BUILD
+    /* D16: cache-conditional re-selection (only inside an open transaction). */
+    if (g_rp_txn && !ds41_rp_apply(g, m, bias->abs_offset, g->selected, g->route_weights,
+                                   g->route_probs, il, 1u, g_rp_row)) return false;
     C1F(C1_ROUTER, il);
     /* Start expert I/O before enqueuing the independent shared expert. The
      * routed consumer joins the matching compact table and upload event.
@@ -43456,8 +43575,23 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
 #endif
 
 static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
-                              const ds4_layer_weights *l, uint32_t count) {
+                              const ds4_layer_weights *l, uint32_t il, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
+#ifdef DS4_ROCM_BUILD
+    /* D16: verify rows of an open verify-round transaction (text rows only;
+     * prefill and image rows stay unbiased). */
+    if (g_rp_txn && g_rp_txn_verify && !g->image_count && g->draft &&
+        g->draft->verify_rows == count)
+        return ds4_gpu_router_select_batch_tensor(
+            b->selected, b->route_weights, b->route_probs, m->map, m->size,
+            l->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
+            b->route_logits, g->prefill_tokens, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+            DS4_EXPERT_WEIGHT_SCALE, count) &&
+            ds41_rp_apply(g, m, l->ffn_exp_probs_b->abs_offset, b->selected,
+                          b->route_weights, b->route_probs, il, count, 0u);
+#else
+    (void)il;
+#endif
     if (!g->image_count) return ds4_gpu_router_select_batch_tensor(
         b->selected, b->route_weights, b->route_probs, m->map, m->size,
         l->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
@@ -43500,7 +43634,7 @@ static bool ds41_moe_batch_overlap(ds41_gpu_graph *g, const ds4_model *m,
     ds4_gpu_tensor *peer = b->q;
     const uint64_t bytes = (uint64_t)count * DS4_N_EMBD * sizeof(float);
     if (!ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) ||
-        !ds41_route_batch(g, m, l, count) ||
+        !ds41_route_batch(g, m, l, il, count) ||
         !ds4_gpu_dsv41_routed_moe_typed_tp_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, b->selected, b->route_weights,
@@ -43561,7 +43695,7 @@ static bool ds41_moe_batch_d2(ds41_gpu_graph *g, const ds4_model *m,
         d5_verify_probe_start(m, l + 1, b->x, count);
     if (n_ids > sizeof(ids) / sizeof(ids[0]) ||
         !ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) ||
-        !ds41_route_batch(g, m, l, count) ||
+        !ds41_route_batch(g, m, l, il, count) ||
         !ds4_gpu_selected_readback_start(b->selected, n_ids) ||
         !ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) ||
         !ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) ||
@@ -43603,7 +43737,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     const bool balance_shared = shared_owner && ds41_balance_shared(g, l, count);
     bool mid_f16 = false;
     return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
-        ds41_route_batch(g, m, l, count) &&
+        ds41_route_batch(g, m, l, il, count) &&
         ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
         ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
@@ -44352,6 +44486,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     }
 #endif
     const float initial_pre[] = {1, 0, 0, 0};
+#ifdef DS4_ROCM_BUILD
+    /* D16: a decode step outside a verify round is its own transaction. */
+    const bool rp_step = ds41_rp_on(g) && !(g->draft && g->draft->verify_rows);
+    if (rp_step && (!ds41_rp_open(g, m, false))) return false;
+#endif
     bool ok = ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) &&
         ds4_gpu_begin_commands() && ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
     C1F(C1_EMBED, -1);
@@ -44478,6 +44617,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (g_ds4_c1_active) {
         ds4_gpu_c1_token_end();
         g_ds4_c1_active = 0;
+    }
+#endif
+#ifdef DS4_ROCM_BUILD
+    if (rp_step) {
+        if (ok) ok = ds41_rp_commit(1u);
+        else (void)ds41_rp_commit(0u);
     }
 #endif
     if (!ok) {
@@ -45862,7 +46007,13 @@ static bool ds41_draft_verify_scalar(ds41_gpu_graph *g, const ds4_model *m,
         d->mh_rows = n;
         bool ok = ds4_gpu_begin_commands() &&
             ds41_draft_slots(g, pos0, 1, n, true) && ds4_gpu_end_commands();
+#ifdef DS4_ROCM_BUILD
+        if (ok) ok = ds41_rp_open(g, m, true);
+#endif
         for (uint32_t i = 0; ok && i < n; i++) {
+#ifdef DS4_ROCM_BUILD
+            g_rp_row = i;
+#endif
             ok = ds41_graph_step(g, m, w, tokens[i],
                 logits_rows ? logits_rows + (uint64_t)i * DS4_N_VOCAB : NULL);
             for (uint32_t il = 0; ok && il < 20u; il++) {
@@ -45904,7 +46055,7 @@ static bool ds41_draft_verify_batch(ds41_gpu_graph *g, const ds4_model *m,
     const char *dense_env = getenv("DS4_ROCM_DSPARK_V41_GENERIC_DENSE");
     g_ds41_dspark_verify_dense = dense_env && dense_env[0] != '0';
 #endif
-    bool ok = ds4_gpu_begin_commands() &&
+    bool ok = ds41_rp_open(g, m, true) && ds4_gpu_begin_commands() &&
         ds41_draft_slots(g, g->pos, 1, n, true) &&
         ds41_graph_step_batch(graphs, tokens, (int)n, n, m, w);
     if (ok) {
@@ -46016,11 +46167,20 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
      * than its prefill kernels at DSpark's two-to-six-row verifier widths.
      * Keep this source-bound ablation until the width-specific batch kernels
      * are qualified, then select the faster path from measured thresholds. */
+    const uint64_t rp_m0 = ds4_gpu_stream_batch_miss_count();
     if (ds41_verify_setting() == DS41_VERIFY_EXACT)
         ok = ds41_draft_verify_scalar(g, m, w, tokens, n, logits_rows);
     else
 #endif
         ok = ds41_draft_verify_batch(g, m, w, tokens, n, logits_rows);
+#ifdef DS4_ROCM_BUILD
+    if (ok && g->streaming) {
+        g_rp_verify_rounds++;
+        g_rp_verify_rows += n;
+        g_rp_verify_misses += ds4_gpu_stream_batch_miss_count() - rp_m0;
+    }
+    if (!ok) (void)ds41_rp_commit(0u);
+#endif
     if (ok && logits_rows)
         for (uint32_t r = 0; r < n; r++)
             ds41_d0_log_logits(1u, g->pos - n + r, tokens[r], r, n,
@@ -46068,6 +46228,10 @@ static bool ds41_draft_rollback(ds41_gpu_graph *g, const int *tokens,
         }
     }
     ok = ok && ds41_draft_commit(g, accepted);
+#ifdef DS4_ROCM_BUILD
+    /* D16: the verify round's transaction commits its accepted rows. */
+    if (g_rp_txn && g_rp_txn_verify && !ds41_rp_commit(accepted)) ok = false;
+#endif
     d->mh_rows = accepted;
     if (!ds4_gpu_end_commands()) ok = false;
     if (!ok) g->valid = false;

@@ -20,7 +20,7 @@ export DS4_DIR=/data/ds4-d19
 LOG=/data/ds4-bench/d19-queue.log
 . "$DS4_DIR/scripts/d12/common.sh"
 LOG=/data/ds4-bench/d19-queue.log
-T=/data/ds4-bench/d19-traces; mkdir -p $T /data/ds4-bench/d19-kv/s3
+T=/data/ds4-bench/d19-traces; mkdir -p "$T"
 note() { echo "$(date -Is) $*" >> $LOG; }
 qcheck() {
   local cmd
@@ -97,22 +97,10 @@ D14_BUDGET_MIN=50 DS4_ROCM_STREAM_EVICT_POLICY=s3fifo DS4_ROCM_STREAM_SEED_POLIC
   sess d19-s1-plain-32k-s3cold s1 163840 "" "grow:target=32768:label=grow"
 D14_BUDGET_MIN=50 DS4_DSPARK_SCHED=old DS4_ROCM_STREAM_EVICT_POLICY=s3fifo DS4_ROCM_STREAM_SEED_POLICY=cold DS4_NOTE="D19 DSpark session to 32k, s3fifo + seed cold" \
   sess d19-s1-dsp-32k-s3cold s1 163840 "$DRAFT" "grow:target=32768:label=grow"
-if [[ -z $start_at || $start_at == d19-s1-plain-s3cold-trace-a ]] && [[ -n $(ls -A /data/ds4-bench/d19-kv/s3) ]]; then
-  note "STOP before trace-a: existing checkpoints in d19-kv/s3"; exit 1
-fi
-KV="--kv-disk-dir /data/ds4-bench/d19-kv/s3 --kv-disk-space-mb 32768"
-DS4_ROCM_STREAM_EVICT_POLICY=s3fifo DS4_ROCM_STREAM_SEED_POLICY=cold DS4_D12_CACHE_TRACE=$T/d19-s1-plain-s3cold-trace-a.trace D14_BUDGET_MIN=85 \
-  DS4_NOTE="D19 traced plain session 0->66k, s3fifo + seed cold, disk KV saves" \
-  sess d19-s1-plain-s3cold-trace-a s1-long 163840 "$KV" "grow:target=66000:label=grow"
-case $start_at in
-  "") A1=$verified_dir ;;
-  d19-s1-plain-s3cold-trace-b)
-    A1=$(qcheck check d19-s1-plain-s3cold-trace-a "grow:target=66000:label=grow")
-    [[ -n $(ls -A /data/ds4-bench/d19-kv/s3) ]] || { note "STOP: missing restore checkpoints"; exit 1; } ;;
-  *) echo "unknown q4 tag: $start_at" >&2; exit 2 ;;
-esac
-DS4_ROCM_STREAM_EVICT_POLICY=s3fifo DS4_ROCM_STREAM_SEED_POLICY=cold DS4_D12_CACHE_TRACE=$T/d19-s1-plain-s3cold-trace-b.trace D14_BUDGET_MIN=88 \
-  DS4_NOTE="D19 traced plain session restored at ~66k, s3fifo + seed cold, ->100k" \
-  sess d19-s1-plain-s3cold-trace-b s1-long 163840 "$KV" "grow:target=100000:from=$A1:label=grow"
-gzip -- "$T/d19-s1-plain-s3cold-trace-a.trace" "$T/d19-s1-plain-s3cold-trace-b.trace"
+# These paired arms replace the earlier nominal-100k S3-only trace legs.
+# Example: q4.sh --from d19-q4long-lru-a skips the independent 32k sessions.
+long_cmd=(python3 -B "$DS4_DIR/scripts/d19/q4_long.py")
+if [[ -n $start_at ]]; then long_cmd+=("$start_at"); fi
+printf -v cmd '%q ' "${long_cmd[@]}"
+nix-shell /data/ds4-env/shell.nix --run "$cmd"
 note "QUEUE DONE (q4)"

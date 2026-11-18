@@ -543,3 +543,19 @@ extern "C" int ds4_gpu_route_prior_stats(float *out, uint32_t n_rows, uint32_t n
 }
 
 extern "C" uint64_t ds4_gpu_stream_batch_miss_count(void) { return g_stream_cache_stats.batch_misses; }
+
+/* D16b trace: residency of model_map's experts, n_layer x 384 bytes (1 =
+ * resident).  Host only, no device work. */
+extern "C" uint64_t ds4_gpu_stream_resident_mask(const void *model_map, uint32_t n_layer,
+                                                 unsigned char *out) {
+    if (!model_map || !out) return 0;
+    memset(out, 0, (size_t)n_layer * DS4_ROCM_MAX_N_EXPERT);
+    uint64_t n = 0;
+    for (const cuda_stream_resident_expert &e : g_stream_resident_experts) {
+        if (e.model_map != model_map || e.layer >= n_layer || e.expert < 0 ||
+            (uint32_t)e.expert >= DS4_ROCM_MAX_N_EXPERT) continue;
+        out[(size_t)e.layer * DS4_ROCM_MAX_N_EXPERT + (uint32_t)e.expert] = 1;
+        n++;
+    }
+    return n;
+}

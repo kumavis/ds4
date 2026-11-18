@@ -43565,6 +43565,83 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
 }
 #endif
 
+#ifdef DS4_ROCM_BUILD
+/* D16b: prefill routing trace (DS4_ROCM_ROUTE_TRACE=<path>, off by default;
+ * measurement only, routes are unchanged).  For every multi-row prefill
+ * routing call (not a DSpark verify round) it appends to <path>:
+ *   once per layer:  'B' u32 layer, u32 384, 384 x f32 selection bias
+ *   at layer 0:      'C' u32 pos, u32 rows, u64 resident, 40 x 384 u8
+ *                    residency of the SSD expert cache at the chunk's start
+ *   every layer:     'L' u32 layer, u32 rows, rows x 384 x f16 gating score
+ *                    s = sqrt(softplus(logit)) (the router's probs)
+ * Each record is preceded by a one-byte tag.  The score readback drains the
+ * stream, so tracing slows prefill. */
+static FILE *g_rt_file;
+static int g_rt_state = -1;
+static bool g_rt_bias_done[64];
+
+static uint16_t ds41_rt_f16(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t e = (int32_t)((x >> 23) & 0xffu) - 127 + 15;
+    uint32_t m = x & 0x7fffffu;
+    if (e <= 0) return (uint16_t)sign;                 /* flush tiny to zero */
+    if (e >= 31) return (uint16_t)(sign | 0x7c00u);    /* overflow to inf */
+    uint32_t h = sign | ((uint32_t)e << 10) | (m >> 13);
+    if ((m >> 12) & 1u) h++;                           /* round half up */
+    return (uint16_t)h;
+}
+
+static void ds41_route_trace(ds41_gpu_graph *g, const ds4_model *m,
+                             const ds4_layer_weights *l, uint32_t il, uint32_t count) {
+    if (g_rt_state < 0) {
+        const char *path = getenv("DS4_ROCM_ROUTE_TRACE");
+        g_rt_state = 0;
+        if (path && path[0]) {
+            g_rt_file = fopen(path, "ab");
+            if (g_rt_file) g_rt_state = 1;
+            else fprintf(stderr, "ds4: D16b route trace: cannot open %s\n", path);
+        }
+    }
+    if (g_rt_state != 1 || !g->streaming || g->image_count || count < 2u || il >= 64u ||
+        DS4_N_EXPERT != 384u || (g->draft && g->draft->verify_rows == count)) return;
+    if (!g_rt_bias_done[il] && l->ffn_exp_probs_b) {
+        const float *bias = (const float *)((const char *)m->map + l->ffn_exp_probs_b->abs_offset);
+        const uint32_t hdr[2] = {il, 384u};
+        fputc('B', g_rt_file);
+        fwrite(hdr, sizeof(hdr), 1, g_rt_file);
+        fwrite(bias, sizeof(float), 384u, g_rt_file);
+        g_rt_bias_done[il] = true;
+    }
+    if (il == 0u) {
+        unsigned char *mask = malloc((size_t)DS4_N_LAYER * 384u);
+        if (mask) {
+            const uint64_t n = ds4_gpu_stream_resident_mask(m->map, DS4_N_LAYER, mask);
+            const uint32_t hdr[2] = {g->pos, count};
+            fputc('C', g_rt_file);
+            fwrite(hdr, sizeof(hdr), 1, g_rt_file);
+            fwrite(&n, sizeof(n), 1, g_rt_file);
+            fwrite(mask, 1, (size_t)DS4_N_LAYER * 384u, g_rt_file);
+            free(mask);
+        }
+    }
+    const size_t n = (size_t)count * 384u;
+    float *buf = malloc(n * sizeof(float));
+    uint16_t *h = malloc(n * sizeof(uint16_t));
+    if (buf && h && ds4_gpu_tensor_read(g->batch.route_probs, 0, buf, n * sizeof(float))) {
+        for (size_t i = 0; i < n; i++) h[i] = ds41_rt_f16(buf[i]);
+        const uint32_t hdr[2] = {il, count};
+        fputc('L', g_rt_file);
+        fwrite(hdr, sizeof(hdr), 1, g_rt_file);
+        fwrite(h, sizeof(uint16_t), n, g_rt_file);
+        if (il + 1u == DS4_N_LAYER) fflush(g_rt_file);
+    }
+    free(buf);
+    free(h);
+}
+#endif
+
 static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_layer_weights *l, uint32_t il, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
@@ -43583,11 +43660,17 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
 #else
     (void)il;
 #endif
-    if (!g->image_count) return ds4_gpu_router_select_batch_tensor(
-        b->selected, b->route_weights, b->route_probs, m->map, m->size,
-        l->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
-        b->route_logits, g->prefill_tokens, DS4_N_EXPERT, DS4_N_EXPERT_USED,
-        DS4_EXPERT_WEIGHT_SCALE, count);
+    if (!g->image_count) {
+        const bool routed = ds4_gpu_router_select_batch_tensor(
+            b->selected, b->route_weights, b->route_probs, m->map, m->size,
+            l->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
+            b->route_logits, g->prefill_tokens, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+            DS4_EXPERT_WEIGHT_SCALE, count);
+#ifdef DS4_ROCM_BUILD
+        if (routed) ds41_route_trace(g, m, l, il, count);
+#endif
+        return routed;
+    }
     /* The ordinary 384-expert selector already has the right scoring and
      * normalization. Split only where the text/visual selection bias changes. */
     for (uint32_t first = 0; first < count;) {

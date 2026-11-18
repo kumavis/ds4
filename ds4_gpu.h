@@ -521,6 +521,8 @@ int ds4_gpu_route_prior_apply(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
         uint32_t row_offset, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale);
 int ds4_gpu_route_prior_stats(float *out, uint32_t n_rows, uint32_t n_layer);
 uint64_t ds4_gpu_stream_batch_miss_count(void);
+uint64_t ds4_gpu_stream_resident_mask(const void *model_map, uint32_t n_layer,
+                                      unsigned char *out);
 /* int3: device bytes the D5 shelf allocates once prefetch engages (0 when
  * it never does); the V4.1 memory-sized cache charges them. */
 uint64_t ds4_gpu_d5_shelf_plan_bytes(uint64_t slot_bytes);

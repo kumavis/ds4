@@ -555,6 +555,12 @@ int ds4_gpu_dsv41_stream_prepare_layer(
  * want[6] (a 384-bit mask) are copied or read; the others' staging bytes are
  * left as they are and must not be used (the routed MoE uses only routed
  * experts). want == NULL is the whole layer. */
+/* D17 partial staging reclaim for union sweeps (ROCm): begin (1 = partial
+ * mode; 0 = refused, do the full reclaim), take back one layer's union slots,
+ * end (stats: lent entries at begin, evicted, held, violations). */
+int ds4_gpu_stream_expert_cache_staging_union_begin(void);
+int ds4_gpu_stream_expert_cache_staging_reclaim_slots(uint32_t parity, const uint64_t *mask);
+int ds4_gpu_stream_expert_cache_staging_union_end(uint64_t *stats);
 int ds4_gpu_dsv41_stream_prepare_layer_masked(
         const ds4_gpu_stream_expert_table *table,
         const uint64_t *want,

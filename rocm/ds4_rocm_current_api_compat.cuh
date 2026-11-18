@@ -336,6 +336,24 @@ extern "C" int ds4_gpu_dsv41_stream_prepare_layer(
     return cuda_stream_v41_prepare_layer(table, plan);
 }
 
+extern "C" int ds4_gpu_stream_expert_cache_staging_union_begin(void) {
+    return cuda_stream_staging_union_begin();
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_staging_reclaim_slots(uint32_t parity, const uint64_t *mask) {
+    return cuda_stream_staging_reclaim_slots(parity, mask);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_staging_union_end(uint64_t *stats) {
+    if (stats) {
+        stats[0] = g_stream_staging_partial_lent_resident0;
+        stats[1] = g_stream_staging_partial_evicted;
+        stats[2] = g_stream_staging_partial_held;
+        stats[3] = g_stream_staging_partial_violations;
+    }
+    return cuda_stream_staging_union_end();
+}
+
 extern "C" int ds4_gpu_dsv41_stream_prepare_layer_masked(
         const ds4_gpu_stream_expert_table *table,
         const uint64_t *want,

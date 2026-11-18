@@ -1129,6 +1129,42 @@ static int d20_down_stage9_enabled(void) {
     return v;
 }
 
+/* D20 step 3 switches and the WMMA tile-list scratch. */
+static int d20_wmma_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_ROCM_D20_WMMA");
+        v = e && e[0] && strcmp(e, "0") ? 1 : 0;
+    }
+    return v;
+}
+static uint32_t d20_wmma_min_rows(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_ROCM_D20_WMMA_MIN");
+        long x = e && e[0] ? strtol(e, NULL, 10) : 16;
+        if (x < 1 || x > 100000) x = 16;
+        v = (int)x;
+    }
+    return (uint32_t)v;
+}
+static int d20_wmma_scratch(uint32_t capacity, uint32_t **total, uint32_t **experts, uint32_t **starts) {
+    static uint32_t *buf = NULL;
+    static uint32_t cap = 0;
+    if (capacity > cap) {
+        if (buf) (void)cudaFree(buf);
+        buf = NULL;
+        cap = 0;
+        if (!cuda_ok(cudaMalloc((void **)&buf, (size_t)(1u + 2u * capacity) * sizeof(uint32_t)),
+                     "d20 wmma tile scratch")) return 0;
+        cap = capacity;
+    }
+    *total = buf;
+    *experts = buf + 1;
+    *starts = buf + 1 + capacity;
+    return 1;
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -1580,6 +1616,20 @@ static int routed_moe_launch(
                     n_tokens, mxfp4_path, stream_full_layer, full_table_cached,
                     batch_stream_selected, batch_stream_split_selected,
                     compact_selected, use_sorted_pairs, use_expert_tiles);
+        }
+        /* D20 step 3 admission: the default tile8 MXFP4 path at V4.1 expert
+         * shapes, no occupancy variant selected. */
+        const bool d20_wmma_active = mxfp4_path && use_expert_tiles && d20_wmma_enabled() &&
+            !use_mxfp4_ldsB && !use_mxfp4_tile32 && !use_mxfp4_tile4 && !use_mxfp4_row64 &&
+            expert_in_dim == 5120u && expert_mid_dim == 2304u && out_dim == 5120u &&
+            xq_blocks == 20u && midq_blocks == 9u;
+        const uint32_t d20_wmma_min = d20_wmma_min_rows();
+        uint32_t d20_wmma_capacity = 0u;
+        uint32_t *d20_wmma_total = NULL, *d20_wmma_experts = NULL, *d20_wmma_starts = NULL;
+        if (d20_wmma_active) {
+            d20_wmma_capacity = pair_count / 16u + 385u;
+            if (!d20_wmma_scratch(d20_wmma_capacity, &d20_wmma_total, &d20_wmma_experts,
+                                  &d20_wmma_starts)) return 0;
         }
         dim3 xq_grid(xq_blocks, n_tokens, 1);
         if (!use_rocm_mmq_gateup) {
@@ -2453,7 +2503,20 @@ static int routed_moe_launch(
                         gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                         tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                         gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                        0u, write_gate_up, clamp);
+                        d20_wmma_active ? d20_wmma_min : 0u, write_gate_up, clamp);
+                    if (d20_wmma_active) {
+                        ok = d20_ok(cudaGetLastError(), "routed_moe gate/up launch");
+                        d20_wmma_tiles_kernel<<<1, 64, 0, 0>>>(sorted_counts, d20_wmma_total,
+                            d20_wmma_experts, d20_wmma_starts, n_total_expert, d20_wmma_min, d20_wmma_capacity);
+                        ok = ok && d20_ok(cudaGetLastError(), "routed_moe d20 wmma tiles launch");
+                        dim3 wgrid((expert_mid_dim + 63u) / 64u, d20_wmma_capacity, 1);
+                        d20_wmma_mxfp4_kernel<true><<<wgrid, 128, 0, 0>>>(
+                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                            d20_wmma_total, d20_wmma_experts, d20_wmma_starts,
+                            (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                            xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                    }
                     }
                 } else if (use_gate_row2048) {
                     if (gate_row_span == 512u) {
@@ -3072,8 +3135,9 @@ static int routed_moe_launch(
                 } else if (mxfp4_path) {
                     const uint32_t row_blocks = (out_dim + 31u) / 32u;
                     dim3 tgrid((row_blocks + down_row_groups - 1u) / down_row_groups, down_tile_capacity, 1);
-                    if (midq_blocks == 9u && d20_down_stage9_enabled())
+                    if (midq_blocks == 9u && (d20_down_stage9_enabled() || d20_wmma_active))
                         moe_down_mxfp4_expert_tile8_row32_stage9_kernel<<<tgrid, 256, 0, 0 /* default stream */>>>(
+                            d20_wmma_active ? d20_wmma_min : 0u,
                             (float *)down->ptr,
                             down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                             down_tile_total, down_tile_experts, down_tile_starts,
@@ -3086,6 +3150,17 @@ static int routed_moe_launch(
                         down_tile_total, down_tile_experts, down_tile_starts,
                         down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert, 0u, down_row_groups);
+                    if (d20_wmma_active) {
+                        ok = d20_ok(cudaGetLastError(), "routed_moe down launch");
+                        dim3 wgrid((out_dim + 63u) / 64u, d20_wmma_capacity, 1);
+                        d20_wmma_mxfp4_kernel<false><<<wgrid, 128, 0, 0>>>(
+                            NULL, NULL, (float *)down->ptr, down_w, NULL, midq,
+                            sorted_pairs, sorted_offsets, sorted_counts,
+                            d20_wmma_total, d20_wmma_experts, d20_wmma_starts, NULL,
+                            down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
+                            n_expert, 0u, 0.0f);
+                        ok = ok && d20_ok(cudaGetLastError(), "routed_moe d20 wmma down launch");
+                    }
                 } else if (use_down_row2048) {
                     if (down_row_span == 512u) {
                         dim3 tgrid((out_dim + 511u) / 512u, down_tile_capacity, 1);
@@ -4436,7 +4511,7 @@ extern "C" int ds4_gpu_test_d20_down_stage9(uint32_t count, uint32_t seed, uint3
         moe_down_mxfp4_expert_tile8_row32_kernel<<<grid, 256>>>(o1, dw, dq, dp, doff, dcnt, dtot, dte, dts,
             expert_bytes, row_bytes, midq_blocks, out_dim, 1u, 0u, row_groups);
         ok = cuda_ok(cudaGetLastError(), "d20 test original");
-        moe_down_mxfp4_expert_tile8_row32_stage9_kernel<<<grid, 256>>>(o2, dw, dq, dp, doff, dcnt, dtot, dte, dts,
+        moe_down_mxfp4_expert_tile8_row32_stage9_kernel<<<grid, 256>>>(0u, o2, dw, dq, dp, doff, dcnt, dtot, dte, dts,
             expert_bytes, row_bytes, midq_blocks, out_dim, 1u, 0u, row_groups);
         ok = ok && cuda_ok(cudaGetLastError(), "d20 test stage9") && cuda_ok(cudaDeviceSynchronize(), "d20 test sync");
     }
@@ -4451,5 +4526,122 @@ extern "C" int ds4_gpu_test_d20_down_stage9(uint32_t count, uint32_t seed, uint3
     }
     cudaFree(dw); cudaFree(dq); cudaFree(o1); cudaFree(o2); cudaFree(dp); cudaFree(doff);
     cudaFree(dcnt); cudaFree(dtot); cudaFree(dte); cudaFree(dts);
+    return ok;
+}
+
+/* D20 step 3 model-free test hook.  kind 0: gate/up (K 5120, 2304 rows,
+ * SwiGLU mid and raw gate/up), kind 1: down (K 2304, 5120 rows).  One
+ * expert with `count` pairs (n_expert 6, pair i -> token i, slot i % 6),
+ * random MXFP4 weights, Q8_K activations and route weights from `seed`.
+ * Runs the tile8 kernel (gate/up: the default staged kernel; down: the
+ * original) and the WMMA kernel on identical inputs; counts differing output
+ * bits (gate/up: mid, gate and up) and times each over `reps` launches. */
+extern "C" int ds4_gpu_test_d20_wmma(uint32_t kind, uint32_t count, uint32_t seed, uint32_t reps,
+                                     uint64_t *n_diff, uint64_t *n_total, float *ms_tile8, float *ms_wmma) {
+    const bool gu = kind == 0u;
+    const uint32_t K = gu ? 5120u : 2304u, rows = gu ? 2304u : 5120u, nb = K / 256u;
+    const uint32_t n_expert = 6u;
+    const uint64_t row_bytes = (uint64_t)K / 32u * sizeof(cuda_block_mxfp4);
+    const uint64_t expert_bytes = row_bytes * rows;
+    if (!count || count > 8192u || !n_diff || !n_total || !reps) return 0;
+    uint64_t st = 0x2545f4914f6cdd1dull ^ ((uint64_t)seed * 0x9e3779b97f4a7c15ull);
+    auto rnd = [&st]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+    const uint32_t nm = gu ? 2u : 1u;
+    std::vector<unsigned char> w(expert_bytes * nm);
+    for (uint64_t r = 0; r < (uint64_t)nm * rows * (K / 32u); r++) {
+        cuda_block_mxfp4 *blk = (cuda_block_mxfp4 *)(w.data() + r * sizeof(cuda_block_mxfp4));
+        blk->e = (uint8_t)(118u + rnd() % 14u);
+        for (int q = 0; q < 16; q++) blk->qs[q] = (uint8_t)rnd();
+    }
+    const uint32_t n_act = gu ? count : count * n_expert;   /* gate/up: by token; down: by pair */
+    std::vector<cuda_block_q8_K> act((size_t)n_act * nb);
+    for (auto &b : act) {
+        memset(&b, 0, sizeof(b));
+        b.d = (float)((int32_t)(rnd() % 2001u) - 1000) * 1e-4f + 1e-6f;
+        for (int q = 0; q < 256; q++) b.qs[q] = (int8_t)(rnd() & 0xff);
+    }
+    std::vector<float> rw((size_t)count * n_expert);
+    for (auto &x : rw) x = (float)(rnd() % 1000u) * 1e-3f;
+    std::vector<uint32_t> pairs(count);
+    for (uint32_t i = 0; i < count; i++) pairs[i] = i * n_expert + (i % n_expert);
+    const uint32_t t8 = (count + 7u) / 8u, t16 = (count + 15u) / 16u;
+    std::vector<uint32_t> te8(t8, 0u), ts8(t8), te16(t16, 0u), ts16(t16);
+    for (uint32_t t = 0; t < t8; t++) ts8[t] = 8u * t;
+    for (uint32_t t = 0; t < t16; t++) ts16[t] = 16u * t;
+    const uint32_t zero = 0u;
+    char *dw = NULL; cuda_block_q8_K *da = NULL; float *drw = NULL;
+    float *o[6] = {0};
+    uint32_t *dp = NULL, *doff = NULL, *dcnt = NULL, *dt8 = NULL, *de8 = NULL, *ds8 = NULL, *dt16 = NULL, *de16 = NULL, *ds16 = NULL;
+    const size_t out_elems = (size_t)count * n_expert * rows;
+    const size_t out_bytes = out_elems * sizeof(float);
+    int ok = cuda_ok(cudaMalloc((void **)&dw, w.size()), "d20w w") &&
+        cuda_ok(cudaMalloc((void **)&da, act.size() * sizeof(cuda_block_q8_K)), "d20w act") &&
+        cuda_ok(cudaMalloc((void **)&drw, rw.size() * 4u), "d20w rw") &&
+        cuda_ok(cudaMalloc((void **)&dp, count * 4u), "d20w p") &&
+        cuda_ok(cudaMalloc((void **)&doff, 4u), "d20w off") && cuda_ok(cudaMalloc((void **)&dcnt, 4u), "d20w cnt") &&
+        cuda_ok(cudaMalloc((void **)&dt8, 4u), "d20w t8") && cuda_ok(cudaMalloc((void **)&de8, t8 * 4u), "d20w e8") &&
+        cuda_ok(cudaMalloc((void **)&ds8, t8 * 4u), "d20w s8") && cuda_ok(cudaMalloc((void **)&dt16, 4u), "d20w t16") &&
+        cuda_ok(cudaMalloc((void **)&de16, t16 * 4u), "d20w e16") && cuda_ok(cudaMalloc((void **)&ds16, t16 * 4u), "d20w s16");
+    for (int k = 0; ok && k < 6; k++) ok = cuda_ok(cudaMalloc((void **)&o[k], out_bytes), "d20w out");
+    if (ok) ok = cuda_ok(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "u w") &&
+        cuda_ok(cudaMemcpy(da, act.data(), act.size() * sizeof(cuda_block_q8_K), cudaMemcpyHostToDevice), "u a") &&
+        cuda_ok(cudaMemcpy(drw, rw.data(), rw.size() * 4u, cudaMemcpyHostToDevice), "u rw") &&
+        cuda_ok(cudaMemcpy(dp, pairs.data(), count * 4u, cudaMemcpyHostToDevice), "u p") &&
+        cuda_ok(cudaMemcpy(doff, &zero, 4u, cudaMemcpyHostToDevice), "u off") &&
+        cuda_ok(cudaMemcpy(dcnt, &count, 4u, cudaMemcpyHostToDevice), "u cnt") &&
+        cuda_ok(cudaMemcpy(dt8, &t8, 4u, cudaMemcpyHostToDevice), "u t8") &&
+        cuda_ok(cudaMemcpy(de8, te8.data(), t8 * 4u, cudaMemcpyHostToDevice), "u e8") &&
+        cuda_ok(cudaMemcpy(ds8, ts8.data(), t8 * 4u, cudaMemcpyHostToDevice), "u s8") &&
+        cuda_ok(cudaMemcpy(dt16, &t16, 4u, cudaMemcpyHostToDevice), "u t16") &&
+        cuda_ok(cudaMemcpy(de16, te16.data(), t16 * 4u, cudaMemcpyHostToDevice), "u e16") &&
+        cuda_ok(cudaMemcpy(ds16, ts16.data(), t16 * 4u, cudaMemcpyHostToDevice), "u s16");
+    for (int k = 0; ok && k < 6; k++) ok = cuda_ok(cudaMemset(o[k], k < 3 ? 0xff : 0x7f, out_bytes), "fill");
+    cudaEvent_t e0, e1, e2;
+    if (ok) ok = cuda_ok(cudaEventCreate(&e0), "ev") && cuda_ok(cudaEventCreate(&e1), "ev") && cuda_ok(cudaEventCreate(&e2), "ev");
+    const float clamp = 10.0f;
+    if (ok) {
+        dim3 g8((rows + 31u) / 32u, t8, 1), g8gu(t8, (rows + 31u) / 32u, 1), g16((rows + 63u) / 64u, t16, 1);
+        const uint32_t sh = 8u * nb * (256u + (uint32_t)sizeof(float));
+        (void)cudaEventRecord(e0, 0);
+        for (uint32_t r = 0; r < reps; r++) {
+            if (gu) moe_gate_up_mid_mxfp4_expert_tile8_row32_kernel<<<g8gu, 256, sh>>>(o[1], o[2], o[0], dw, dw + expert_bytes, da,
+                        dp, doff, dcnt, dt8, de8, ds8, drw, expert_bytes, row_bytes, nb, rows, n_expert, 0u, 1u, clamp);
+            else moe_down_mxfp4_expert_tile8_row32_kernel<<<g8, 256>>>(o[0], dw, da, dp, doff, dcnt, dt8, de8, ds8,
+                        expert_bytes, row_bytes, nb, rows, n_expert, 0u, 1u);
+        }
+        (void)cudaEventRecord(e1, 0);
+        for (uint32_t r = 0; r < reps; r++) {
+            if (gu) d20_wmma_mxfp4_kernel<true><<<g16, 128>>>(o[4], o[5], o[3], dw, dw + expert_bytes, da, dp, doff, dcnt,
+                        dt16, de16, ds16, drw, expert_bytes, row_bytes, nb, rows, n_expert, 1u, clamp);
+            else d20_wmma_mxfp4_kernel<false><<<g16, 128>>>(NULL, NULL, o[3], dw, NULL, da, dp, doff, dcnt,
+                        dt16, de16, ds16, NULL, expert_bytes, row_bytes, nb, rows, n_expert, 0u, 0.0f);
+        }
+        (void)cudaEventRecord(e2, 0);
+        ok = cuda_ok(cudaGetLastError(), "d20w launch") && cuda_ok(cudaDeviceSynchronize(), "d20w sync");
+        float a = 0, b = 0;
+        (void)cudaEventElapsedTime(&a, e0, e1);
+        (void)cudaEventElapsedTime(&b, e1, e2);
+        if (ms_tile8) *ms_tile8 = a / reps;
+        if (ms_wmma) *ms_wmma = b / reps;
+    }
+    if (ok) {
+        std::vector<uint32_t> x(out_elems), y(out_elems);
+        uint64_t d = 0, tot = 0;
+        for (int k = 0; ok && k < (gu ? 3 : 1); k++) {
+            ok = cuda_ok(cudaMemcpy(x.data(), o[k], out_bytes, cudaMemcpyDeviceToHost), "d x") &&
+                 cuda_ok(cudaMemcpy(y.data(), o[3 + k], out_bytes, cudaMemcpyDeviceToHost), "d y");
+            for (uint32_t i = 0; i < count; i++)
+                for (uint32_t r = 0; r < rows; r++) {
+                    const size_t off = (size_t)pairs[i] * rows + r;
+                    d += x[off] != y[off];
+                    tot++;
+                }
+        }
+        *n_diff = d;
+        *n_total = tot;
+    }
+    cudaFree(dw); cudaFree(da); cudaFree(drw); cudaFree(dp); cudaFree(doff); cudaFree(dcnt);
+    cudaFree(dt8); cudaFree(de8); cudaFree(ds8); cudaFree(dt16); cudaFree(de16); cudaFree(ds16);
+    for (int k = 0; k < 6; k++) cudaFree(o[k]);
     return ok;
 }

@@ -4189,6 +4189,7 @@ __global__ static void moe_down_mxfp4_expert_tile8_row32_kernel(
  * Bitwise equality of the two helpers is checked model-free by
  * tests/test_d20_down_stage9_rocm.c, not assumed. */
 __global__ static void moe_down_mxfp4_expert_tile8_row32_stage9_kernel(
+        uint32_t max_count,
         float *down_out,
         const char *down_base,
         const cuda_block_q8_K *midq,
@@ -4209,6 +4210,7 @@ __global__ static void moe_down_mxfp4_expert_tile8_row32_stage9_kernel(
     if (tile >= *tile_total) return;
     uint32_t lane = threadIdx.x & 7u;
     uint32_t expert = tile_experts[tile];
+    if (max_count != 0u && counts[expert] >= max_count) return;
     uint32_t local_start = tile_starts[tile];
     /* Aligned quant slices plus separate scales, as in the gate/up tile
      * kernel, so the dot helper loads b128 from LDS. */
@@ -6377,4 +6379,190 @@ __global__ static void moe_down_f32_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
+}
+
+/* ---- D20 step 3: int8 WMMA MXFP4 x Q8_K kernels for large experts ------
+ * DS4_ROCM_D20_WMMA=1 (off by default); experts with at least
+ * DS4_ROCM_D20_WMMA_MIN rows (pairs) run here, smaller ones stay on the tile8
+ * kernels.  One wave computes 16 weight rows x 16 pairs of one expert with
+ * v_wmma_i32_16x16x16_iu8 (layout established by
+ * tests/test_d20_wmma_layout_rocm.cpp: A lane l = row l%16, B lane l = column
+ * l%16, K little-endian in 4 dwords, lanes 16..31 duplicate 0..15; D element
+ * i of lane l = (row 2i + l/16, column l%16)).
+ *
+ * Exactness by construction, checked bitwise by tests/test_d20_wmma_rocm.c:
+ *  - A operand = the MXFP4 block unpacked with dev_mxfp4_unpack4 (doubled
+ *    int8, low nibbles = elements 0..15, high = 16..31); B = the Q8_K quants;
+ *    two 16-wide steps give the 32-element sub-block's integer dot, which
+ *    equals the tile8 kernels' dp4a sum (integer addition is exact; worst
+ *    case |sum| <= 32 * 12 * 128 = 49,152, far inside int32).
+ *  - The float part repeats the tile8 kernels' sequence per (row, pair):
+ *    chunk += scale(row, sub-block) * (float)isum over the 8 sub-blocks of a
+ *    Q8_K block; lane group g = block % 8 accumulates
+ *    acc_g += 0.5f * d(pair, block) * chunk over its blocks in increasing
+ *    order; the result is the quarter-warp tree
+ *    ((a0 + a4) + (a2 + a6)) + ((a1 + a5) + (a3 + a7)).  Groups are visited
+ *    in that tree's order so only a few partials stay live.
+ *  - Epilogue (clamp, SwiGLU, route weight) as in the tile8 kernel. */
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1150__) || defined(__gfx1151__)
+#define D20_HAVE_WMMA 1
+#endif
+typedef int d20_i4v __attribute__((ext_vector_type(4)));
+typedef int d20_i8v __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ static d20_i8v d20_wmma(d20_i4v a, d20_i4v b, d20_i8v c) {
+#ifdef D20_HAVE_WMMA
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+#else
+    __builtin_trap();
+    return c;
+#endif
+}
+
+/* One Q8_K block's chunk for one weight matrix: 8 sub-blocks x 2 WMMA
+ * steps.  wrow: this lane's weight row (A row l % 16); q: this lane's pair's
+ * 256 quants (B column l % 16), NULL for an empty column. */
+__device__ __forceinline__ static void d20_wmma_block_chunk(
+        const char *wrow_block, const int8_t *q, uint32_t lane, float chunk[8]) {
+    const cuda_block_mxfp4 *x8 = (const cuda_block_mxfp4 *)wrow_block;
+    #pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) chunk[i] = 0.0f;
+    #pragma unroll
+    for (uint32_t sb = 0; sb < 8u; sb++) {
+        const uint4 w = *(const uint4 *)(x8[sb].qs);
+        d20_i4v alo, ahi, blo, bhi;
+        alo[0] = (int)dev_mxfp4_unpack4(w.x); ahi[0] = (int)dev_mxfp4_unpack4(w.x >> 4u);
+        alo[1] = (int)dev_mxfp4_unpack4(w.y); ahi[1] = (int)dev_mxfp4_unpack4(w.y >> 4u);
+        alo[2] = (int)dev_mxfp4_unpack4(w.z); ahi[2] = (int)dev_mxfp4_unpack4(w.z >> 4u);
+        alo[3] = (int)dev_mxfp4_unpack4(w.w); ahi[3] = (int)dev_mxfp4_unpack4(w.w >> 4u);
+        if (q) {
+            const int32_t *q32 = (const int32_t *)(q + sb * 32u);
+            blo[0] = q32[0]; blo[1] = q32[1]; blo[2] = q32[2]; blo[3] = q32[3];
+            bhi[0] = q32[4]; bhi[1] = q32[5]; bhi[2] = q32[6]; bhi[3] = q32[7];
+        } else {
+            blo = (d20_i4v){0, 0, 0, 0};
+            bhi = (d20_i4v){0, 0, 0, 0};
+        }
+        d20_i8v acc = {};
+        acc = d20_wmma(alo, blo, acc);
+        acc = d20_wmma(ahi, bhi, acc);
+        /* scale of this lane's own row; element i belongs to row 2i + lane/16,
+         * whose block lane 2i + lane/16 loaded. */
+        const float own = dev_e8m0_to_f32(x8[sb].e);
+        #pragma unroll
+        for (uint32_t i = 0; i < 8u; i++) {
+            const float d = __shfl(own, (int)(2u * i + (lane >> 4u)), 32);
+            chunk[i] += d * (float)acc[i];
+        }
+    }
+}
+
+/* PAIR = true: gate and up (two matrices, SwiGLU epilogue, mid output);
+ * PAIR = false: down (raw output per pair).  Block = 4 waves = 64 rows. */
+template <bool PAIR>
+__global__ static void d20_wmma_mxfp4_kernel(
+        float *gate_out, float *up_out, float *out,
+        const char *w0_base, const char *w1_base,
+        const cuda_block_q8_K *act,          /* gate/up: x by token; down: midq by pair */
+        const uint32_t *sorted_pairs, const uint32_t *offsets, const uint32_t *counts,
+        const uint32_t *tile_total, const uint32_t *tile_experts, const uint32_t *tile_starts,
+        const float *route_weights,
+        uint64_t expert_bytes, uint64_t row_bytes, uint32_t n_blocks, uint32_t out_rows,
+        uint32_t n_expert, uint32_t write_aux, float clamp) {
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    const uint32_t r0 = blockIdx.x * 64u + wave * 16u;
+    if (r0 >= out_rows) return;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t start = tile_starts[tile];
+    const uint32_t count = counts[expert];
+    uint32_t np = count - start;
+    if (np > 16u) np = 16u;
+    const uint32_t col = lane & 15u;
+    const bool have = col < np;
+    const uint32_t pair = have ? sorted_pairs[offsets[expert] + start + col] : 0u;
+    const uint32_t arow = r0 + col < out_rows ? r0 + col : r0;
+    const cuda_block_q8_K *arow_act = act + (uint64_t)(PAIR ? pair / n_expert : pair) * n_blocks;
+    const char *w0 = w0_base + (uint64_t)expert * expert_bytes + (uint64_t)arow * row_bytes;
+    const char *w1 = PAIR ? w1_base + (uint64_t)expert * expert_bytes + (uint64_t)arow * row_bytes : w0;
+    const uint64_t block_bytes = row_bytes / n_blocks;
+    float g04[8], g26[8], g15[8], g37[8], u04[8], u26[8], u15[8], u37[8];
+    const uint32_t order[8] = {0u, 4u, 2u, 6u, 1u, 5u, 3u, 7u};
+    #pragma unroll
+    for (uint32_t oi = 0; oi < 8u; oi++) {
+        const uint32_t g = order[oi];
+        float ga[8], ua[8];
+        #pragma unroll
+        for (uint32_t i = 0; i < 8u; i++) { ga[i] = 0.0f; ua[i] = 0.0f; }
+        for (uint32_t b = g; b < n_blocks; b += 8u) {
+            const int8_t *q = have ? arow_act[b].qs : NULL;
+            const float ds = have ? arow_act[b].d : 0.0f;
+            float chunk[8];
+            d20_wmma_block_chunk(w0 + (uint64_t)b * block_bytes, q, lane, chunk);
+            #pragma unroll
+            for (uint32_t i = 0; i < 8u; i++) ga[i] += 0.5f * ds * chunk[i];
+            if (PAIR) {
+                d20_wmma_block_chunk(w1 + (uint64_t)b * block_bytes, q, lane, chunk);
+                #pragma unroll
+                for (uint32_t i = 0; i < 8u; i++) ua[i] += 0.5f * ds * chunk[i];
+            }
+        }
+        /* partial sums in the quarter-warp tree's order */
+        #pragma unroll
+        for (uint32_t i = 0; i < 8u; i++) {
+            if (oi == 0u) { g04[i] = ga[i]; u04[i] = ua[i]; }
+            else if (oi == 1u) { g04[i] = g04[i] + ga[i]; u04[i] = u04[i] + ua[i]; }
+            else if (oi == 2u) { g26[i] = ga[i]; u26[i] = ua[i]; }
+            else if (oi == 3u) { g26[i] = g26[i] + ga[i]; u26[i] = u26[i] + ua[i]; }
+            else if (oi == 4u) { g15[i] = ga[i]; u15[i] = ua[i]; }
+            else if (oi == 5u) { g15[i] = g15[i] + ga[i]; u15[i] = u15[i] + ua[i]; }
+            else if (oi == 6u) { g37[i] = ga[i]; u37[i] = ua[i]; }
+            else { g37[i] = g37[i] + ga[i]; u37[i] = u37[i] + ua[i]; }
+        }
+    }
+    if (!have) return;
+    #pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) {
+        const uint32_t row = r0 + 2u * i + (lane >> 4u);
+        if (row >= out_rows) continue;
+        float gv = (g04[i] + g26[i]) + (g15[i] + g37[i]);
+        const uint64_t off = (uint64_t)pair * out_rows + row;
+        if (!PAIR) {
+            out[off] = gv;
+            continue;
+        }
+        float uv = (u04[i] + u26[i]) + (u15[i] + u37[i]);
+        if (clamp > 1.0e-6f) {
+            if (gv > clamp) gv = clamp;
+            if (uv > clamp) uv = clamp;
+            if (uv < -clamp) uv = -clamp;
+        }
+        if (write_aux) {
+            gate_out[off] = gv;
+            up_out[off] = uv;
+        }
+        out[off] = (gv / (1.0f + expf(-gv))) * uv * route_weights[pair];
+    }
+}
+
+/* Tile list for the WMMA kernels: 16-pair tiles of experts with at least
+ * min_rows pairs.  One thread (384 experts, tiny). */
+__global__ static void d20_wmma_tiles_kernel(
+        const uint32_t *counts, uint32_t *tile_total, uint32_t *tile_experts,
+        uint32_t *tile_starts, uint32_t n_buckets, uint32_t min_rows, uint32_t capacity) {
+    if (threadIdx.x != 0u || blockIdx.x != 0u) return;
+    uint32_t t = 0;
+    for (uint32_t e = 0; e < n_buckets; e++) {
+        const uint32_t c = counts[e];
+        if (c < min_rows) continue;
+        for (uint32_t s = 0; s < c && t < capacity; s += 16u) {
+            tile_experts[t] = e;
+            tile_starts[t] = s;
+            t++;
+        }
+    }
+    *tile_total = t;
 }

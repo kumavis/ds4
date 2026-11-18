@@ -513,6 +513,8 @@ int ds4_gpu_d5_prefetch(const ds4_gpu_stream_expert_table *table,
  * default 0).  Active only with DS4_ROCM_D5_PREFETCH. */
 uint32_t ds4_gpu_d5_verify_k(void);
 /* D20 model-free test hook (see rocm/ds4_rocm_moe_launch.cuh). */
+int ds4_gpu_test_d20_wmma(uint32_t kind, uint32_t count, uint32_t seed, uint32_t reps,
+                          uint64_t *n_diff, uint64_t *n_total, float *ms_tile8, float *ms_wmma);
 int ds4_gpu_test_d20_down_stage9(uint32_t count, uint32_t seed, uint32_t row_groups,
                                  uint64_t *n_diff, uint64_t *n_total);
 /* int3: device bytes the D5 shelf allocates once prefetch engages (0 when

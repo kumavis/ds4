@@ -1,0 +1,89 @@
+## Selections and distinct experts (per stage: s0 / s1 / s2)
+| run | proposals | selections per stage | distinct experts | distinct per proposal (of 15 selections) |
+|---|---:|---:|---|---|
+| code | 108 | 1620 | 89 / 57 / 35 | 8.19 / 8.45 / 7.30 |
+| prose | 72 | 1080 | 65 / 34 / 22 | 9.89 / 7.36 / 5.03 |
+| json | 142 | 2130 | 83 / 50 / 31 | 9.48 / 6.99 / 6.17 |
+| translate | 160 | 2400 | 74 / 49 / 28 | 9.04 / 7.17 / 5.59 |
+| list | 88 | 1320 | 69 / 32 / 21 | 9.52 / 7.03 / 4.93 |
+| q2-code | 106 | 1590 | 84 / 53 / 34 | 8.75 / 8.26 / 7.34 |
+| all five MXFP4 prompts | 570 | 8550 | 110 / 82 / 47 | |
+
+## Coverage: share of selections covered by the K most used experts of that stage (own prompt)
+| run | stage | K=8 | K=16 | K=32 | K=64 | K=96 |
+|---|---|---:|---:|---:|---:|---:|
+| code | s0 | 0.358 | 0.588 | 0.840 | 0.976 | 1.000 |
+| code | s1 | 0.448 | 0.693 | 0.914 | 1.000 | 1.000 |
+| code | s2 | 0.706 | 0.928 | 0.998 | 1.000 | 1.000 |
+| prose | s0 | 0.462 | 0.701 | 0.895 | 0.999 | 1.000 |
+| prose | s1 | 0.788 | 0.939 | 0.998 | 1.000 | 1.000 |
+| prose | s2 | 0.922 | 0.992 | 1.000 | 1.000 | 1.000 |
+| json | s0 | 0.419 | 0.625 | 0.851 | 0.987 | 1.000 |
+| json | s1 | 0.667 | 0.867 | 0.981 | 1.000 | 1.000 |
+| json | s2 | 0.821 | 0.968 | 1.000 | 1.000 | 1.000 |
+| translate | s0 | 0.501 | 0.722 | 0.903 | 0.996 | 1.000 |
+| translate | s1 | 0.776 | 0.913 | 0.987 | 1.000 | 1.000 |
+| translate | s2 | 0.910 | 0.987 | 1.000 | 1.000 | 1.000 |
+| list | s0 | 0.634 | 0.796 | 0.924 | 0.996 | 1.000 |
+| list | s1 | 0.837 | 0.973 | 1.000 | 1.000 | 1.000 |
+| list | s2 | 0.922 | 0.992 | 1.000 | 1.000 | 1.000 |
+| q2-code | s0 | 0.332 | 0.563 | 0.811 | 0.977 | 1.000 |
+| q2-code | s1 | 0.405 | 0.652 | 0.908 | 1.000 | 1.000 |
+| q2-code | s2 | 0.692 | 0.923 | 0.999 | 1.000 | 1.000 |
+| all | s0 | 0.380 | 0.551 | 0.757 | 0.939 | 0.997 |
+| all | s1 | 0.557 | 0.752 | 0.909 | 0.995 | 1.000 |
+| all | s2 | 0.630 | 0.870 | 0.992 | 1.000 | 1.000 |
+
+## Leave-one-out: hot set = top-K of the other four prompts, coverage on the held-out prompt (mean of stages)
+| held out | K=8 | K=16 | K=32 | K=64 | K=96 | own top-K (upper bound) at K=32 |
+|---|---:|---:|---:|---:|---:|---:|
+| code | 0.180 | 0.336 | 0.595 | 0.759 | 0.838 | 0.917 |
+| prose | 0.590 | 0.750 | 0.903 | 0.970 | 0.994 | 0.965 |
+| json | 0.407 | 0.577 | 0.796 | 0.892 | 0.973 | 0.944 |
+| translate | 0.450 | 0.585 | 0.707 | 0.810 | 0.846 | 0.963 |
+| list | 0.615 | 0.779 | 0.871 | 0.984 | 0.999 | 0.975 |
+| q2-code (hot set from the 5 MXFP4 prompts) | 0.190 | 0.507 | 0.728 | 0.949 | 0.996 | |
+
+## LRU of S slots per stage, no hot set: hit rate per expert lookup (one lookup per distinct expert per proposal)
+| run | S=8 | S=16 | S=32 | S=64 | lookups per proposal (3 stages) |
+|---|---:|---:|---:|---:|---:|
+| code | 0.367 | 0.671 | 0.840 | 0.918 | 23.9 |
+| prose | 0.454 | 0.753 | 0.880 | 0.925 | 22.3 |
+| json | 0.429 | 0.744 | 0.890 | 0.944 | 22.6 |
+| translate | 0.492 | 0.766 | 0.905 | 0.956 | 21.8 |
+| list | 0.501 | 0.821 | 0.903 | 0.934 | 21.5 |
+| q2-code | 0.347 | 0.668 | 0.836 | 0.922 | 24.3 |
+
+## Clustering within one proposal (rows = the 5 drafted positions)
+| run | stage | distinct experts per proposal (max 15) | share of a row's experts also used by the previous row | Jaccard with the previous proposal |
+|---|---|---:|---:|---:|
+| code | s0 | 8.19 | 0.557 | 0.251 |
+| code | s1 | 8.45 | 0.473 | 0.375 |
+| code | s2 | 7.30 | 0.558 | 0.495 |
+| prose | s0 | 9.89 | 0.404 | 0.343 |
+| prose | s1 | 7.36 | 0.505 | 0.568 |
+| prose | s2 | 5.03 | 0.775 | 0.617 |
+| json | s0 | 9.48 | 0.443 | 0.330 |
+| json | s1 | 6.99 | 0.573 | 0.489 |
+| json | s2 | 6.17 | 0.630 | 0.549 |
+| translate | s0 | 9.04 | 0.488 | 0.322 |
+| translate | s1 | 7.17 | 0.545 | 0.498 |
+| translate | s2 | 5.59 | 0.717 | 0.631 |
+| list | s0 | 9.52 | 0.441 | 0.441 |
+| list | s1 | 7.03 | 0.561 | 0.542 |
+| list | s2 | 4.93 | 0.801 | 0.620 |
+| q2-code | s0 | 8.75 | 0.509 | 0.257 |
+| q2-code | s1 | 8.26 | 0.477 | 0.344 |
+| q2-code | s2 | 7.34 | 0.537 | 0.478 |
+
+## Options against today's all-resident drafter (ESTIMATES)
+baseline = measured tok/s of the trace run (drafter resident, 6.72 GiB of drafter experts).
+tok/s' = N / (N / (tps + 0.12 x freed GiB) + drafter miss ms / 1000); drafter miss = 2.9 ms each.
+| run | baseline | (1) via main cache, window 140 tok | (1) window 35 tok | (1b) K=32 + LRU 16 | (1b) K=48 + LRU 16 | (1b) K=64 + LRU 16 | (1c) K=32 drop rest: selections altered | (1c) K=64: altered |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| code | 11.97 | 12.30 (+2.8 %; 259 misses, 4.66 GiB) | 12.15 (+1.5 %; 546 misses, 5.42 GiB) | 12.23 (+2.2 %; 283 misses, 4.20 GiB) | 12.21 (+2.0 %; 188 misses, 3.36 GiB) | 12.18 (+1.8 %; 107 misses, 2.52 GiB) | 40.5 % | 24.1 % |
+| prose | 9.74 | 10.29 (+5.7 %; 163 misses, 5.43 GiB) | 10.20 (+4.7 %; 392 misses, 5.79 GiB) | 10.19 (+4.6 %; 88 misses, 4.20 GiB) | 10.11 (+3.8 %; 54 misses, 3.36 GiB) | 10.03 (+3.0 %; 23 misses, 2.52 GiB) | 9.7 % | 3.0 % |
+| json | 11.96 | 12.35 (+3.2 %; 228 misses, 4.91 GiB) | 12.22 (+2.2 %; 455 misses, 5.49 GiB) | 12.31 (+2.9 %; 176 misses, 4.20 GiB) | 12.27 (+2.6 %; 104 misses, 3.36 GiB) | 12.22 (+2.2 %; 48 misses, 2.52 GiB) | 20.4 % | 10.8 % |
+| translate | 12.53 | 12.95 (+3.3 %; 189 misses, 5.00 GiB) | 12.81 (+2.2 %; 405 misses, 5.56 GiB) | 12.89 (+2.9 %; 150 misses, 4.20 GiB) | 12.85 (+2.5 %; 91 misses, 3.36 GiB) | 12.79 (+2.0 %; 51 misses, 2.52 GiB) | 29.3 % | 19.0 % |
+| list | 10.59 | 11.12 (+5.0 %; 169 misses, 5.38 GiB) | 11.03 (+4.2 %; 359 misses, 5.82 GiB) | 11.04 (+4.2 %; 85 misses, 4.20 GiB) | 10.96 (+3.5 %; 50 misses, 3.36 GiB) | 10.88 (+2.7 %; 22 misses, 2.52 GiB) | 12.9 % | 1.6 % |
+| q2-code | 14.56 | 14.78 (+1.5 %; 263 misses, 4.65 GiB) | 14.54 (-0.1 %; 531 misses, 5.41 GiB) | 14.77 (+1.5 %; 232 misses, 4.20 GiB) | 14.82 (+1.8 %; 113 misses, 3.36 GiB) | 14.79 (+1.6 %; 55 misses, 2.52 GiB) | 27.2 % | 5.1 % |

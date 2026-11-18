@@ -11618,8 +11618,11 @@ static void kv_cache_store_turn_end(server *s, server_slot *slot) {
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
     const int min_turn = kv_cache_turn_min_tokens();
+    /* Default: every turn end that adds at least --kv-cache-min-tokens
+     * (measured: d17-a2-on512, restore 80.7 s against 127.7 s stock at 31k). */
     const int target = kv_cache_turn_target_step(s, slot, tokens->len,
-                                                 min_turn > 0 ? min_turn : kv_cache_turn_step(s));
+                                                 min_turn > 0 ? min_turn :
+                                                 (s->kv.opt.min_tokens > 0 ? s->kv.opt.min_tokens : 1));
     if (target == 0) return;
     const double t0 = now_sec();
     pthread_mutex_lock(&s->inference_mu);

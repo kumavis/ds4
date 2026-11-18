@@ -315,7 +315,7 @@ static int routed_moe_q2_float_down_launch(
     if (compact_active) {
         moe_build_active_experts_kernel<<<1u, 1u>>>(
                 active_count, active_experts, counts, n_total_expert);
-        if (!cuda_ok(cudaGetLastError(),
+        if (!d20_ok(cudaGetLastError(),
                      "routed_moe iq2/q2 active expert list launch")) {
             return 0;
         }
@@ -374,7 +374,7 @@ static int routed_moe_q2_float_down_launch(
                 down_expert_bytes, down_row_bytes, n_expert, n_tokens,
                 active_count, active_experts);
     }
-    if (!cuda_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down scalar launch")) return 0;
+    if (!d20_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down scalar launch")) return 0;
     if (halo_compact && prepared_count && !ds4_rocm_halo_q2_prepared(down_h,down_w,
             mid_h_hot,offsets,sorted_pairs,h_counts,n_tokens)) return 0;
     if (hot_count != 0u &&
@@ -400,7 +400,7 @@ static int routed_moe_q2_float_down_launch(
             if (lds_trace && !strcmp(lds_trace, "1"))
                 fprintf(stderr,"V41_Q2_LDS rows=%u tiles=%u bytes=%u\n",n_tokens,tile_count,lds_bytes);
 #undef V41_Q2_ARGS
-            if(!cuda_ok(cudaGetLastError(), "V4.1 Q2 prefill launch"))return 0;
+            if(!d20_ok(cudaGetLastError(), "V4.1 Q2 prefill launch"))return 0;
             static bool logged=false;
             if(!logged){logged=true;fprintf(stderr,"ds4: ROCm V4.1 Q2 reused panels rows=%u tiles=%u\n",n_tokens,tile_count);}
         } else if (halo_compact && tile_count) {
@@ -414,7 +414,7 @@ static int routed_moe_q2_float_down_launch(
                     nullptr,down_h,down_w,nullptr,mid_h_hot,counts,offsets,sorted_pairs,
                     hot_experts_dev,tile_count,2048u,4096u,2752512u,672u,6u,0u);
             }
-            if(!cuda_ok(cudaGetLastError(), "Halo Q2 direct-X compact launch"))return 0;
+            if(!d20_ok(cudaGetLastError(), "Halo Q2 direct-X compact launch"))return 0;
         } else
         {
 
@@ -539,7 +539,7 @@ static int routed_moe_q2_float_down_launch(
                     expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
         }
         }
-        if (!cuda_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down wmma launch")) return 0;
+        if (!d20_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down wmma launch")) return 0;
     }
 #endif
 
@@ -555,7 +555,7 @@ static int routed_moe_q2_float_down_launch(
         moe_sum_kernel<<<(n + 255u) / 256u, 256>>>(
                 (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
     }
-    return cuda_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down sum launch");
+    return d20_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down sum launch");
 }
 
 typedef struct {
@@ -728,7 +728,7 @@ static int routed_moe_mxfp4_ptrs_rows_launch(
             n_expert,
             0u,
             clamp);
-    if (!cuda_ok(cudaGetLastError(), "routed_moe streaming rows mxfp4 gate/up launch")) return 0;
+    if (!d20_ok(cudaGetLastError(), "routed_moe streaming rows mxfp4 gate/up launch")) return 0;
     return routed_moe_mxfp4_ptrs_rows_tail_launch(out, mid, down_ptrs, midq, selected,
                                                   down_row_bytes, expert_mid_dim, out_dim,
                                                   n_expert, n_tokens, down_per_row);
@@ -771,7 +771,7 @@ static int routed_moe_mxfp4_gate_up_pairs_launch(
             write_gate_up,
             clamp,
             list);
-    return cuda_ok(cudaGetLastError(), "routed_moe mxfp4 pair-list gate/up launch");
+    return d20_ok(cudaGetLastError(), "routed_moe mxfp4 pair-list gate/up launch");
 }
 
 /* D2 (single-token decode overlap): the routed MXFP4 experts of one token
@@ -960,7 +960,7 @@ static int routed_moe_mxfp4_ptrs_rows_tail_launch(
     const uint32_t pair_count = n_tokens * n_expert;
     dim3 midq_grid(midq_blocks, pair_count, 1);
     q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, mid, expert_mid_dim, pair_count);
-    if (!cuda_ok(cudaGetLastError(), "routed_moe streaming rows mxfp4 mid quantize launch")) return 0;
+    if (!d20_ok(cudaGetLastError(), "routed_moe streaming rows mxfp4 mid quantize launch")) return 0;
     if (down_per_row) {
         dim3 row_grid((out_dim + 7u) / 8u, 1, 1);
         for (uint32_t t = 0; t < n_tokens; t++) {
@@ -988,7 +988,7 @@ static int routed_moe_mxfp4_ptrs_rows_tail_launch(
                 out_dim,
                 n_expert);
     }
-    return cuda_ok(cudaGetLastError(), "routed_moe streaming rows mxfp4 down launch");
+    return d20_ok(cudaGetLastError(), "routed_moe streaming rows mxfp4 down launch");
 }
 
 static int routed_moe_full_table_is_cached(
@@ -1002,6 +1002,121 @@ static int routed_moe_full_table_is_cached(
            cuda_model_range_is_cached(model_map, up_offset, gate_bytes) &&
            cuda_model_range_is_cached(model_map, down_offset, down_bytes);
 }
+
+/* ---- D20: routed-MoE launch profiler (DS4_ROCM_D20_PROF=1, off by default) ----
+ * Measurement only.  Inside every routed_moe_launch call with at least 2 rows,
+ * a timing hipEvent is recorded after each kernel launch / memset of this file
+ * (at its existing error check) and the host clock is read at the same point.
+ * At the call's end the events are synchronized; each launch is charged the
+ * GPU time from the previous mark to its own (so idle GPU time before it, e.g.
+ * a host wait, is charged to it too) and the host time since the previous
+ * mark.  Totals per row bucket and launch label print at exit.  Off: every
+ * check is cuda_ok plus one branch. */
+#include <chrono>
+enum { D20_MAX_MARKS = 160, D20_MAX_LABELS = 96, D20_BUCKETS = 6 };
+static int g_d20_prof = -1;
+static int g_d20_active;
+static cudaEvent_t g_d20_ev[D20_MAX_MARKS];
+static const char *g_d20_lab[D20_MAX_MARKS];
+static double g_d20_host[D20_MAX_MARKS];
+static int g_d20_n;
+static const char *g_d20_names[D20_MAX_LABELS];
+static double g_d20_gpu_ms[D20_BUCKETS][D20_MAX_LABELS], g_d20_host_ms[D20_BUCKETS][D20_MAX_LABELS];
+static uint64_t g_d20_cnt[D20_BUCKETS][D20_MAX_LABELS];
+static double g_d20_call_gpu[D20_BUCKETS], g_d20_call_host[D20_BUCKETS], g_d20_call_sync[D20_BUCKETS];
+static uint64_t g_d20_calls[D20_BUCKETS], g_d20_rows[D20_BUCKETS], g_d20_overflow;
+static const char *g_d20_bucket_name[D20_BUCKETS] = {"2-6", "7-255", "256-511", "512-1023", "1024-2047", "2048+"};
+
+static double d20_now_ms(void) {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static int d20_bucket(uint32_t n) {
+    return n <= 6u ? 0 : n < 256u ? 1 : n < 512u ? 2 : n < 1024u ? 3 : n < 2048u ? 4 : 5;
+}
+static void d20_report(void) {
+    for (int b = 0; b < D20_BUCKETS; b++) {
+        if (!g_d20_calls[b]) continue;
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D20 moe prof rows %s: calls=%llu mean_rows=%.0f gpu=%.1f ms/call host_to_end=%.1f ms/call sync_wait=%.1f ms/call\n",
+                g_d20_bucket_name[b], (unsigned long long)g_d20_calls[b],
+                (double)g_d20_rows[b] / (double)g_d20_calls[b], g_d20_call_gpu[b] / g_d20_calls[b],
+                g_d20_call_host[b] / g_d20_calls[b], g_d20_call_sync[b] / g_d20_calls[b]);
+        for (int l = 0; l < D20_MAX_LABELS && g_d20_names[l]; l++) {
+            if (!g_d20_cnt[b][l]) continue;
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "D20 moe prof rows %s:   %-48s n=%llu gpu=%.2f ms/call host=%.2f ms/call\n",
+                    g_d20_bucket_name[b], g_d20_names[l], (unsigned long long)g_d20_cnt[b][l],
+                    g_d20_gpu_ms[b][l] / g_d20_calls[b], g_d20_host_ms[b][l] / g_d20_calls[b]);
+        }
+    }
+    if (g_d20_overflow) fprintf(stderr, DS4_GPU_LOG_PREFIX "D20 moe prof: %llu calls exceeded %d marks\n",
+                                (unsigned long long)g_d20_overflow, D20_MAX_MARKS);
+}
+static int d20_on(void) {
+    if (g_d20_prof < 0) {
+        const char *e = getenv("DS4_ROCM_D20_PROF");
+        g_d20_prof = e && e[0] && strcmp(e, "0") ? 1 : 0;
+        if (g_d20_prof) {
+            for (int i = 0; i < D20_MAX_MARKS; i++)
+                if (cudaEventCreate(&g_d20_ev[i]) != cudaSuccess) { g_d20_prof = 0; break; }
+            if (g_d20_prof) atexit(d20_report);
+        }
+    }
+    return g_d20_prof;
+}
+static void d20_mark(const char *label) {
+    if (!g_d20_active) return;
+    if (g_d20_n >= D20_MAX_MARKS) { g_d20_active = 2; return; }
+    (void)cudaEventRecord(g_d20_ev[g_d20_n], 0);
+    g_d20_lab[g_d20_n] = label;
+    g_d20_host[g_d20_n] = d20_now_ms();
+    g_d20_n++;
+}
+static int d20_ok(cudaError_t err, const char *what) {
+    const int ok = cuda_ok(err, what);
+    if (g_d20_active == 1) d20_mark(what);
+    return ok;
+}
+struct D20ProfScope {
+    uint32_t rows;
+    bool on;
+    explicit D20ProfScope(uint32_t n) : rows(n), on(false) {
+        if (n < 2u || g_d20_active || !d20_on()) return;
+        on = true;
+        g_d20_active = 1;
+        g_d20_n = 0;
+        d20_mark("(call start)");
+    }
+    ~D20ProfScope() {
+        if (!on) return;
+        const bool overflow = g_d20_active == 2;
+        g_d20_active = 1;
+        if (!overflow) d20_mark("(call end)");
+        g_d20_active = 0;
+        if (overflow) { g_d20_overflow++; return; }
+        const double t_end = d20_now_ms();
+        (void)cudaEventSynchronize(g_d20_ev[g_d20_n - 1]);
+        const int b = d20_bucket(rows);
+        g_d20_calls[b]++;
+        g_d20_rows[b] += rows;
+        g_d20_call_host[b] += t_end - g_d20_host[0];
+        g_d20_call_sync[b] += d20_now_ms() - t_end;
+        float total = 0.0f;
+        (void)cudaEventElapsedTime(&total, g_d20_ev[0], g_d20_ev[g_d20_n - 1]);
+        g_d20_call_gpu[b] += total;
+        for (int i = 1; i < g_d20_n; i++) {
+            float ms = 0.0f;
+            (void)cudaEventElapsedTime(&ms, g_d20_ev[i - 1], g_d20_ev[i]);
+            int l = 0;
+            for (; l < D20_MAX_LABELS && g_d20_names[l]; l++)
+                if (!strcmp(g_d20_names[l], g_d20_lab[i])) break;
+            if (l == D20_MAX_LABELS) continue;
+            if (!g_d20_names[l]) g_d20_names[l] = g_d20_lab[i];
+            g_d20_gpu_ms[b][l] += ms;
+            g_d20_host_ms[b][l] += g_d20_host[i] - g_d20_host[i - 1];
+            g_d20_cnt[b][l]++;
+        }
+    }
+};
 
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
@@ -1032,6 +1147,7 @@ static int routed_moe_launch(
         uint32_t layer_index,
         uint32_t n_tokens,
         bool force_resident) {
+    D20ProfScope d20_scope(n_tokens);
     routed_moe_launch_plan plan;
     if (!routed_moe_build_plan(out, gate, up, mid, down, model_map, model_size,
                                gate_offset, up_offset, down_offset, gate_type, down_type,
@@ -1457,7 +1573,7 @@ static int routed_moe_launch(
         dim3 xq_grid(xq_blocks, n_tokens, 1);
         if (!use_rocm_mmq_gateup) {
             q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
-            ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
+            ok = d20_ok(cudaGetLastError(), "routed_moe x quantize launch");
         }
         if (n_tokens == 1u) C1R(C1_MOE_PREP);
         if (zero_copy_overlap) {
@@ -1575,7 +1691,7 @@ static int routed_moe_launch(
                             n_expert,
                             0xffffffffu,
                             clamp);
-                    ok = cuda_ok(cudaGetLastError(),
+                    ok = d20_ok(cudaGetLastError(),
                                  "routed_moe streaming batch resident gate/up launch");
                 }
                 if (!ok) {
@@ -1601,7 +1717,7 @@ static int routed_moe_launch(
                             n_expert,
                             0xffffffffu,
                             clamp);
-                    ok = cuda_ok(cudaGetLastError(),
+                    ok = d20_ok(cudaGetLastError(),
                                  "routed_moe streaming batch missing gate/up launch");
                 }
             } else {
@@ -1620,7 +1736,7 @@ static int routed_moe_launch(
                         n_expert,
                         0xffffffffu,
                         clamp);
-                ok = cuda_ok(cudaGetLastError(),
+                ok = d20_ok(cudaGetLastError(),
                              "routed_moe streaming batch gate/up launch");
             }
             if (ok && !iq2_path) {
@@ -1630,7 +1746,7 @@ static int routed_moe_launch(
                         (const float *)mid->ptr,
                         expert_mid_dim,
                         pair_count);
-                ok = cuda_ok(cudaGetLastError(), "routed_moe streaming batch mid quantize launch");
+                ok = d20_ok(cudaGetLastError(), "routed_moe streaming batch mid quantize launch");
             }
             if (ok) {
                 dim3 dgrid((out_dim + 31u) / 32u, n_tokens, 1);
@@ -1645,7 +1761,7 @@ static int routed_moe_launch(
                             out_dim,
                             n_expert,
                             n_tokens);
-                    ok = cuda_ok(cudaGetLastError(),
+                    ok = d20_ok(cudaGetLastError(),
                                  "routed_moe streaming batch iq2 down launch");
                 } else if (iq2_path) {
                     const ds4_rocm_runtime_config *runtime_cfg =
@@ -1668,7 +1784,7 @@ static int routed_moe_launch(
                         out_dim,
                         down_row_bytes,
                         n_expert);
-                    ok = cuda_ok(cudaGetLastError(),
+                    ok = d20_ok(cudaGetLastError(),
                                  "routed_moe streaming batch fp32 q2 down launch");
                 } else {
                     moe_down_sum6_qwarp32_ptrs_batch_kernel<<<dgrid, 256>>>(
@@ -1681,7 +1797,7 @@ static int routed_moe_launch(
                             out_dim,
                             n_expert,
                             n_tokens);
-                    ok = cuda_ok(cudaGetLastError(),
+                    ok = d20_ok(cudaGetLastError(),
                                  "routed_moe streaming batch down launch");
                 }
             }
@@ -1794,7 +1910,7 @@ static int routed_moe_launch(
                         tile_experts, tile_starts,
                         (const int32_t *)selected_exec->ptr,
                         pair_count, expert_tile_m, bucket_count);
-                    ok = cuda_ok(cudaGetLastError(),
+                    ok = d20_ok(cudaGetLastError(),
                                  "routed_moe narrow sorted tiles launch");
                 } else {
                     ok = cuda_ok(cudaMemset(counts, 0, counts_bytes),
@@ -1806,11 +1922,11 @@ static int routed_moe_launch(
                         (const int32_t *)selected_exec->ptr,
                         pair_count,
                         bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe sorted count launch");
                 }
                 if (ok && !use_narrow_sorted_builder) {
                     moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
                 }
                 if (ok && !use_narrow_sorted_builder) {
                     moe_scatter_sorted_pairs_deterministic_kernel<<<bucket_count, 1u>>>(
@@ -1819,52 +1935,52 @@ static int routed_moe_launch(
                         (const int32_t *)selected_exec->ptr,
                         pair_count,
                         bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
                 }
                 if (ok && use_expert_tiles && !use_narrow_sorted_builder) {
                     moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, tile_total, counts, expert_tile_m, bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
                 }
                 if (ok && use_mxfp4_ldsB) {
                     moe_build_expert_tile_offsets_kernel<<<1, 1, 0, 0 /* default stream */>>>(tile128_offsets, tile128_total, counts, 128u, bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile128 offsets launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe expert tile128 offsets launch");
                 }
                 if (ok && use_mxfp4_ldsB) {
                     moe_build_expert_tiles_kernel<<<(bucket_count + 255u) / 256u, 256, 0, 0 /* default stream */>>>(
                         tile128_experts, tile128_starts, tile128_offsets, counts, 128u, bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile128 build launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe expert tile128 build launch");
                 }
                 if (ok && use_mxfp4_tile32) {
                     moe_build_expert_tile_offsets_kernel<<<1, 1, 0, 0 /* default stream */>>>(tile32_offsets, tile32_total, counts, 32u, bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile32 offsets launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe expert tile32 offsets launch");
                 }
                 if (ok && use_mxfp4_tile32) {
                     moe_build_expert_tiles_kernel<<<(bucket_count + 255u) / 256u, 256, 0, 0 /* default stream */>>>(
                         tile32_experts, tile32_starts, tile32_offsets, counts, 32u, bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile32 build launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe expert tile32 build launch");
                 }
                 if (ok && use_mxfp4_tile4) {
                     moe_build_expert_tile_offsets_kernel<<<1, 1, 0, 0 /* default stream */>>>(tile4_offsets, tile4_total, counts, 4u, bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile4 offsets launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe expert tile4 offsets launch");
                 }
                 if (ok && use_mxfp4_tile4) {
                     moe_build_expert_tiles_kernel<<<(bucket_count + 255u) / 256u, 256, 0, 0 /* default stream */>>>(
                         tile4_experts, tile4_starts, tile4_offsets, counts, 4u, bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile4 build launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe expert tile4 build launch");
                 }
                 if (ok && use_expert_tiles && !use_narrow_sorted_builder) {
                     moe_build_expert_tiles_kernel<<<(bucket_count + 255u) / 256u, 256>>>(
                             tile_experts, tile_starts, tile_offsets, counts, expert_tile_m, bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe expert tiles launch");
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
                     moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, 16u, bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
                     moe_build_expert_tiles_kernel<<<(bucket_count + 255u) / 256u, 256>>>(
                             tile16_experts, tile16_starts, tile16_offsets, counts, 16u, bucket_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 launch");
+                    ok = d20_ok(cudaGetLastError(), "routed_moe expert tile16 launch");
                 }
             }
         }
@@ -1928,7 +2044,7 @@ static int routed_moe_launch(
         if (ok && use_iq2_x_f16) {
             const uint64_t xh_count = (uint64_t)n_tokens * expert_in_dim;
             f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(iq2_x_h, (const float *)x->ptr, xh_count);
-            ok = cuda_ok(cudaGetLastError(), "routed_moe iq2 gate x f16 launch");
+            ok = d20_ok(cudaGetLastError(), "routed_moe iq2 gate x f16 launch");
         }
         int mmq_gateup_done = 0;
         if (ok && g_halo_prefill_model && halo_prefill_scope(n_tokens) && use_rocm_mmq_gateup && !g_glm_model &&
@@ -2130,7 +2246,7 @@ static int routed_moe_launch(
                         stream_resident_mask,
                         clamp);
                 }
-                ok = cuda_ok(cudaGetLastError(), "routed_moe split resident gate/up launch");
+                ok = d20_ok(cudaGetLastError(), "routed_moe split resident gate/up launch");
                 if (!ok) {
                     (void)cuda_stream_selected_finish_pending_missing(0);
                 } else {
@@ -2177,7 +2293,7 @@ static int routed_moe_launch(
                         stream_missing_mask,
                         clamp);
                 }
-                if (ok) ok = cuda_ok(cudaGetLastError(), "routed_moe split missing gate/up launch");
+                if (ok) ok = d20_ok(cudaGetLastError(), "routed_moe split missing gate/up launch");
                 split_gateup_done = ok;
             } else {
                 ok = cuda_stream_selected_finish_pending_missing(
@@ -2598,7 +2714,7 @@ static int routed_moe_launch(
                         clamp);
                 }
             }
-            ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
+            ok = d20_ok(cudaGetLastError(), "routed_moe gate/up launch");
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
             if (ok && use_iq2_gate_wmma && iq2_gate_hot_count != 0u) {
                 constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
@@ -2670,7 +2786,7 @@ static int routed_moe_launch(
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     }
                 }
-                ok = cuda_ok(cudaGetLastError(), "routed_moe iq2 wmma hot gate/up launch");
+                ok = d20_ok(cudaGetLastError(), "routed_moe iq2 wmma hot gate/up launch");
             }
 #endif
         }
@@ -2690,7 +2806,7 @@ static int routed_moe_launch(
             !use_iq2_q2_decode_float_down) {
             dim3 midq_grid(midq_blocks, pair_count, 1);
             q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, pair_count);
-            ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
+            ok = d20_ok(cudaGetLastError(), "routed_moe mid quantize launch");
         }
         int direct_iq2_down_done = 0;
         if (ok && use_v41_q8_down) {
@@ -2707,7 +2823,7 @@ static int routed_moe_launch(
                     (const int32_t *)selected_exec->ptr, down_expert_bytes,
                     down_row_bytes, midq_blocks, out_dim, n_expert);
             }
-            ok = cuda_ok(cudaGetLastError(), "V4.1 quantized wave down launch");
+            ok = d20_ok(cudaGetLastError(), "V4.1 quantized wave down launch");
             direct_iq2_down_done = ok;
         } else if (ok && use_iq2_q2_decode_float_down) {
             const ds4_rocm_runtime_config *runtime_cfg = cuda_runtime_config();
@@ -2753,7 +2869,7 @@ static int routed_moe_launch(
                     down_row_bytes,
                     n_expert);
             }
-            ok = cuda_ok(cudaGetLastError(),
+            ok = d20_ok(cudaGetLastError(),
                          "routed_moe decode fp32 q2 down launch");
             direct_iq2_down_done = ok;
         } else if (ok && iq2_iq2_path) {
@@ -2782,7 +2898,7 @@ static int routed_moe_launch(
                         n_expert,
                         n_tokens);
             }
-            ok = cuda_ok(cudaGetLastError(), "routed_moe iq2 down launch");
+            ok = d20_ok(cudaGetLastError(), "routed_moe iq2 down launch");
             direct_iq2_down_done = ok;
         }
         int split_ptr_down_done = 0;
@@ -2795,7 +2911,7 @@ static int routed_moe_launch(
                     midq_blocks,
                     out_dim,
                     n_expert);
-            ok = cuda_ok(cudaGetLastError(), "routed_moe split ptr down launch");
+            ok = d20_ok(cudaGetLastError(), "routed_moe split ptr down launch");
             split_ptr_down_done = ok;
         }
         if (ok) {
@@ -2912,7 +3028,7 @@ static int routed_moe_launch(
             } else if (use_atomic_down) {
                 uint64_t n = (uint64_t)n_tokens * out_dim;
                 zero_kernel<<<(n + 255u) / 256u, 256>>>((float *)out->ptr, n);
-                ok = cuda_ok(cudaGetLastError(), "routed_moe atomic zero launch");
+                ok = d20_ok(cudaGetLastError(), "routed_moe atomic zero launch");
             }
             if (use_mxfp4_draft_down || use_direct_down_sum6) {
                 /* The direct kernels already write the final token rows. */
@@ -3061,14 +3177,14 @@ static int routed_moe_launch(
                         n_expert);
                 }
             }
-            ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
+            ok = d20_ok(cudaGetLastError(), "routed_moe down launch");
             }
         }
         if (ok && !direct_iq2_down_done && !use_atomic_down &&
             !use_mxfp4_draft_down && !use_direct_down_sum6 && !use_iq2_q2_float_down) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
-            ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
+            ok = d20_ok(cudaGetLastError(), "routed_moe sum launch");
         }
         if (zero_copy_selected) {
             /* Ordering guarantee 3 (cuda_stream_selected_apply_ptrs): record
@@ -3115,7 +3231,7 @@ static int routed_moe_launch(
                         0xffffffffu,
                         clamp,
                         store_gate_up);
-                ok = cuda_ok(cudaGetLastError(),
+                ok = d20_ok(cudaGetLastError(),
                              "routed_moe q2 streaming batch resident gate/up launch");
             }
             if (!ok) {
@@ -3142,7 +3258,7 @@ static int routed_moe_launch(
                         0xffffffffu,
                         clamp,
                         store_gate_up);
-                ok = cuda_ok(cudaGetLastError(),
+                ok = d20_ok(cudaGetLastError(),
                              "routed_moe q2 streaming batch missing gate/up launch");
             }
         } else {
@@ -3164,7 +3280,7 @@ static int routed_moe_launch(
                     0xffffffffu,
                     clamp,
                     store_gate_up);
-            ok = cuda_ok(cudaGetLastError(),
+            ok = d20_ok(cudaGetLastError(),
                          "routed_moe q2 streaming batch gate/up launch");
         }
         if (ok) {
@@ -3181,7 +3297,7 @@ static int routed_moe_launch(
                     out_dim,
                     down_row_bytes,
                     n_expert);
-            ok = cuda_ok(cudaGetLastError(),
+            ok = d20_ok(cudaGetLastError(),
                          "routed_moe q2 streaming batch down launch");
         }
         if (ok) ok = cuda_stream_batch_selected_mark_inflight();
@@ -3259,11 +3375,11 @@ static int routed_moe_launch(
                     (const int32_t *)selected_exec->ptr,
                     pair_count,
                     bucket_count);
-            ok = cuda_ok(cudaGetLastError(), "routed_moe q2 expert count launch");
+            ok = d20_ok(cudaGetLastError(), "routed_moe q2 expert count launch");
         }
         if (ok) {
             moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, bucket_count);
-            ok = cuda_ok(cudaGetLastError(), "routed_moe q2 expert prefix launch");
+            ok = d20_ok(cudaGetLastError(), "routed_moe q2 expert prefix launch");
         }
         if (ok) {
             moe_scatter_sorted_pairs_deterministic_kernel<<<bucket_count, 1u>>>(
@@ -3272,12 +3388,12 @@ static int routed_moe_launch(
                     (const int32_t *)selected_exec->ptr,
                     pair_count,
                     bucket_count);
-            ok = cuda_ok(cudaGetLastError(), "routed_moe q2 expert scatter launch");
+            ok = d20_ok(cudaGetLastError(), "routed_moe q2 expert scatter launch");
         }
         if (ok && moe_wmma_hot) {
             const uint64_t xh_count = (uint64_t)n_tokens * expert_in_dim;
             f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(wmma_x_h, (const float *)x->ptr, xh_count);
-            ok = cuda_ok(cudaGetLastError(), "routed_moe q2 wmma x f16 launch");
+            ok = d20_ok(cudaGetLastError(), "routed_moe q2 wmma x f16 launch");
         }
         if (!ok) return 0;
 
@@ -3317,7 +3433,7 @@ static int routed_moe_launch(
                 (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
                 counts, offsets, sorted_pairs, 1u, scalar_max, expert_in_dim, expert_mid_dim,
                 gate_expert_bytes, gate_row_bytes, n_expert, clamp);
-        if (!cuda_ok(cudaGetLastError(), "routed_moe q2 expert gate/up launch")) return 0;
+        if (!d20_ok(cudaGetLastError(), "routed_moe q2 expert gate/up launch")) return 0;
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         if (moe_wmma_hot && wmma_f16_low_count != 0u) {
             constexpr uint32_t mt4 = 4u, bm = 16u, bn = 16u, bk = 16u;
@@ -3334,7 +3450,7 @@ static int routed_moe_launch(
                     NULL, wmma_mid_h, gate_w, up_w, (const float *)x->ptr, wmma_x_h, (const float *)weights->ptr,
                     counts, offsets, sorted_pairs, wmma_gate_f16_low_dev, wmma_f16_low_count,
                     expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, n_expert, clamp);
-            if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma f16-low gate/up launch")) return 0;
+            if (!d20_ok(cudaGetLastError(), "routed_moe q2 wmma f16-low gate/up launch")) return 0;
         }
         if (moe_wmma_hot && wmma_f16_hot_count != 0u) {
             constexpr uint32_t mt = 8u, bm = 16u, bn = 16u, bk = 16u;
@@ -3351,7 +3467,7 @@ static int routed_moe_launch(
                     NULL, wmma_mid_h, gate_w, up_w, (const float *)x->ptr, wmma_x_h, (const float *)weights->ptr,
                     counts, offsets, sorted_pairs, wmma_gate_hot_dev, wmma_f16_hot_count,
                     expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, n_expert, clamp);
-            if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma f16-mid gate/up launch")) return 0;
+            if (!d20_ok(cudaGetLastError(), "routed_moe q2 wmma f16-mid gate/up launch")) return 0;
         }
 #endif
         dim3 down_grid((out_dim + down_rpb - 1u) / down_rpb, bucket_count, 1);
@@ -3366,7 +3482,7 @@ static int routed_moe_launch(
                     counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
                     down_expert_bytes, down_row_bytes, n_expert);
         }
-        if (!cuda_ok(cudaGetLastError(), "routed_moe q2 expert down launch")) return 0;
+        if (!d20_ok(cudaGetLastError(), "routed_moe q2 expert down launch")) return 0;
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         if (moe_wmma_hot && wmma_f16_low_count != 0u) {
             constexpr uint32_t mt4 = 4u, bm = 16u, bn = 16u, bk = 16u;
@@ -3383,7 +3499,7 @@ static int routed_moe_launch(
                     NULL, wmma_down_h, down_w, NULL, wmma_mid_h,
                     counts, offsets, sorted_pairs, wmma_down_f16_low_dev, wmma_f16_low_count,
                     expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
-            if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma f16-low down launch")) return 0;
+            if (!d20_ok(cudaGetLastError(), "routed_moe q2 wmma f16-low down launch")) return 0;
         }
         if (moe_wmma_hot && wmma_f16_hot_count != 0u) {
             constexpr uint32_t mt = 8u, bm = 16u, bn = 16u, bk = 16u;
@@ -3400,7 +3516,7 @@ static int routed_moe_launch(
                     NULL, wmma_down_h, down_w, NULL, wmma_mid_h,
                     counts, offsets, sorted_pairs, wmma_down_hot_dev, wmma_f16_hot_count,
                     expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
-            if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma f16-mid down launch")) return 0;
+            if (!d20_ok(cudaGetLastError(), "routed_moe q2 wmma f16-mid down launch")) return 0;
         }
 #endif
         const uint64_t n = (uint64_t)n_tokens * out_dim;
@@ -3417,7 +3533,7 @@ static int routed_moe_launch(
             moe_sum_kernel<<<(n + 255u) / 256u, 256>>>(
                     (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
         }
-        ok = cuda_ok(cudaGetLastError(), "routed_moe q2 expert sum launch");
+        ok = d20_ok(cudaGetLastError(), "routed_moe q2 expert sum launch");
         if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();
         return ok;
     }
@@ -3472,7 +3588,7 @@ static int routed_moe_launch(
                         stream_resident_mask,
                         clamp,
                         store_gate_up);
-                ok_gateup = cuda_ok(cudaGetLastError(),
+                ok_gateup = d20_ok(cudaGetLastError(),
                                      "routed_moe q2 split resident gate/up launch");
                 if (decode_profile && ok_gateup) {
                     decode_profile_rec.gate_resident = 1;
@@ -3519,7 +3635,7 @@ static int routed_moe_launch(
                         stream_missing_mask,
                         clamp,
                         store_gate_up);
-                ok_gateup = cuda_ok(cudaGetLastError(),
+                ok_gateup = d20_ok(cudaGetLastError(),
                                      "routed_moe q2 split missing gate/up launch");
                 if (decode_profile && ok_gateup) {
                     decode_profile_rec.gate_missing = 1;
@@ -3541,7 +3657,7 @@ static int routed_moe_launch(
             cuda_block_q8_K *xq_gate = (cuda_block_q8_K *)down->ptr;
             dim3 xq_grid(xq_blocks, n_tokens, 1);
             q8_K_quantize_kernel<<<xq_grid, 256>>>(xq_gate, (const float *)x->ptr, expert_in_dim, n_tokens);
-            ok_gateup = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k gate input quantize launch");
+            ok_gateup = d20_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k gate input quantize launch");
             if (ok_gateup) {
                 dim3 gate_grid((expert_mid_dim + 255u) / 256u, pair_count, 1);
                 moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel<<<gate_grid, 256u>>>(
@@ -3560,7 +3676,7 @@ static int routed_moe_launch(
                         n_expert,
                         (uint32_t)store_gate_up,
                         clamp);
-                ok_gateup = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k gate/up launch");
+                ok_gateup = d20_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k gate/up launch");
             }
             if (decode_profile && ok_gateup) {
                 decode_profile_rec.gate_full = 1;
@@ -3594,7 +3710,7 @@ static int routed_moe_launch(
                     n_expert,
                     clamp,
                     store_gate_up);
-            ok_gateup = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows gate/up launch");
+            ok_gateup = d20_ok(cudaGetLastError(), "routed_moe q2 oldhip rows gate/up launch");
             if (decode_profile && ok_gateup) {
                 decode_profile_rec.gate_full = 1;
                 if (!routed_moe_decode_profile_record_event(
@@ -3627,7 +3743,7 @@ static int routed_moe_launch(
                     n_expert,
                     clamp,
                     store_gate_up);
-            ok_gateup = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows gate/up launch");
+            ok_gateup = d20_ok(cudaGetLastError(), "routed_moe q2 oldhip rows gate/up launch");
             if (decode_profile && ok_gateup) {
                 decode_profile_rec.gate_full = 1;
                 if (!routed_moe_decode_profile_record_event(
@@ -3654,7 +3770,7 @@ static int routed_moe_launch(
                 return 0;
             }
             q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, pair_count);
-            ok_decode_moe = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k mid quantize launch");
+            ok_decode_moe = d20_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k mid quantize launch");
             if (decode_profile && ok_decode_moe) {
                 decode_profile_rec.mid_quant = 1;
                 if (!routed_moe_decode_profile_record_event(
@@ -3691,7 +3807,7 @@ static int routed_moe_launch(
                             out_dim,
                             n_expert);
                 }
-                ok_decode_moe = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k down launch");
+                ok_decode_moe = d20_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k down launch");
                 if (decode_profile && ok_decode_moe) {
                     decode_profile_rec.down = 1;
                     if (!routed_moe_decode_profile_record_event(
@@ -3733,7 +3849,7 @@ static int routed_moe_launch(
                         down_row_bytes,
                         n_expert);
             }
-            ok_decode_moe = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip rows down launch");
+            ok_decode_moe = d20_ok(cudaGetLastError(), "routed_moe q2 oldhip rows down launch");
             if (decode_profile && ok_decode_moe) {
                 decode_profile_rec.down = 1;
                 if (!routed_moe_decode_profile_record_event(
@@ -3788,7 +3904,7 @@ static int routed_moe_launch(
                 n_expert,
                 clamp);
         }
-        ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
+        ok = d20_ok(cudaGetLastError(), "routed_moe gate/up launch");
     }
     if (ok) {
         dim3 dgrid(out_dim, pair_count, 1);
@@ -3802,12 +3918,12 @@ static int routed_moe_launch(
             expert_mid_dim,
             out_dim,
             n_expert);
-        ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
+        ok = d20_ok(cudaGetLastError(), "routed_moe down launch");
     }
     if (ok) {
         uint64_t n = (uint64_t)n_tokens * out_dim;
         moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
-        ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
+        ok = d20_ok(cudaGetLastError(), "routed_moe sum launch");
     }
     if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();
     return ok;
@@ -3928,7 +4044,7 @@ extern "C" int ds4_gpu_test_mxfp4_stream_rows(
     /* (a) streamed rows path, as routed_moe_launch's batch-stream branch. */
     if (ok) {
         q8_K_quantize_kernel<<<dim3(xq_blocks, n_tokens, 1), 256>>>(xq_a, x, expert_in_dim, n_tokens);
-        ok = cuda_ok(cudaGetLastError(), "test x quantize") &&
+        ok = d20_ok(cudaGetLastError(), "test x quantize") &&
              routed_moe_mxfp4_ptrs_rows_launch(out_a, scratch, scratch, mid_a,
                                                tables[0], tables[1], tables[2],
                                                xq_a, midq_a, sel, w,
@@ -3957,7 +4073,7 @@ extern "C" int ds4_gpu_test_mxfp4_stream_rows(
                 out_b + (uint64_t)t * out_dim, (const char *)tables[2], midq_t,
                 sel + (uint64_t)t * n_expert, 0, down_row_bytes, midq_blocks,
                 out_dim, n_expert);
-        ok = cuda_ok(cudaGetLastError(), "test decode reference launch");
+        ok = d20_ok(cudaGetLastError(), "test decode reference launch");
     }
     ok = ok && cuda_ok(cudaDeviceSynchronize(), "test sync") &&
         cuda_ok(cudaMemcpy(mid_rows_host, mid_a, mid_bytes, cudaMemcpyDeviceToHost), "test mid a down") &&
@@ -4187,7 +4303,7 @@ extern "C" int ds4_gpu_test_mxfp4_overlap(
         cuda_ok(cudaMemset(out_b, 0x7e, out_bytes), "test poison");
     if (ok) {
         q8_K_quantize_kernel<<<dim3(xq_blocks, n_tokens, 1), 256>>>(xq, x, expert_in_dim, n_tokens);
-        ok = cuda_ok(cudaGetLastError(), "test x quantize");
+        ok = d20_ok(cudaGetLastError(), "test x quantize");
     }
     /* (a) reference */
     if (ok && n_tokens == 1u) {
@@ -4202,7 +4318,7 @@ extern "C" int ds4_gpu_test_mxfp4_overlap(
                 dim3((out_dim + 7u) / 8u, 1u, 1), 256>>>(
                 out_b, (const char *)tables[2], midq_b, sel, 0, down_row_bytes,
                 midq_blocks, out_dim, n_expert);
-        ok = cuda_ok(cudaGetLastError(), "test decode reference launch");
+        ok = d20_ok(cudaGetLastError(), "test decode reference launch");
     } else if (ok) {
         ok = routed_moe_mxfp4_ptrs_rows_launch(out_b, scratch, scratch, mid_b,
                                                tables[0], tables[1], tables[2],

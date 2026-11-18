@@ -444,42 +444,33 @@ class S3FIFO:
         self.f = {}
 
     def _evict_s(self, prot):
-        while self.S:
-            v = next(iter(self.S))
-            del self.S[v]
+        for _ in range(len(self.S)):
+            v, _ = self.S.popitem(last=False)
             if v in prot:
-                self.S[v] = None            # keep, rotate
-                if all(x in prot for x in self.S):
-                    return False
-                continue
-            if self.f.get(v, 0) > 0:
+                self.S[v] = None
+            elif self.f[v] > 0:
                 self.M[v] = None
                 self.f[v] = 0
-                if len(self.M) > self.cap - self.ks:
-                    self._evict_m(prot)
             else:
                 self.G[v] = None
                 if len(self.G) > self.cap - self.ks:
                     self.G.popitem(last=False)
-                self.f.pop(v, None)
+                del self.f[v]
                 return True
         return False
 
     def _evict_m(self, prot):
-        guard = 0
-        while self.M:
-            v = next(iter(self.M))
-            del self.M[v]
-            if self.f.get(v, 0) > 0 or v in prot:
+        if not self.M:
+            return False
+        for _ in range(4 * len(self.M) + 4):
+            v, _ = self.M.popitem(last=False)
+            if v in prot or self.f[v] > 0:
                 if v not in prot:
                     self.f[v] -= 1
                 self.M[v] = None
-                guard += 1
-                if guard > 4 * len(self.M) + 8:
-                    raise RuntimeError("s3fifo: main all protected")
-                continue
-            self.f.pop(v, None)
-            return True
+            else:
+                del self.f[v]
+                return True
         return False
 
     def access(self, k, ci, t, prot, nu):
@@ -487,11 +478,10 @@ class S3FIFO:
             self.f[k] = min(3, self.f.get(k, 0) + 1)
             return True
         while len(self.S) + len(self.M) >= self.cap:
-            if len(self.S) >= self.ks:
-                if self._evict_s(prot):
-                    continue
-            if not self._evict_m(prot):
-                self._evict_s(prot)
+            if len(self.S) >= self.ks and self._evict_s(prot):
+                continue
+            if not self._evict_m(prot) and not self._evict_s(prot):
+                raise RuntimeError("s3fifo: no evictable resident")
         if k in self.G:
             del self.G[k]
             self.M[k] = None

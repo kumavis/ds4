@@ -304,6 +304,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
  * entries) plus the frozen per-layer Rbar, taken and uploaded by
  * ds4_gpu_route_prior_open() when a transaction opens (a decode step, or a
  * whole verify round). */
+/* V4.1 has 384 routed experts: DS4_ROCM_MAX_N_EXPERT (DS4_ROCM_N_EXPERT is V4s 256). */
 enum { DS4_RP_MAX_LAYERS = 64, DS4_RP_MAX_ROWS = 8, DS4_RP_STAT = 4 };
 static unsigned char *g_rp_mask_dev;
 static float *g_rp_rbar_dev;
@@ -346,7 +347,7 @@ extern "C" uint32_t ds4_gpu_route_prior_keep(void) {
 static int cuda_rp_alloc(uint32_t n_layer) {
     if (g_rp_mask_dev) return n_layer <= g_rp_layers;
     if (n_layer == 0 || n_layer > DS4_RP_MAX_LAYERS) return 0;
-    const size_t mask_bytes = (size_t)DS4_RP_MAX_LAYERS * DS4_ROCM_N_EXPERT;
+    const size_t mask_bytes = (size_t)DS4_RP_MAX_LAYERS * DS4_ROCM_MAX_N_EXPERT;
     if (cudaMalloc((void **)&g_rp_mask_dev, mask_bytes) != cudaSuccess ||
         cudaMalloc((void **)&g_rp_rbar_dev, DS4_RP_MAX_LAYERS * sizeof(float)) != cudaSuccess ||
         cudaMalloc((void **)&g_rp_stats_dev, (size_t)DS4_RP_MAX_ROWS * DS4_RP_MAX_LAYERS *
@@ -370,17 +371,17 @@ static int cuda_rp_alloc(uint32_t n_layer) {
 extern "C" int ds4_gpu_route_prior_open(const void *model_map, uint32_t n_layer,
                                         const float *rbar) {
     if (!model_map || !rbar || !cuda_rp_alloc(n_layer)) return 0;
-    memset(g_rp_mask_host, 0, (size_t)n_layer * DS4_ROCM_N_EXPERT);
+    memset(g_rp_mask_host, 0, (size_t)n_layer * DS4_ROCM_MAX_N_EXPERT);
     uint64_t n = 0;
     for (const cuda_stream_resident_expert &e : g_stream_resident_experts) {
         if (e.model_map != model_map || e.layer >= n_layer || e.expert < 0 ||
-            (uint32_t)e.expert >= DS4_ROCM_N_EXPERT) continue;
-        g_rp_mask_host[(size_t)e.layer * DS4_ROCM_N_EXPERT + (uint32_t)e.expert] = 1;
+            (uint32_t)e.expert >= DS4_ROCM_MAX_N_EXPERT) continue;
+        g_rp_mask_host[(size_t)e.layer * DS4_ROCM_MAX_N_EXPERT + (uint32_t)e.expert] = 1;
         n++;
     }
     g_rp_snap_resident = n;
     memcpy(g_rp_rbar_host, rbar, n_layer * sizeof(float));
-    return cuda_ok(cudaMemcpyAsync(g_rp_mask_dev, g_rp_mask_host, (size_t)n_layer * DS4_ROCM_N_EXPERT,
+    return cuda_ok(cudaMemcpyAsync(g_rp_mask_dev, g_rp_mask_host, (size_t)n_layer * DS4_ROCM_MAX_N_EXPERT,
                                    cudaMemcpyHostToDevice, 0), "D16 mask upload") &&
         cuda_ok(cudaMemcpyAsync(g_rp_rbar_dev, g_rp_rbar_host, n_layer * sizeof(float),
                                 cudaMemcpyHostToDevice, 0), "D16 rbar upload");
@@ -498,7 +499,7 @@ extern "C" int ds4_gpu_route_prior_apply(ds4_gpu_tensor *selected, ds4_gpu_tenso
         uint32_t row_offset, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale) {
     const float lambda = ds4_gpu_route_prior_lambda();
     if (!(lambda > 0.0f)) return 1;
-    if (!g_rp_mask_dev || n_expert != DS4_ROCM_N_EXPERT || n_expert_used > DS4_ROCM_N_EXPERT_USED ||
+    if (!g_rp_mask_dev || n_expert != DS4_ROCM_MAX_N_EXPERT || n_expert_used > DS4_ROCM_N_EXPERT_USED ||
         layer >= n_layer || n_layer > g_rp_layers || n_rows == 0 ||
         row_offset + n_rows > DS4_RP_MAX_ROWS || !selected || !weights || !probs) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "D16 apply: bad arguments (mask=%p expert=%u used=%u layer=%u/%u rows=%u+%u)\n",
@@ -525,7 +526,7 @@ extern "C" int ds4_gpu_route_prior_apply(ds4_gpu_tensor *selected, ds4_gpu_tenso
         return 0;
     }
     dim3 block(32, 4, 1);
-    route_prior_kernel<DS4_ROCM_N_EXPERT><<<(n_rows + 3u) / 4u, block>>>(
+    route_prior_kernel<DS4_ROCM_MAX_N_EXPERT><<<(n_rows + 3u) / 4u, block>>>(
         (int32_t *)selected->ptr, (float *)weights->ptr, (const float *)probs->ptr, bias,
         g_rp_mask_dev, g_rp_rbar_dev, g_rp_stats_dev, layer, n_layer, row_offset, n_rows,
         n_expert_used, ds4_gpu_route_prior_keep(), lambda, expert_weight_scale);

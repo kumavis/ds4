@@ -4204,7 +4204,8 @@ static int cuda_stream_layer_expert_cache_load(
 /* V4.1 only: the graph owns dynamic-cache metadata until every source copy
  * completes. The following reader receives no cache pointer or vector index. */
 static int cuda_stream_v41_prepare_layer(const ds4_gpu_stream_expert_table *t,
-                                         ds4_gpu_dsv41_stream_layer_plan *out) {
+                                         ds4_gpu_dsv41_stream_layer_plan *out,
+                                         const uint64_t *want = NULL) {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
     uint64_t total = 0;
@@ -4243,7 +4244,14 @@ static int cuda_stream_v41_prepare_layer(const ds4_gpu_stream_expert_table *t,
         g_stream_v41_reuse_stats.prepares++;
         g_stream_v41_reuse_stats.logical_bytes += total;
     }
+    uint32_t skipped = 0;
     for (uint32_t e = 0; ok && e < 384u; e++) {
+        if (want && !((want[e / 64u] >> (e % 64u)) & 1u)) {
+            /* D17 union load: neither copied nor read. */
+            plan.skip[e / 64u] |= UINT64_C(1) << (e % 64u);
+            skipped++;
+            continue;
+        }
         const int idx = cuda_stream_resident_find(t->model_map, t->layer, (int32_t)e,
             t->gate_offset, t->up_offset, t->down_offset,
             t->gate_expert_bytes, t->down_expert_bytes);
@@ -4288,7 +4296,7 @@ static int cuda_stream_v41_prepare_layer(const ds4_gpu_stream_expert_table *t,
     if (stats) {
         g_stream_v41_reuse_stats.hits += hits;
         g_stream_v41_reuse_stats.d2d_bytes += copied;
-        g_stream_v41_reuse_stats.missing_bytes += total - (uint64_t)hits * (total / 384u);
+        g_stream_v41_reuse_stats.missing_bytes += total - (uint64_t)(hits + skipped) * (total / 384u);
         if (!ok) g_stream_v41_reuse_stats.failures++;
     }
     if (!ok) return 0;
@@ -4310,7 +4318,8 @@ static int cuda_stream_v41_plan_matches(const ds4_gpu_dsv41_stream_layer_plan *p
         a.gate_offset == b.gate_offset && a.up_offset == b.up_offset &&
         a.down_offset == b.down_offset && a.gate_expert_bytes == b.gate_expert_bytes &&
         a.down_expert_bytes == b.down_expert_bytes &&
-        memcmp(s.reuse_plan.hits, p->hits, sizeof(p->hits)) == 0;
+        memcmp(s.reuse_plan.hits, p->hits, sizeof(p->hits)) == 0 &&
+        memcmp(s.reuse_plan.skip, p->skip, sizeof(p->skip)) == 0;
 }
 
 /* Coalesce only adjacent misses in a single plane. An empty hit bitmap retains
@@ -4328,9 +4337,9 @@ static int cuda_stream_v41_missing_jobs(const ds4_gpu_dsv41_stream_layer_plan *p
     for (uint32_t plane = 0; plane < 3u; plane++) {
         uint32_t e = 0;
         while (e < 384u) {
-            if ((p->hits[e / 64u] >> (e % 64u)) & 1u) { e++; continue; }
+            if (((p->hits[e / 64u] | p->skip[e / 64u]) >> (e % 64u)) & 1u) { e++; continue; }
             const uint32_t first = e++;
-            while (e < 384u && !((p->hits[e / 64u] >> (e % 64u)) & 1u)) e++;
+            while (e < 384u && !(((p->hits[e / 64u] | p->skip[e / 64u]) >> (e % 64u)) & 1u)) e++;
             uint64_t begin = (uint64_t)first * stride[plane];
             const uint64_t end = (uint64_t)e * stride[plane];
             while (begin < end) {

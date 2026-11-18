@@ -1,0 +1,9 @@
+feat(d17b): union-loading layer sweep on ROCm (DS4_ROCM_V41_UNION_SWEEP=<max rows>, off by default)
+
+After each layer's router, a small sweep's staging receives only the routed
+union (residents copied from the cache, the rest read) instead of the whole
+layer being read ahead. Same routing, expert bytes and kernels, so the
+output should not change. Whole-layer loading stays the path for every
+other sweep. Development state: gates not yet run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

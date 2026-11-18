@@ -336,6 +336,13 @@ extern "C" int ds4_gpu_dsv41_stream_prepare_layer(
     return cuda_stream_v41_prepare_layer(table, plan);
 }
 
+extern "C" int ds4_gpu_dsv41_stream_prepare_layer_masked(
+        const ds4_gpu_stream_expert_table *table,
+        const uint64_t *want,
+        ds4_gpu_dsv41_stream_layer_plan *plan) {
+    return cuda_stream_v41_prepare_layer(table, plan, want);
+}
+
 extern "C" int ds4_gpu_dsv41_stream_load_layer(
         const ds4_gpu_dsv41_stream_layer_plan *plan) {
     return cuda_stream_v41_load_layer(plan);

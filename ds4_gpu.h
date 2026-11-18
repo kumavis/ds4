@@ -546,9 +546,18 @@ typedef struct ds4_gpu_dsv41_stream_layer_plan {
     ds4_gpu_stream_expert_table table;
     uint64_t generation;
     uint64_t hits[6];
+    uint64_t skip[6];   /* D17: experts left out of a union-loaded layer */
 } ds4_gpu_dsv41_stream_layer_plan;
 int ds4_gpu_dsv41_stream_prepare_layer(
         const ds4_gpu_stream_expert_table *table,
+        ds4_gpu_dsv41_stream_layer_plan *plan);
+/* D17: like ds4_gpu_dsv41_stream_prepare_layer, but only the experts set in
+ * want[6] (a 384-bit mask) are copied or read; the others' staging bytes are
+ * left as they are and must not be used (the routed MoE uses only routed
+ * experts). want == NULL is the whole layer. */
+int ds4_gpu_dsv41_stream_prepare_layer_masked(
+        const ds4_gpu_stream_expert_table *table,
+        const uint64_t *want,
         ds4_gpu_dsv41_stream_layer_plan *plan);
 int ds4_gpu_dsv41_stream_load_layer(
         const ds4_gpu_dsv41_stream_layer_plan *plan);

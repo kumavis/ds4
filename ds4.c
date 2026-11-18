@@ -43794,6 +43794,26 @@ static bool ds41_draft_attention_output(ds41_gpu_graph *g,
 #endif
 }
 
+/* D11 attribution (opt-in, read by no decision): DS4_D11_DRAFT_TRACE=1 copies
+ * the drafter router selections of every stage into a small device buffer
+ * (stream-ordered device copy) and prints one D11_DRAFT line per proposal,
+ * read back after the proposal has completed, next to the drafted tokens. */
+#define D11_SEL_STRIDE 128u
+static ds4_gpu_tensor *g_d11_sel;
+static int ds41_d11_trace_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_D11_DRAFT_TRACE");
+        cached = e && e[0] && strcmp(e, "0") != 0;
+        if (cached && !g_d11_sel) {
+            g_d11_sel = ds4_gpu_tensor_alloc((uint64_t)DS4_DSPARK_MAX_STAGES *
+                D11_SEL_STRIDE * sizeof(int32_t));
+            if (!g_d11_sel) cached = 0;
+        }
+    }
+    return cached;
+}
+
 static bool ds41_draft_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_layer_weights *l, uint32_t stage,
                                  uint32_t count) {
@@ -43818,6 +43838,11 @@ static bool ds41_draft_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             0, 0, 0, 0, true, false, b->route_logits, g->prefill_tokens,
             n_exp, n_used, DS4_EXPERT_WEIGHT_SCALE, count) &&
         d8_mark(D8_DET_ROUTER));
+    if (ds41_d11_trace_on() && stage < DS4_DSPARK_MAX_STAGES &&
+        (uint64_t)count * n_used <= D11_SEL_STRIDE)
+        DS41_DRAFT_MOE_STEP("D11 selection copy", ds4_gpu_tensor_copy(g_d11_sel,
+            (uint64_t)stage * D11_SEL_STRIDE * sizeof(int32_t), b->selected, 0,
+            (uint64_t)count * n_used * sizeof(int32_t)));
     DS41_DRAFT_MOE_STEP("shared gate", ds41_matmul_batch(
         b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true));
     DS41_DRAFT_MOE_STEP("shared up", ds41_matmul_batch(
@@ -44008,6 +44033,29 @@ static bool ds41_draft_propose(ds41_gpu_graph *g, const ds4_model *m,
             (uint64_t)B * sizeof(int32_t)) &&
         ds4_gpu_tensor_read(d->conf, 0, conf_out,
             (uint64_t)B * sizeof(float));
+    if (ok && ds41_d11_trace_on()) {
+        const uint32_t nu = d->w->n_expert_used;
+        int32_t sel[DS4_DSPARK_MAX_STAGES * D11_SEL_STRIDE];
+        if (B * nu <= D11_SEL_STRIDE && d->n_stage <= DS4_DSPARK_MAX_STAGES &&
+            ds4_gpu_tensor_read(g_d11_sel, 0, sel,
+                (uint64_t)d->n_stage * D11_SEL_STRIDE * sizeof(int32_t))) {
+            flockfile(stderr);
+            fprintf(stderr, "D11_DRAFT v=1 pos=%u seed=%d block=%u used=%u drafts=",
+                    g->pos, t0, B, nu);
+            for (uint32_t i = 0; i < B; i++)
+                fprintf(stderr, "%s%d", i ? "," : "", tokens_out[i]);
+            for (uint32_t st = 0; st < d->n_stage; st++) {
+                fprintf(stderr, " s%u=", st);
+                for (uint32_t r = 0; r < B; r++) {
+                    for (uint32_t k = 0; k < nu; k++)
+                        fprintf(stderr, "%s%d", k ? "," : (r ? "|" : ""),
+                                sel[st * D11_SEL_STRIDE + r * nu + k]);
+                }
+            }
+            fputc(10, stderr);
+            funlockfile(stderr);
+        }
+    }
 #ifdef DS4_ROCM_BUILD
     if (profile) {
         profile_read += now_sec() - profile_t0;

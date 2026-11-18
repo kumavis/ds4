@@ -11554,17 +11554,6 @@ static bool kv_turn_checkpoints(void) {
     return on == 1;
 }
 
-static int kv_cache_turn_step(const server *s) {
-    int step = s->kv.opt.continued_interval_tokens;
-    const int align = s->kv.opt.boundary_align_tokens;
-    if (step <= 0) return 0;
-    if (align > 0) {
-        step = ((step + align - 1) / align) * align;
-        if (step <= 0) step = align;
-    }
-    return step;
-}
-
 static int kv_cache_turn_min_tokens(void) {
     static int v = -1;
     if (v < 0) {

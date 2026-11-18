@@ -352,7 +352,7 @@ static cuda_stream_layer_expert_cache g_stream_layer_expert_cache[2];
 static int g_stream_staging_lent;
 static uint32_t g_stream_staging_lent_slots;
 static uint64_t g_stream_staging_stats_lends, g_stream_staging_stats_reclaims,
-                g_stream_staging_stats_evicted;
+                g_stream_staging_stats_evicted, g_stream_staging_stats_shelf_swaps;
 static int cuda_stream_staging_reclaim(void);
 static uint64_t g_stream_v41_plan_generation;
 static cuda_stream_v41_reuse_stats g_stream_v41_reuse_stats;
@@ -3891,6 +3891,12 @@ static int cuda_stream_staging_reclaim(void) {
         char *staging_buf = e->buf;
         e->buf = g_stream_expert_free_slots[pick];
         g_stream_expert_free_slots[pick] = staging_buf;
+        g_stream_staging_stats_shelf_swaps++;
+    }
+    if (n_shelf_staging) {
+        /* Gate evidence (int4): the D5 shelf held lent staging memory. */
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D13 staging reclaim: %u D5 shelf buffer(s) were "
+                        "staging memory; swapped for non-staging free slots\n", n_shelf_staging);
     }
     size_t kept = 0;
     uint32_t removed = 0;

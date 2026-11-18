@@ -44914,14 +44914,15 @@ static bool ds41_stream_layer_start(ds41_stream_layer_load *job,
     return true;
 }
 
-/* D13: DS4_ROCM_STREAM_STAGING_CACHE=1 lends the two staging layers to the
- * dynamic expert cache whenever no layer sweep runs (from engine open, and
- * after each sweep); each sweep takes them back first. Off by default. */
+/* D13: the two staging layers are lent to the dynamic expert cache whenever
+ * no layer sweep runs (from engine open, and after each sweep); each sweep
+ * takes them back first. On by default since kumanix-int4;
+ * DS4_ROCM_STREAM_STAGING_CACHE=0 restores the int3 behaviour. */
 static bool ds41_staging_cache_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
         const char *env = getenv("DS4_ROCM_STREAM_STAGING_CACHE");
-        enabled = env && !strcmp(env, "1");
+        enabled = !(env && !strcmp(env, "0"));
     }
     return enabled != 0;
 }

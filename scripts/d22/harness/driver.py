@@ -322,51 +322,75 @@ def load_payload(path):
 
 
 # ------------------------------------------------------------------ D22 pressure helper
-# hold: take memory in steps (256 MiB, every page touched) while the server is
-# idle, up to max_mb, the last step sized to land MemAvailable at stop_mb
-# (default floor + 662, i.e. under the guard line floor + 768 and above the
-# driver's own stop line floor + 512). A watcher releases everything at once if
-# MemAvailable ever reads under hard_mb (floor + 400). release: give it back.
-_HELD = []
-def _hold_say(run_dir, msg):
-    line = f"{time.strftime('%H:%M:%S')} epoch={int(time.time())} hold: {msg}"
-    with open(os.path.join(run_dir, "hold.log"), "a") as f:
-        f.write(line + "\n")
+class PressureHold:
+    """Own the held pages and monitor them from the first allocation until release."""
+    def __init__(self, rec, hard_mb):
+        self.rec = rec
+        self.hard_mb = hard_mb
+        self.chunks = []
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.watcher = threading.Thread(target=self.watch, daemon=True)
 
-def _hold_release(run_dir, why):
-    n = sum(len(b) for b in _HELD) >> 20
-    _HELD.clear()
-    _hold_say(run_dir, f"released {n} MiB ({why}); MemAvailable {mem_available_mb()} MiB")
+    def log(self, message):
+        with open(os.path.join(self.rec.run_dir, "hold.log"), "a") as f:
+            print(f"{time.strftime('%H:%M:%S')} epoch={int(time.time())} hold: {message}", file=f)
 
-def _hold_watch(run_dir, hard_mb):
-    while _HELD:
-        m = mem_available_mb()
-        if m is not None and m < hard_mb:
-            _hold_release(run_dir, f"hard stop: MemAvailable {m} < {hard_mb}")
-            return
-        time.sleep(0.25)
+    def release(self, why, abort=False):
+        with self.lock:
+            if self.done.is_set():
+                return
+            self.done.set()
+            if abort:
+                self.rec.stop_flag = True  # decline the next turn; let in-flight work finish
+            mib = sum(len(b) for b in self.chunks) >> 20
+            self.chunks.clear()
+        self.log(f"released {mib} MiB ({why})")
 
-def run_hold(run_dir, max_mb, stop_mb, hard_mb):
-    import threading
-    _hold_say(run_dir, f"start: MemAvailable {mem_available_mb()} MiB, max {max_mb}, stop under {stop_mb}, hard {hard_mb}")
-    held = 0
-    while held < max_mb:
-        m = mem_available_mb()
-        if m is None or m <= stop_mb + 16:
-            break
-        step = min(256, m - stop_mb, max_mb - held)   # land at stop_mb, never past it
-        if m - step < hard_mb:
-            _hold_say(run_dir, f"next step would reach {m - step} MiB (< hard {hard_mb}); stopping")
-            break
-        n = step << 20
-        b = bytearray(n)
-        b[::4096] = b"\x01" * len(range(0, n, 4096))
-        _HELD.append(b)
-        held += step
-        time.sleep(1.0)
-        _hold_say(run_dir, f"holding {held} MiB; MemAvailable {mem_available_mb()} MiB")
-    threading.Thread(target=_hold_watch, args=(run_dir, hard_mb), daemon=True).start()
-    return "held"
+    def sample(self):
+        try:
+            if os.path.exists(os.path.join(self.rec.run_dir, "RELEASE_PRESSURE")):
+                self.release("operator requested release", abort=True)
+                return None
+            m = mem_available_mb()
+            if m is None:
+                self.release("MemAvailable unavailable", abort=True)
+            elif m < self.hard_mb:
+                self.release(f"hard stop: MemAvailable {m} < {self.hard_mb}", abort=True)
+            else:
+                return m
+        except (OSError, ValueError, IndexError) as exc:
+            self.release(f"MemAvailable unavailable: {exc}", abort=True)
+        return None
+
+    def watch(self):
+        while not self.done.wait(0.25):
+            if self.sample() is None:
+                return
+
+    def ramp(self, max_mb, stop_mb):
+        self.log(f"start: max {max_mb} MiB, target {stop_mb}, hard {self.hard_mb}")
+        self.watcher.start()
+        held = 0
+        while held < max_mb and not self.done.is_set():
+            m = self.sample()
+            if m is None or m <= stop_mb + 16:
+                break
+            step = min(256, m - stop_mb, max_mb - held)
+            if m - step < self.hard_mb:
+                break
+            chunk = bytearray(step << 20)
+            chunk[::4096] = b"\x01" * len(range(0, len(chunk), 4096))
+            with self.lock:
+                if self.done.is_set():
+                    break
+                self.chunks.append(chunk)
+                del chunk  # release must drop the last reference even while the ramp sleeps
+                held += step
+            self.log(f"holding {held} MiB; MemAvailable before step {m} MiB")
+            if self.done.wait(1):
+                break
+        return "stop-flag" if self.rec.stop_flag else "held"
 
 
 def step_args(spec):
@@ -573,8 +597,11 @@ def cmd_run(a):
         say("all steps skipped by policy: --prefill-chunk is ignored on V4.1 ROCm (see the flag file)")
         status["steps"].append({"spec": "all", "label": "all", "end": "skipped-by-policy", "s": 0})
         a.step = []
+    pressure = None
     try:
         for spec in a.step:
+            if rec.stop_flag:
+                break
             kind, kv = step_args(spec)
             label = kv.get("label", kind)
             t0 = time.time()
@@ -598,10 +625,13 @@ def cmd_run(a):
                         why = "error"
                         break
             elif kind == "hold":
-                why = run_hold(a.run_dir, int(kv.get("max_mb", 1536)), int(kv.get("stop_mb", MEM_FLOOR_MB + 662)),
-                               int(kv.get("hard_mb", MEM_FLOOR_MB + 400)))
+                if pressure is not None and not pressure.done.is_set():
+                    raise ValueError("pressure already held")
+                pressure = PressureHold(rec, int(kv.get("hard_mb", MEM_FLOOR_MB + 400)))
+                why = pressure.ramp(int(kv.get("max_mb", 1536)), int(kv.get("stop_mb", MEM_FLOOR_MB + 662)))
             elif kind == "release":
-                _hold_release(a.run_dir, "step")
+                if pressure is not None:
+                    pressure.release("step")
                 why = "released"
             elif kind == "idle":
                 time.sleep(float(kv.get("s", 10)))
@@ -609,17 +639,23 @@ def cmd_run(a):
             else:
                 why = f"unknown step {kind}"
             status["steps"].append({"spec": spec, "label": label, "end": why, "s": round(time.time() - t0, 1)})
-            json.dump(status, open(os.path.join(a.run_dir, "driver.json"), "w"), indent=1)
-            if why in ("mem-guard", "error", "time-budget"):
+            with open(os.path.join(a.run_dir, "driver.json"), "w") as status_file:
+                json.dump(status, status_file, indent=1)
+            if why in ("mem-guard", "error", "time-budget", "stop-flag"):
                 say(f"stopping the scenario after step {label}: {why}")
                 break
     except Exception as e:  # never leave the server running
         status["exception"] = repr(e)
         say("driver exception:", repr(e))
     finally:
-        status["stop"] = clean_stop(a.run_dir, a.port)
-        json.dump(status, open(os.path.join(a.run_dir, "driver.json"), "w"), indent=1)
-    return 0 if not status.get("exception") else 1
+        try:
+            if pressure is not None:
+                pressure.release("scenario finished")
+        finally:
+            status["stop"] = clean_stop(a.run_dir, a.port)
+        with open(os.path.join(a.run_dir, "driver.json"), "w") as status_file:
+            json.dump(status, status_file, indent=1)
+    return 1 if status.get("exception") or rec.stop_flag else 0
 
 
 # ------------------------------------------------------------------ parsing

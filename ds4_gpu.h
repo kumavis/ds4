@@ -506,6 +506,21 @@ int ds4_gpu_d5_prefetch(const ds4_gpu_stream_expert_table *table,
  * default 6; DS4_ROCM_D5_VERIFY_L0 layer-0 probe on the attention input,
  * default 0).  Active only with DS4_ROCM_D5_PREFETCH. */
 uint32_t ds4_gpu_d5_verify_k(void);
+/* D16 cache-conditional routing (exploration, output-changing when on):
+ * DS4_ROCM_ROUTE_CACHE_PRIOR=<lambda> (0 = off), DS4_ROCM_ROUTE_CACHE_KEEP=<n>
+ * (3).  open() snapshots the expert cache's residency for one routing
+ * transaction; apply() re-selects already routed rows under it; stats()
+ * returns per row and layer {r_obs, dropped-rank mask, drift, bonus}. */
+float ds4_gpu_route_prior_lambda(void);
+uint32_t ds4_gpu_route_prior_keep(void);
+int ds4_gpu_route_prior_open(const void *model_map, uint32_t n_layer, const float *rbar);
+uint64_t ds4_gpu_route_prior_snapshot_count(void);
+int ds4_gpu_route_prior_apply(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size,
+        uint64_t bias_offset, uint32_t layer, uint32_t n_layer, uint32_t n_rows,
+        uint32_t row_offset, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale);
+int ds4_gpu_route_prior_stats(float *out, uint32_t n_rows, uint32_t n_layer);
+uint64_t ds4_gpu_stream_batch_miss_count(void);
 /* int3: device bytes the D5 shelf allocates once prefetch engages (0 when
  * it never does); the V4.1 memory-sized cache charges them. */
 uint64_t ds4_gpu_d5_shelf_plan_bytes(uint64_t slot_bytes);

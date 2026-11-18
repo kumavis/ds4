@@ -161,7 +161,7 @@ def measured(tags):
 
 
 print("\n== headroom (tok/s; modelled unless 'measured')")
-cols = ["meas_plain", "meas_old", "meas_online", "old", "oracle", "fixed2", "fixed3", "fixed4",
+cols = ["meas_plain", "meas_old", "meas_online", "old", "model", "model_peek", "oracle", "fixed2", "fixed3", "fixed4",
         "fixed5", "noplain_old", "noplain_oldmin1", "oracle_noplain", "oracle_wait0",
         "oracle_wait05", "old_wait0", "perfect"]
 print("prompt     " + " ".join(f"{c:>9s}" for c in cols))
@@ -182,6 +182,15 @@ for p in PROMPTS:
         oracle_wait05=sim.oracle(pr, mkcost(p, 0.5))["tps"],
         old_wait0=sim.replay(pr, sim.OldPolicy(), mkcost(p, 0.0))["tps"],
     )
+    mp = dict(P=118.0, D=20.0, VA=77.0, VB=49.0) if Q == "mx" else dict(P=87.0, D=20.0, VA=66.0, VB=41.0)
+    row["model"] = sim.replay(pr, sim.ModelPolicy(**mp), mkcost(p))["tps"]
+    # Bound for any confidence-driven width rule: drafter cost waived when the
+    # confidences say width 0 (as if the draft/plain choice could peek).
+    kc = costs[p]
+    pk = sim.Cost(kc["P"], kc["D"], kc["Va"], kc["Vb"])
+    pk.round = lambda proposed, w, c=pk: (c.P if (proposed and w == 0) else sim.Cost.round(c, proposed, w))
+    row["model_peek"] = sim.replay(pr, sim.ModelPolicy(P=kc["P"], D=kc["D"], VA=kc["Va"], VB=kc["Vb"],
+                                                       gate=-99.0), pk)["tps"]
     for w in (2, 3, 4, 5):
         row[f"fixed{w}"] = sim.replay(pr, sim.FixedPolicy(w), mkcost(p))["tps"]
     k = mkcost(p)

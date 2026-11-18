@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# D9 queue 1 (build 1): smoke, plain gate, per-position probe runs (the
+# D9 queue 1 (build 1). NOTE: its `env $TR ... run` lines never ran (env cannot call a shell function); q1b.sh is the version that ran.: smoke, plain gate, per-position probe runs (the
 # drafter's full proposal at every position of the plain trajectory), traced
 # old-scheduler runs, a drafter profile, Q2 probe/old.
 set -u; . "$(dirname "$0")/common.sh"

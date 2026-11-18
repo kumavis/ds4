@@ -1,3 +1,119 @@
+/* ---- D20: routed-MoE launch profiler (DS4_ROCM_D20_PROF=1, off by default) ----
+ * Measurement only.  Inside every routed_moe_launch call with at least 2 rows,
+ * a timing hipEvent is recorded after each kernel launch / memset of this file
+ * (at its existing error check) and the host clock is read at the same point.
+ * At the call's end the events are synchronized; each launch is charged the
+ * GPU time from the previous mark to its own (so idle GPU time before it, e.g.
+ * a host wait, is charged to it too) and the host time since the previous
+ * mark.  Totals per row bucket and launch label print at exit.  Off: every
+ * check is cuda_ok plus one branch. */
+#include <chrono>
+enum { D20_MAX_MARKS = 160, D20_MAX_LABELS = 96, D20_BUCKETS = 6 };
+static int g_d20_prof = -1;
+static int g_d20_active;
+static cudaEvent_t g_d20_ev[D20_MAX_MARKS];
+static const char *g_d20_lab[D20_MAX_MARKS];
+static double g_d20_host[D20_MAX_MARKS];
+static int g_d20_n;
+static const char *g_d20_names[D20_MAX_LABELS];
+static double g_d20_gpu_ms[D20_BUCKETS][D20_MAX_LABELS], g_d20_host_ms[D20_BUCKETS][D20_MAX_LABELS];
+static uint64_t g_d20_cnt[D20_BUCKETS][D20_MAX_LABELS];
+static double g_d20_call_gpu[D20_BUCKETS], g_d20_call_host[D20_BUCKETS], g_d20_call_sync[D20_BUCKETS];
+static uint64_t g_d20_calls[D20_BUCKETS], g_d20_rows[D20_BUCKETS], g_d20_overflow;
+static const char *g_d20_bucket_name[D20_BUCKETS] = {"2-6", "7-255", "256-511", "512-1023", "1024-2047", "2048+"};
+
+static double d20_now_ms(void) {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static int d20_bucket(uint32_t n) {
+    return n <= 6u ? 0 : n < 256u ? 1 : n < 512u ? 2 : n < 1024u ? 3 : n < 2048u ? 4 : 5;
+}
+static void d20_report(void) {
+    for (int b = 0; b < D20_BUCKETS; b++) {
+        if (!g_d20_calls[b]) continue;
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D20 moe prof rows %s: calls=%llu mean_rows=%.0f gpu=%.1f ms/call host_to_end=%.1f ms/call sync_wait=%.1f ms/call\n",
+                g_d20_bucket_name[b], (unsigned long long)g_d20_calls[b],
+                (double)g_d20_rows[b] / (double)g_d20_calls[b], g_d20_call_gpu[b] / g_d20_calls[b],
+                g_d20_call_host[b] / g_d20_calls[b], g_d20_call_sync[b] / g_d20_calls[b]);
+        for (int l = 0; l < D20_MAX_LABELS && g_d20_names[l]; l++) {
+            if (!g_d20_cnt[b][l]) continue;
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "D20 moe prof rows %s:   %-48s n=%llu gpu=%.2f ms/call host=%.2f ms/call\n",
+                    g_d20_bucket_name[b], g_d20_names[l], (unsigned long long)g_d20_cnt[b][l],
+                    g_d20_gpu_ms[b][l] / g_d20_calls[b], g_d20_host_ms[b][l] / g_d20_calls[b]);
+        }
+    }
+    if (g_d20_overflow) fprintf(stderr, DS4_GPU_LOG_PREFIX "D20 moe prof: %llu calls exceeded %d marks\n",
+                                (unsigned long long)g_d20_overflow, D20_MAX_MARKS);
+}
+static int d20_on(void) {
+    if (g_d20_prof < 0) {
+        const char *e = getenv("DS4_ROCM_D20_PROF");
+        g_d20_prof = e && e[0] && strcmp(e, "0") ? 1 : 0;
+        if (g_d20_prof) {
+            for (int i = 0; i < D20_MAX_MARKS; i++)
+                if (cudaEventCreate(&g_d20_ev[i]) != cudaSuccess) { g_d20_prof = 0; break; }
+            if (g_d20_prof) atexit(d20_report);
+        }
+    }
+    return g_d20_prof;
+}
+static void d20_mark(const char *label) {
+    if (!g_d20_active) return;
+    if (g_d20_n >= D20_MAX_MARKS) { g_d20_active = 2; return; }
+    (void)cudaEventRecord(g_d20_ev[g_d20_n], 0);
+    g_d20_lab[g_d20_n] = label;
+    g_d20_host[g_d20_n] = d20_now_ms();
+    g_d20_n++;
+}
+static int d20_ok(cudaError_t err, const char *what) {
+    const int ok = cuda_ok(err, what);
+    if (g_d20_active == 1) d20_mark(what);
+    return ok;
+}
+struct D20ProfScope {
+    uint32_t rows;
+    bool on;
+    explicit D20ProfScope(uint32_t n) : rows(n), on(false) {
+        if (n < 2u || g_d20_active || !d20_on()) return;
+        on = true;
+        g_d20_active = 1;
+        g_d20_n = 0;
+        d20_mark("(call start)");
+    }
+    ~D20ProfScope() {
+        if (!on) return;
+        const bool overflow = g_d20_active == 2;
+        g_d20_active = 1;
+        if (!overflow) d20_mark("(call end)");
+        g_d20_active = 0;
+        if (overflow) { g_d20_overflow++; return; }
+        const double t_end = d20_now_ms();
+        (void)cudaEventSynchronize(g_d20_ev[g_d20_n - 1]);
+        const int b = d20_bucket(rows);
+        g_d20_calls[b]++;
+        g_d20_rows[b] += rows;
+        g_d20_call_host[b] += t_end - g_d20_host[0];
+        g_d20_call_sync[b] += d20_now_ms() - t_end;
+        float total = 0.0f;
+        (void)cudaEventElapsedTime(&total, g_d20_ev[0], g_d20_ev[g_d20_n - 1]);
+        g_d20_call_gpu[b] += total;
+        for (int i = 1; i < g_d20_n; i++) {
+            float ms = 0.0f;
+            (void)cudaEventElapsedTime(&ms, g_d20_ev[i - 1], g_d20_ev[i]);
+            int l = 0;
+            for (; l < D20_MAX_LABELS && g_d20_names[l]; l++)
+                if (!strcmp(g_d20_names[l], g_d20_lab[i])) break;
+            if (l == D20_MAX_LABELS) continue;
+            if (!g_d20_names[l]) g_d20_names[l] = g_d20_lab[i];
+            g_d20_gpu_ms[b][l] += ms;
+            g_d20_host_ms[b][l] += g_d20_host[i] - g_d20_host[i - 1];
+            g_d20_cnt[b][l]++;
+        }
+    }
+};
+
+
 static int routed_moe_u64_add_checked(uint64_t a, uint64_t b, uint64_t *out) {
     if (!out || a > UINT64_MAX - b) return 0;
     *out = a + b;
@@ -1002,121 +1118,6 @@ static int routed_moe_full_table_is_cached(
            cuda_model_range_is_cached(model_map, up_offset, gate_bytes) &&
            cuda_model_range_is_cached(model_map, down_offset, down_bytes);
 }
-
-/* ---- D20: routed-MoE launch profiler (DS4_ROCM_D20_PROF=1, off by default) ----
- * Measurement only.  Inside every routed_moe_launch call with at least 2 rows,
- * a timing hipEvent is recorded after each kernel launch / memset of this file
- * (at its existing error check) and the host clock is read at the same point.
- * At the call's end the events are synchronized; each launch is charged the
- * GPU time from the previous mark to its own (so idle GPU time before it, e.g.
- * a host wait, is charged to it too) and the host time since the previous
- * mark.  Totals per row bucket and launch label print at exit.  Off: every
- * check is cuda_ok plus one branch. */
-#include <chrono>
-enum { D20_MAX_MARKS = 160, D20_MAX_LABELS = 96, D20_BUCKETS = 6 };
-static int g_d20_prof = -1;
-static int g_d20_active;
-static cudaEvent_t g_d20_ev[D20_MAX_MARKS];
-static const char *g_d20_lab[D20_MAX_MARKS];
-static double g_d20_host[D20_MAX_MARKS];
-static int g_d20_n;
-static const char *g_d20_names[D20_MAX_LABELS];
-static double g_d20_gpu_ms[D20_BUCKETS][D20_MAX_LABELS], g_d20_host_ms[D20_BUCKETS][D20_MAX_LABELS];
-static uint64_t g_d20_cnt[D20_BUCKETS][D20_MAX_LABELS];
-static double g_d20_call_gpu[D20_BUCKETS], g_d20_call_host[D20_BUCKETS], g_d20_call_sync[D20_BUCKETS];
-static uint64_t g_d20_calls[D20_BUCKETS], g_d20_rows[D20_BUCKETS], g_d20_overflow;
-static const char *g_d20_bucket_name[D20_BUCKETS] = {"2-6", "7-255", "256-511", "512-1023", "1024-2047", "2048+"};
-
-static double d20_now_ms(void) {
-    return std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-static int d20_bucket(uint32_t n) {
-    return n <= 6u ? 0 : n < 256u ? 1 : n < 512u ? 2 : n < 1024u ? 3 : n < 2048u ? 4 : 5;
-}
-static void d20_report(void) {
-    for (int b = 0; b < D20_BUCKETS; b++) {
-        if (!g_d20_calls[b]) continue;
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "D20 moe prof rows %s: calls=%llu mean_rows=%.0f gpu=%.1f ms/call host_to_end=%.1f ms/call sync_wait=%.1f ms/call\n",
-                g_d20_bucket_name[b], (unsigned long long)g_d20_calls[b],
-                (double)g_d20_rows[b] / (double)g_d20_calls[b], g_d20_call_gpu[b] / g_d20_calls[b],
-                g_d20_call_host[b] / g_d20_calls[b], g_d20_call_sync[b] / g_d20_calls[b]);
-        for (int l = 0; l < D20_MAX_LABELS && g_d20_names[l]; l++) {
-            if (!g_d20_cnt[b][l]) continue;
-            fprintf(stderr, DS4_GPU_LOG_PREFIX "D20 moe prof rows %s:   %-48s n=%llu gpu=%.2f ms/call host=%.2f ms/call\n",
-                    g_d20_bucket_name[b], g_d20_names[l], (unsigned long long)g_d20_cnt[b][l],
-                    g_d20_gpu_ms[b][l] / g_d20_calls[b], g_d20_host_ms[b][l] / g_d20_calls[b]);
-        }
-    }
-    if (g_d20_overflow) fprintf(stderr, DS4_GPU_LOG_PREFIX "D20 moe prof: %llu calls exceeded %d marks\n",
-                                (unsigned long long)g_d20_overflow, D20_MAX_MARKS);
-}
-static int d20_on(void) {
-    if (g_d20_prof < 0) {
-        const char *e = getenv("DS4_ROCM_D20_PROF");
-        g_d20_prof = e && e[0] && strcmp(e, "0") ? 1 : 0;
-        if (g_d20_prof) {
-            for (int i = 0; i < D20_MAX_MARKS; i++)
-                if (cudaEventCreate(&g_d20_ev[i]) != cudaSuccess) { g_d20_prof = 0; break; }
-            if (g_d20_prof) atexit(d20_report);
-        }
-    }
-    return g_d20_prof;
-}
-static void d20_mark(const char *label) {
-    if (!g_d20_active) return;
-    if (g_d20_n >= D20_MAX_MARKS) { g_d20_active = 2; return; }
-    (void)cudaEventRecord(g_d20_ev[g_d20_n], 0);
-    g_d20_lab[g_d20_n] = label;
-    g_d20_host[g_d20_n] = d20_now_ms();
-    g_d20_n++;
-}
-static int d20_ok(cudaError_t err, const char *what) {
-    const int ok = cuda_ok(err, what);
-    if (g_d20_active == 1) d20_mark(what);
-    return ok;
-}
-struct D20ProfScope {
-    uint32_t rows;
-    bool on;
-    explicit D20ProfScope(uint32_t n) : rows(n), on(false) {
-        if (n < 2u || g_d20_active || !d20_on()) return;
-        on = true;
-        g_d20_active = 1;
-        g_d20_n = 0;
-        d20_mark("(call start)");
-    }
-    ~D20ProfScope() {
-        if (!on) return;
-        const bool overflow = g_d20_active == 2;
-        g_d20_active = 1;
-        if (!overflow) d20_mark("(call end)");
-        g_d20_active = 0;
-        if (overflow) { g_d20_overflow++; return; }
-        const double t_end = d20_now_ms();
-        (void)cudaEventSynchronize(g_d20_ev[g_d20_n - 1]);
-        const int b = d20_bucket(rows);
-        g_d20_calls[b]++;
-        g_d20_rows[b] += rows;
-        g_d20_call_host[b] += t_end - g_d20_host[0];
-        g_d20_call_sync[b] += d20_now_ms() - t_end;
-        float total = 0.0f;
-        (void)cudaEventElapsedTime(&total, g_d20_ev[0], g_d20_ev[g_d20_n - 1]);
-        g_d20_call_gpu[b] += total;
-        for (int i = 1; i < g_d20_n; i++) {
-            float ms = 0.0f;
-            (void)cudaEventElapsedTime(&ms, g_d20_ev[i - 1], g_d20_ev[i]);
-            int l = 0;
-            for (; l < D20_MAX_LABELS && g_d20_names[l]; l++)
-                if (!strcmp(g_d20_names[l], g_d20_lab[i])) break;
-            if (l == D20_MAX_LABELS) continue;
-            if (!g_d20_names[l]) g_d20_names[l] = g_d20_lab[i];
-            g_d20_gpu_ms[b][l] += ms;
-            g_d20_host_ms[b][l] += g_d20_host[i] - g_d20_host[i - 1];
-            g_d20_cnt[b][l]++;
-        }
-    }
-};
 
 static int routed_moe_launch(
         ds4_gpu_tensor *out,

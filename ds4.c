@@ -80290,7 +80290,26 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * graph sequence and the per-layer gates pair up.  The worker acks a sync
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
+static int ds4_session_sync_body(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+
+/* D18 (trace only): with DS4_D12_CACHE_TRACE set, mark each prompt sync in the
+ * expert-cache trace: Q before (pos = valid checkpoint length, rows = prompt
+ * length), q after (pos = position reached, rows = return code).  Lookups
+ * between Q and q are prompt prefill; single-token steps after q are decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    const uint32_t pos0 = s && s->checkpoint_valid ? (uint32_t)s->checkpoint.len : 0u;
+    ds4_gpu_d12_trace_mark(Q, pos0, prompt && prompt->len > 0 ? (uint32_t)prompt->len : 0u);
+    const int rc = ds4_session_sync_body(s, prompt, err, errlen);
+    const uint32_t pos1 = s && s->checkpoint_valid ? (uint32_t)s->checkpoint.len : 0u;
+    ds4_gpu_d12_trace_mark(q, pos1, (uint32_t)rc);
+    return rc;
+#else
+    return ds4_session_sync_body(s, prompt, err, errlen);
+#endif
+}
+
+static int ds4_session_sync_body(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
 #ifndef DS4_NO_GPU
     if (s) s->dspark_rewind_end = 0;
 #endif

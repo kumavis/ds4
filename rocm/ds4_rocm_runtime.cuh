@@ -357,6 +357,7 @@ static uint32_t g_stream_staging_lent_slots;
 static uint64_t g_stream_staging_stats_lends, g_stream_staging_stats_reclaims,
                 g_stream_staging_stats_evicted, g_stream_staging_stats_shelf_swaps;
 static int cuda_stream_staging_reclaim(void);
+static void cuda_stream_s3_clear(void);   /* D19 S3-FIFO, defined with the eviction code */
 static uint64_t g_stream_v41_plan_generation;
 static cuda_stream_v41_reuse_stats g_stream_v41_reuse_stats;
 static std::vector<cuda_stream_resident_expert> g_stream_resident_experts;

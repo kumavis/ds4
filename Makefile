@@ -1242,6 +1242,12 @@ tests/test_mxfp4_overlap_rocm: tests/test_mxfp4_overlap_rocm.o ds4_rocm.o ds4_im
 test-mxfp4-overlap-rocm: tests/test_mxfp4_overlap_rocm
 	./tests/test_mxfp4_overlap_rocm
 
+tests/test_d20_down_stage9_rocm.o: tests/test_d20_down_stage9_rocm.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_d20_down_stage9_rocm: tests/test_d20_down_stage9_rocm.o ds4_rocm.o ds4_image.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
 tests/test_d5_prefetch_rocm.o: tests/test_d5_prefetch_rocm.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 

@@ -512,6 +512,9 @@ int ds4_gpu_d5_prefetch(const ds4_gpu_stream_expert_table *table,
  * default 6; DS4_ROCM_D5_VERIFY_L0 layer-0 probe on the attention input,
  * default 0).  Active only with DS4_ROCM_D5_PREFETCH. */
 uint32_t ds4_gpu_d5_verify_k(void);
+/* D20 model-free test hook (see rocm/ds4_rocm_moe_launch.cuh). */
+int ds4_gpu_test_d20_down_stage9(uint32_t count, uint32_t seed, uint32_t row_groups,
+                                 uint64_t *n_diff, uint64_t *n_total);
 /* int3: device bytes the D5 shelf allocates once prefetch engages (0 when
  * it never does); the V4.1 memory-sized cache charges them. */
 uint64_t ds4_gpu_d5_shelf_plan_bytes(uint64_t slot_bytes);

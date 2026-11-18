@@ -4180,6 +4180,115 @@ __global__ static void moe_down_mxfp4_expert_tile8_row32_kernel(
     }
 }
 
+/* D20 step 1 (DS4_ROCM_D20_DOWN_STAGE9=1, off by default): the tile8 MXFP4
+ * down kernel with LDS staging for up to 9 Q8_K blocks.  V4.1's down has
+ * K = 2304 = 9 blocks, one more than the original kernel stages, so the
+ * original always runs the unstaged dev_dot_mxfp4_q8_K_block8 (activations
+ * from global memory per lane).  This copy stages them and runs
+ * dev_dot_mxfp4_q8a_block8.  Everything else is the original line for line.
+ * Bitwise equality of the two helpers is checked model-free by
+ * tests/test_d20_down_stage9_rocm.c, not assumed. */
+__global__ static void moe_down_mxfp4_expert_tile8_row32_stage9_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t atomic_out,
+        uint32_t row_groups) {
+    uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t expert = tile_experts[tile];
+    uint32_t local_start = tile_starts[tile];
+    /* Aligned quant slices plus separate scales, as in the gate/up tile
+     * kernel, so the dot helper loads b128 from LDS. */
+    __shared__ int4 sxq4[8u * 9u * 16u];
+    __shared__ float sds[8u * 9u];
+    int8_t *sqs = (int8_t *)sxq4;
+    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    /* Fixed-count predicated setup keeps pair/xqb in registers; the tail
+     * xqb entries stay at valid dummy rows and are never read past np. */
+    const cuda_block_q8_K *xqb[8] = { midq, midq, midq, midq, midq, midq, midq, midq };
+    uint32_t count = counts[expert];
+    uint32_t np = count - local_start;
+    if (np > 8u) np = 8u;
+    #pragma unroll
+    for (uint32_t p = 0; p < 8u; p++) {
+        if (p < np) {
+            pair[p] = sorted_pairs[offsets[expert] + local_start + p];
+            xqb[p] = midq + (uint64_t)pair[p] * midq_blocks;
+        }
+    }
+    const int staged = midq_blocks <= 9u;
+    if (staged) {
+        for (uint32_t i = threadIdx.x; i < np * midq_blocks * 16u; i += blockDim.x) {
+            const uint32_t u = i / (midq_blocks * 16u);
+            const uint32_t rem = i - u * (midq_blocks * 16u);
+            const uint32_t b = rem >> 4u;
+            const uint32_t k = rem & 15u;
+            const uint32_t sp = sorted_pairs[offsets[expert] + local_start + u];
+            const int32_t *src = (const int32_t *)
+                midq[(uint64_t)sp * midq_blocks + b].qs + k * 4u;
+            ((int4 *)sqs)[(u * midq_blocks + b) * 16u + k] =
+                make_int4(src[0], src[1], src[2], src[3]);
+        }
+        for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
+            const uint32_t u = i / midq_blocks;
+            const uint32_t b = i - u * midq_blocks;
+            const uint32_t sp = sorted_pairs[offsets[expert] + local_start + u];
+            sds[i] = midq[(uint64_t)sp * midq_blocks + b].d;
+        }
+        __syncthreads();
+    }
+    /* Each block covers row_groups consecutive 32-row groups against one
+     * staged copy of the tile's activations: activation staging traffic
+     * and block-launch count both divide by row_groups.  Per (token,row)
+     * the arithmetic is untouched (same helper, same lane-strided block
+     * loop, same reduction), so results are bit-identical to
+     * row_groups=1. */
+    for (uint32_t rg = 0u; rg < row_groups; rg++) {
+    uint32_t row = (blockIdx.x * row_groups + rg) * 32u + (threadIdx.x >> 3u);
+    if (row >= out_dim) continue;
+    const char *down_row = down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes;
+    const uint64_t down_chunk_bytes = down_row_bytes / midq_blocks;
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const uint64_t sq = (uint64_t)midq_blocks << 8u;
+    for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+        const cuda_block_mxfp4 *wb = (const cuda_block_mxfp4 *)(down_row + (uint64_t)b * down_chunk_bytes);
+        if (staged) {
+            const int8_t *qb = sqs + ((uint64_t)b << 8u);
+            dev_dot_mxfp4_q8a_block8(wb,
+                qb, qb + sq, qb + 2u * sq, qb + 3u * sq,
+                qb + 4u * sq, qb + 5u * sq, qb + 6u * sq, qb + 7u * sq,
+                sds[b], sds[midq_blocks + b], sds[2u * midq_blocks + b], sds[3u * midq_blocks + b],
+                sds[4u * midq_blocks + b], sds[5u * midq_blocks + b], sds[6u * midq_blocks + b], sds[7u * midq_blocks + b],
+                np, acc);
+        } else {
+            dev_dot_mxfp4_q8_K_block8(wb, xqb[0] + b, xqb[1] + b, xqb[2] + b, xqb[3] + b,
+                                      xqb[4] + b, xqb[5] + b, xqb[6] + b, xqb[7] + b, np, acc);
+        }
+    }
+    #pragma unroll
+    for (uint32_t p = 0; p < 8u; p++) {
+        if (p >= np) continue;
+        acc[p] = quarter_warp_sum_f32(acc[p], lane);
+        if (lane == 0) {
+            down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
+        }
+    }
+    }
+}
+
 __global__ static void moe_down_sorted_qwarp32_kernel(
         float *down_out,
         const char *down_base,

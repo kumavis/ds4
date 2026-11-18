@@ -1,0 +1,40 @@
+| tensor (x stages) | shape | type | bytes each | total GiB | on GPU | read |
+|---|---|---|---:|---:|---|---|
+| mtp.N.ffn_gate_exps.weight (x3) | 5120x2304x128 | MXFP4 | 802,160,640 | 2.2412 | GPU (resident image) | only the selected experts: <=15 of 128 per stage per proposal (5 rows x top-3) |
+| mtp.N.ffn_up_exps.weight (x3) | 5120x2304x128 | MXFP4 | 802,160,640 | 2.2412 | GPU (resident image) | only the selected experts: <=15 of 128 per stage per proposal (5 rows x top-3) |
+| mtp.N.ffn_down_exps.weight (x3) | 2304x5120x128 | MXFP4 | 802,160,640 | 2.2412 | GPU (resident image) | only the selected experts: <=15 of 128 per stage per proposal (5 rows x top-3) |
+| mtp.N.attn_q_b.weight (x3) | 1280x32768 | F16 | 83,886,080 | 0.2344 | GPU | every proposal |
+| mtp.N.attn_output_b.weight (x3) | 8192x5120 | F16 | 83,886,080 | 0.2344 | GPU | every proposal |
+| mtp.N.attn_output_a.weight (x3) | 4096x8192 | F16 | 67,108,864 | 0.1875 | GPU | every proposal |
+| mtp.N.main_proj.weight (x1) | 15360x5120 | F16 | 157,286,400 | 0.1465 | GPU | not by the proposal; by the per-token drafter KV bookkeeping (every committed token) |
+| mtp.N.markov_head.markov_w1.weight (x1) | 256x129280 | F32 | 132,382,720 | 0.1233 | GPU | one 1 KiB row per Markov step (5 per proposal) |
+| mtp.N.markov_head.markov_w2.weight (x1) | 256x129280 | F32 | 132,382,720 | 0.1233 | GPU (resident image) | NOT read: the ROCm F32 path reads a transposed copy (extra 126 MiB allocation) |
+| mtp.N.ffn_gate_shexp.weight (x3) | 5120x2304 | F16 | 23,592,960 | 0.0659 | GPU | every proposal |
+| mtp.N.ffn_up_shexp.weight (x3) | 5120x2304 | F16 | 23,592,960 | 0.0659 | GPU | every proposal |
+| mtp.N.ffn_down_shexp.weight (x3) | 2304x5120 | F16 | 23,592,960 | 0.0659 | GPU | every proposal |
+| mtp.N.attn_q_a.weight (x3) | 5120x1280 | F16 | 13,107,200 | 0.0366 | GPU | every proposal |
+| mtp.N.attn_kv.weight (x3) | 5120x512 | F16 | 5,242,880 | 0.0146 | GPU | every proposal + every committed token (bookkeeping) |
+| mtp.N.ffn_gate_inp.weight (x3) | 5120x128 | F32 | 2,621,440 | 0.0073 | GPU | every proposal |
+| mtp.N.hc_attn_fn.weight (x3) | 20480x24 | F32 | 1,966,080 | 0.0055 | GPU | every proposal |
+| mtp.N.hc_ffn_fn.weight (x3) | 20480x24 | F32 | 1,966,080 | 0.0055 | GPU | every proposal |
+| mtp.N.attn_norm.weight (x3) | 5120 | F32 | 32,768 | 0.0001 | GPU | every proposal |
+| mtp.N.ffn_norm.weight (x3) | 5120 | F32 | 32,768 | 0.0001 | GPU | every proposal |
+| mtp.N.hc_attn_base.weight (x3) | 24 | F32 | 16,384 | 0.0000 | GPU | every proposal |
+| mtp.N.hc_attn_scale.weight (x3) | 3 | F32 | 16,384 | 0.0000 | GPU | every proposal |
+| mtp.N.hc_ffn_base.weight (x3) | 24 | F32 | 16,384 | 0.0000 | GPU | every proposal |
+| mtp.N.hc_ffn_scale.weight (x3) | 3 | F32 | 16,384 | 0.0000 | GPU | every proposal |
+| mtp.N.attn_sinks.weight (x3) | 64 | F32 | 16,384 | 0.0000 | GPU | every proposal |
+| mtp.N.attn_q_a_norm.weight (x3) | 1280 | F32 | 16,384 | 0.0000 | GPU | every proposal |
+| mtp.N.attn_kv_a_norm.weight (x3) | 512 | F32 | 16,384 | 0.0000 | GPU | every proposal |
+| mtp.N.exp_probs_b.bias (x3) | 128 | F32 | 16,384 | 0.0000 | GPU | every proposal |
+| mtp.N.exp_probs_b_vl.bias (x3) | 128 | F32 | 16,384 | 0.0000 | GPU | never (vision-token routing bias; text only) |
+| mtp.N.main_norm.weight (x1) | 5120 | F32 | 32,768 | 0.0000 | GPU | every proposal |
+| mtp.N.norm.weight (x1) | 5120 | F32 | 32,768 | 0.0000 | GPU | every proposal |
+| mtp.N.confidence_head.proj.weight (x1) | 5376x1 | F32 | 32,768 | 0.0000 | GPU (+ 21 KiB copy in conf_proj) | copy read per proposal |
+| total | | | | 8.041 | | |
+routed experts: 6.724 GiB
+attention (q_a,q_b,kv,out_a,out_b): 0.708 GiB
+shared expert: 0.198 GiB
+main_proj: 0.146 GiB
+markov w1: 0.123 GiB
+markov w2: 0.123 GiB

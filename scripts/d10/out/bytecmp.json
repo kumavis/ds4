@@ -1,0 +1,22 @@
+{
+ "whole": {
+  "mtp.0.attn_kv.weight": "bb1c9c721b60fa56d01c06708dd765d8a1b154cc9318bd9b658ba12ac02a8330",
+  "blk.2.attn_compressor_kv.weight": "f1be9ee16ef2ec86fbb6193b2b4bfadfe92806dbf23211d937cc1a3392b9eda5",
+  "blk.2.attn_compressor_gate.weight": "e5b65cfd3c9baa7d4788aab782295cf818414e9a7158d8311b5a79ff8bdf9b10",
+  "blk.8.attn_compressor_kv.weight": "e38022e20c1b4e00969b135d57d842d6370ec4338c4f9c28c8649dd966428cd6",
+  "blk.8.attn_compressor_gate.weight": "5359b71974d2c914ced4f70e3c20ae2977503dfdb31b93d5eca6c0605ca95039",
+  "blk.14.attn_compressor_kv.weight": "9cb1d7c4e443f94f6ea293eee7d2440f459c54ba9ab6bcd56b4e812261c9af47",
+  "blk.14.attn_compressor_gate.weight": "4f426abe5f12caf2985ff663a3e03ad229cf4fba91aaa1e5b10dfd88f2874342",
+  "blk.20.attn_compressor_kv.weight": "7b544104988bdaa2dcb450c1de97e4097477073f06cbd53aeaf162e03fcb0fa4",
+  "mtp.1.attn_kv.weight": "833da21abd928f1d078a4e40a61eb0270163e37e7e6bb56c02302dba45a2af0d",
+  "mtp.2.attn_kv.weight": "e310bd4f472c673e94d72a2d5d595a0d3183689ed78858b8f4afcd23566f6072"
+ },
+ "expert_prefix_matches": [],
+ "expert_prefixes": 1152,
+ "attn_kv_equal_to_main": {
+  "mtp.0.attn_kv.weight": [],
+  "mtp.1.attn_kv.weight": [],
+  "mtp.2.attn_kv.weight": []
+ },
+ "bytes_read": 354418688
+}

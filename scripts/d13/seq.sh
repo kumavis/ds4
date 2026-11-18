@@ -3,8 +3,10 @@
 # is not a tty, so linenoise reads plain lines):
 #   turn 1: p-long (1,445 tokens -> layer sweep), decode N tokens
 #   turn 2: p-code (~100 new tokens -> token-major prefill), decode N tokens
-#   turn 3: p-json (~280 new tokens -> second layer sweep; with the switch on
-#           this reclaims lent slots that decode filled), decode N tokens
+#   turn 3: p-translate + p-json in one message (~530 new tokens -> second
+#           layer sweep; with the switch on this reclaims lent slots that
+#           decode filled), decode N tokens
+#   turn 4: p-prose (token-major), decode N tokens
 # Usage: seq.sh TAG on|off [N] [extra ds4 flags]. Output in /data/ds4-bench/d13-seq/TAG/.
 # Runs under the GPU lock and refuses to start if another ds4 is running.
 set -u
@@ -12,7 +14,8 @@ tag=$1; mode=$2; n=${3:-96}; shift 3 || shift $#
 out=/data/ds4-bench/d13-seq/$tag
 mkdir -p "$out"
 E=/data/ds4-env
-for p in long code json; do tr '\n' ' ' < $E/p-$p.txt | sed 's/  */ /g'; echo; done > "$out/input.txt"
+line() { cat "$@" | tr '\n' ' ' | sed 's/  */ /g'; echo; }
+{ line $E/p-long.txt; line $E/p-code.txt; line $E/p-translate.txt $E/p-json.txt; line $E/p-prose.txt; } > "$out/input.txt"
 case $mode in on) sc=1;; *) sc=0;; esac
 cd /data/ds4-d13
 exec 9>/data/ds4-bench/gpu.lock

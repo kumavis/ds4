@@ -11528,17 +11528,107 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
 }
 
-static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
+/* D17: checkpoints that long agent sessions actually hit.
+ *
+ * The stock rule stores a "continued" checkpoint only when the live position
+ * is an exact multiple of the (aligned) continued interval.  Agent turns are
+ * mostly prefilled tool output that jumps over those multiples, so a 100k
+ * session keeps few checkpoints and a restart restores tens of thousands of
+ * tokens too early.  With DS4_KV_TURN_CHECKPOINTS=1:
+ *   - at the end of every turn, store the whole live state when at least one
+ *     interval of tokens was added since this slot's last store;
+ *   - nothing during prefill: a V4.1 layer-major prefill cannot be staged
+ *     mid-chunk (measured: "session has no valid checkpoint to stage"), and
+ *     the end of the prompt would sit on the time-to-first-token path;
+ *   - no stores from the decode loop (the turn end covers the reply).
+ * Files, budget and eviction are unchanged: stores go through the same
+ * kvstore path with reason "continued".  Off by default. */
+enum { KVC_PREFILL_MID, KVC_PROMPT_DONE, KVC_DECODE };
+
+static bool kv_turn_checkpoints(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_KV_TURN_CHECKPOINTS");
+        on = v && v[0] && strcmp(v, "0") != 0;
+    }
+    return on == 1;
+}
+
+static int kv_cache_turn_step(const server *s) {
+    int step = s->kv.opt.continued_interval_tokens;
+    const int align = s->kv.opt.boundary_align_tokens;
+    if (step <= 0) return 0;
+    if (align > 0) {
+        step = ((step + align - 1) / align) * align;
+        if (step <= 0) step = align;
+    }
+    return step;
+}
+
+static int kv_cache_turn_min_tokens(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_KV_TURN_CHECKPOINT_MIN_TOKENS");
+        v = e && e[0] ? atoi(e) : 0;
+        if (v < 0) v = 0;
+    }
+    return v;
+}
+
+static int kv_cache_turn_target_step(server *s, server_slot *slot, int live_tokens, int step) {
+    if (!s || !slot || !s->kv.enabled) return 0;
+    if (step <= 0 || live_tokens < s->kv.opt.min_tokens) return 0;
+    if (live_tokens - slot->continued_last_store_tokens < step) return 0;
+    return live_tokens;
+}
+
+static int kv_cache_turn_target(server *s, server_slot *slot, int live_tokens) {
+    return kv_cache_turn_target_step(s, slot, live_tokens, kv_cache_turn_step(s));
+}
+
+static void kv_cache_maybe_store_continued_at(server *s, server_slot *slot, int where) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
-    const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
+    int target;
+    if (kv_turn_checkpoints()) {
+        /* Turn mode stores only at turn ends (kv_cache_store_turn_end): a
+         * V4.1 layer-major prefill has no stageable checkpoint mid-chunk. */
+        (void)where;
+        return;
+    } else {
+        target = kv_cache_slot_continued_target(s, slot, tokens->len);
+    }
     if (target == 0) return;
     if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued")) {
         (void)kc;
         kv_cache_slot_note_store(slot, target);
     }
+}
+
+static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
+    kv_cache_maybe_store_continued_at(s, slot, KVC_PROMPT_DONE);
+}
+
+/* D17: turn-end checkpoint (DS4_KV_TURN_CHECKPOINTS=1). Runs after the final
+ * response was sent, so it is off the client's time-to-first-token path. */
+static void kv_cache_store_turn_end(server *s, server_slot *slot) {
+    if (!kv_turn_checkpoints() || !s || !slot || !s->kv.enabled) return;
+    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    if (!tokens) return;
+    const int min_turn = kv_cache_turn_min_tokens();
+    const int target = kv_cache_turn_target_step(s, slot, tokens->len,
+                                                 min_turn > 0 ? min_turn : kv_cache_turn_step(s));
+    if (target == 0) return;
+    const double t0 = now_sec();
+    pthread_mutex_lock(&s->inference_mu);
+    kv_cache_store_current(s, slot, "continued");
+    pthread_mutex_unlock(&s->inference_mu);
+    kv_cache_slot_note_store(slot, target);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: kv cache turn checkpoint tokens=%d %.1f ms",
+               target, (now_sec() - t0) * 1000.0);
 }
 
 #ifdef DS4_SERVER_TEST
@@ -12902,7 +12992,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
-            kv_cache_maybe_store_continued(p->srv, p->slot);
+            kv_cache_maybe_store_continued_at(p->srv, p->slot,
+                current < p->prompt_tokens ? KVC_PREFILL_MID : KVC_PROMPT_DONE);
         }
         return;
     }
@@ -12943,7 +13034,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && p->slot && current > p->cached_tokens) {
-        kv_cache_maybe_store_continued(p->srv, p->slot);
+        kv_cache_maybe_store_continued_at(p->srv, p->slot,
+            current < p->prompt_tokens ? KVC_PREFILL_MID : KVC_PROMPT_DONE);
     }
 }
 
@@ -14135,7 +14227,7 @@ decode_again:
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+            if (!multimodal) kv_cache_maybe_store_continued_at(s, slot, KVC_DECODE);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -14949,6 +15041,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
     ds4_session_set_cancel(slot->session, NULL, NULL);
+    if (!job_cancelled(j) && !g_stop_requested) kv_cache_store_turn_end(s, slot);
 
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;

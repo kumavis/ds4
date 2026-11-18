@@ -1,4 +1,4 @@
-"""Compare two D19 session runs on matched turns. Use --overlap for an explicitly partial twin."""
+"""Compare raw D19 session evidence and timings for matched turns."""
 import argparse
 from hashlib import sha256
 import json
@@ -11,72 +11,135 @@ def require(ok, message):
         raise ValueError(message)
 
 
-def digest(tokens):
-    return sha256(",".join(tokens).encode()).hexdigest()[:16]
+def digest(values):
+    return sha256(",".join(values).encode()).hexdigest()[:16]
+
+
+def validate_turn(record, raw, transcript_turn, log, previous_end, log_size, dspark):
+    turn = record["turn"]
+    require(turn == raw["turn"] == transcript_turn["turn"], f"turn {turn}: turn ID")
+    require(raw["http_status"] == record["http_status"] == 200 and not raw["error"] and not record["error"],
+            f"turn {turn}: HTTP status or error")
+    require(raw["finish"] == record["finish"] and raw["finish"] in {"stop", "tool_calls", "length"},
+            f"turn {turn}: finish reason")
+
+    usage = raw["usage"]
+    prompt = usage["prompt_tokens"]
+    completion = usage["completion_tokens"]
+    require(prompt == record["prompt_tokens"] == transcript_turn["prompt_tokens"], f"turn {turn}: prompt usage")
+    require(completion == record["reply_tokens"] == transcript_turn["completion_tokens"] and completion > 0,
+            f"turn {turn}: completion usage")
+    require(prompt + completion == usage["total_tokens"] == record["context_after"], f"turn {turn}: total usage")
+    text_hash = sha256(transcript_turn["reply"].encode()).hexdigest()[:16]
+    require(text_hash == transcript_turn["reply_sha"] == raw["reply_sha"] == record["reply_sha"],
+            f"turn {turn}: visible reply digest")
+
+    start, end = raw["log_off"]
+    require(0 <= previous_end <= start < end <= log_size, f"turn {turn}: invalid/overlapping log offsets")
+    log.seek(start)
+    segment = log.read(end - start)
+    steps = re.findall(rb"D8_STEP\s+pos=(\d+)\s+tok=(\d+)\b", segment)
+    require(len(steps) == segment.count(b"D8_STEP ") == record["d8_steps"], f"turn {turn}: malformed D8 steps")
+    positions = [int(pos) for pos, _ in steps]
+    if dspark:
+        require(all(prompt <= pos < prompt + completion for pos in positions) and positions == sorted(set(positions)),
+                f"turn {turn}: invalid DSpark step positions")
+    else:
+        require(positions == list(range(prompt, prompt + completion)), f"turn {turn}: incomplete plain D8 positions")
+    token_hash = digest([token.decode() for _, token in steps]) if steps else None
+    require(token_hash == record["reply_tok_sha"], f"turn {turn}: raw D8 token digest")
+    return end, [(int(pos), int(token)) for pos, token in steps]
 
 
 def read(records, tag, runs):
     group = [row for row in records if row.get("tag") == tag]
-    totals = [row for row in group if row["kind"] == "scenario"]
-    require(len(totals) == 1, f"{tag}: missing/duplicate scenario")
-    total = totals[0]
-    turns = [row for row in group if row["kind"] == "turn"]
-    require(total["turns"] == len(turns) > 0 and len({r["turn"] for r in turns}) == len(turns), f"{tag}: count")
-    run = runs / Path(total["run_dir"]).name
-    raw = [json.loads(line) for line in (run/"turns.jsonl").read_text().splitlines()]
-    require(len(raw) == len(turns) and total["exit_code"] == 0 and not total["driver_exception"] and
-            total["ready"] and total["stop"]["result"] == "stopped" and
-            re.search(r"^EXIT=0 wall_s=\d+ driver_rc=0$", (run/"run.log").read_text(), re.M), f"{tag}: incomplete driver")
-    with (run/"server.log").open("rb") as log:
-        for r, t in zip(turns, raw):
-            require(r["turn"] == t["turn"] and r["reply_sha"] == t["reply_sha"] and r["http_status"] == 200 and not r["error"],
-                    f"{tag}: turn {r['turn']} HTTP/visible reply")
-            a,b = t["log_off"]
-            log.seek(a)
-            ids = re.findall(rb"D8_STEP [^\n]*?\btok=(\d+)", log.read(b-a))
-            require(r["d8_steps"] == len(ids) and (digest([x.decode() for x in ids]) if ids else None) == r["reply_tok_sha"],
-                    f"{tag}: turn {r['turn']} raw D8 token digest")
-    hashes = [r["reply_sha"] for r in turns]
-    require(total["reply_shas"] == hashes and total["replies_digest"] == digest(hashes), f"{tag}: reply summary digest")
-    require(total["max_context"] == max(r["context_after"] for r in turns), f"{tag}: fill")
-    require(total["avail_min_mb"] >= 12288 and 0 < total["nvme_max_c"] < 89, f"{tag}: telemetry")
-    require(len(total["steps"]) == 1, f"{tag}: expected one grow step")
-    return total, turns
+    summaries = [row for row in group if row["kind"] == "scenario"]
+    require(len(summaries) == 1, f"{tag}: missing/duplicate scenario")
+    summary = summaries[0]
+    turns = [row.copy() for row in group if row["kind"] == "turn"]
+    require(summary["turns"] == len(turns) > 0, f"{tag}: invalid count")
+    turn_ids = [turn["turn"] for turn in turns]
+    require(turn_ids == list(range(turn_ids[0], turn_ids[0] + len(turns))), f"{tag}: nonconsecutive turns")
+
+    directory = runs / Path(summary["run_dir"]).name
+    raw_turns = [json.loads(line) for line in (directory / "turns.jsonl").read_text().splitlines()]
+    driver = json.loads((directory / "driver.json").read_text())
+    stop = driver["stop"]
+    run_log = (directory / "run.log").read_text()
+    require(len(raw_turns) == len(turns) and summary["exit_code"] == 0 and not summary["driver_exception"],
+            f"{tag}: incomplete session records")
+    require(driver["ready"] and summary["ready"] and stop == summary["stop"] and stop["result"] == "stopped" and
+            stop["comm"] == "ds4-server" and stop["sigterm_ts"] and
+            re.search(r"^EXIT=0 wall_s=\d+ driver_rc=0$", run_log, re.M) and
+            f"sending one SIGTERM to {stop['pid']}" in run_log and "after SIGTERM" in run_log,
+            f"{tag}: clean stop unverified")
+    require(len(summary["steps"]) == 1 and summary["steps"] == driver["steps"], f"{tag}: driver step mismatch")
+    label = summary["steps"][0]["label"]
+    transcript = json.loads((directory / f"transcript-{label}.json").read_text())
+    transcript_turns = transcript["turns"]
+    require([t["turn"] for t in transcript_turns] == list(range(turn_ids[-1] + 1)), f"{tag}: transcript chronology")
+
+    server_log = directory / "server.log"
+    log_size = server_log.stat().st_size
+    previous_end = 0
+    with server_log.open("rb") as log:
+        for record, raw in zip(turns, raw_turns):
+            previous_end, record["raw_d8"] = validate_turn(record, raw, transcript_turns[record["turn"]], log, previous_end, log_size,
+                                         summary["dspark"])
+    hashes = [turn["reply_sha"] for turn in turns]
+    require(summary["reply_shas"] == hashes and summary["replies_digest"] == digest(hashes),
+            f"{tag}: scenario reply digest")
+    require(summary["max_context"] == max(turn["context_after"] for turn in turns), f"{tag}: maximum fill")
+    require(summary["avail_min_mb"] >= 12288 and 0 < summary["nvme_max_c"] < 89, f"{tag}: telemetry")
+    return summary, turns
+
+
+def arm_metrics(summary, turns, count):
+    matched = turns[:count]
+    tokens = sum(turn["reply_tokens"] for turn in matched)
+    steps = sum(turn["d8_steps"] for turn in matched)
+    seconds = sum(turn["decode_s"] for turn in matched)
+    return {
+        "turns": len(turns), "end": summary["steps"][0]["end"], "max_context": summary["max_context"],
+        "dynamic_cache_slots": summary["cache_slots"], "kv_disk_dir": summary["kv_disk_dir"],
+        "first_turn": matched[0]["turn"], "last_turn": matched[-1]["turn"], "matched_reply_tokens": tokens,
+        "matched_d8_steps": steps, "token_id_coverage": "complete" if steps == tokens else "partial",
+        "decode_s": round(seconds, 3), "decode_tps": tokens / seconds,
+        "ttft_sum_s": round(sum(turn["ttft_s"] for turn in matched), 3),
+        "memory_min_mib": summary["avail_min_mb"], "nvme_max_c": summary["nvme_max_c"],
+        "first_kv_hit_tokens": turns[0]["kv_hit_tokens"],
+    }
 
 
 def compare(records, runs, left, right, overlap):
-    sa, a = read(records, left, runs)
-    sb, b = read(records, right, runs)
-    for k in ("payload_sha256", "dspark", "ctx", "quant", "scenario"):
-        require(sa[k] == sb[k], f"unmatched setup: {k}")
-    require(all(s["steps"][0]["end"] == "target" for s in (sa,sb)) or overlap, "partial session; request --overlap explicitly")
-    require(len(a) == len(b) or overlap, "unequal lengths")
-    n = min(len(a),len(b))
-    for x,y in zip(a[:n],b[:n]):
-        for k in ("turn", "prompt_tokens", "event", "reply_tokens", "reply_sha", "reply_tok_sha",
-                  "d8_steps", "dspark_rounds", "dspark_accepted"):
-            require(x[k] == y[k], f"turn {x['turn']}: {k} differs; matched timing would be confounded")
-    out = {"matched_turns": n, "dspark":sa["dspark"]}
-    for tag, s, rows in ((left,sa,a),(right,sb,b)):
-        matched = rows[:n]
-        tok = sum(t["reply_tokens"] for t in matched)
-        sec = sum(t["decode_s"] for t in matched)
-        out[tag] = dict(turns=len(rows), end=s["steps"][0]["end"], max_context=s["max_context"],
-                        dynamic_cache_slots=s["cache_slots"], kv_disk_dir=s["kv_disk_dir"],
-                        first_turn=matched[0]["turn"], last_turn=matched[-1]["turn"], matched_reply_tokens=tok,
-                        matched_d8_steps=sum(t["d8_steps"] for t in matched), decode_s=round(sec,3), decode_tps=tok/sec,
-                        ttft_sum_s=round(sum(t["ttft_s"] for t in matched),3), memory_min_mib=s["avail_min_mb"],
-                        nvme_max_c=s["nvme_max_c"], first_kv_hit_tokens=rows[0]["kv_hit_tokens"])
-    out["decode_gain_pct"] = 100*(out[right]["decode_tps"]/out[left]["decode_tps"]-1)
-    print(json.dumps(out, indent=2))
+    left_summary, left_turns = read(records, left, runs)
+    right_summary, right_turns = read(records, right, runs)
+    for key in ("payload_sha256", "dspark", "ctx", "quant", "scenario"):
+        require(left_summary[key] == right_summary[key], f"unmatched setup: {key}")
+    allowed = {"target", "mem-guard"} if overlap else {"target"}
+    for summary in (left_summary, right_summary):
+        require(summary["steps"][0]["end"] in allowed, f"unexpected stop: {summary['steps'][0]['end']}")
+    require(len(left_turns) == len(right_turns) or overlap, "unequal session lengths")
+    count = min(len(left_turns), len(right_turns))
+    for first, second in zip(left_turns, right_turns):
+        for key in ("turn", "prompt_tokens", "event", "reply_tokens", "reply_sha", "reply_tok_sha",
+                    "raw_d8", "d8_steps", "dspark_rounds", "dspark_accepted"):
+            require(first[key] == second[key], f"turn {first['turn']}: {key} differs")
+    output = {
+        "matched_turns": count, "dspark": left_summary["dspark"],
+        left: arm_metrics(left_summary, left_turns, count), right: arm_metrics(right_summary, right_turns, count),
+    }
+    output["decode_gain_pct"] = 100 * (output[right]["decode_tps"] / output[left]["decode_tps"] - 1)
+    print(json.dumps(output, indent=2))
 
 
 if __name__ == "__main__":
-    p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument("sessions",type=Path)
-    p.add_argument("runs",type=Path)
-    p.add_argument("left")
-    p.add_argument("right")
-    p.add_argument("--overlap",action="store_true")
-    a=p.parse_args()
-    compare([json.loads(l) for l in a.sessions.read_text().splitlines()],a.runs,a.left,a.right,a.overlap)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("sessions", type=Path)
+    parser.add_argument("runs", type=Path)
+    parser.add_argument("left")
+    parser.add_argument("right")
+    parser.add_argument("--overlap", action="store_true", help="allow only target and memory-guard terminations")
+    args = parser.parse_args()
+    records = [json.loads(line) for line in args.sessions.read_text().splitlines()]
+    compare(records, args.runs, args.left, args.right, args.overlap)

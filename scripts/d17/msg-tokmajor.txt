@@ -1,0 +1,8 @@
+feat(d17b): token-major threshold as a setting (DS4_ROCM_V41_TOKEN_MAJOR_MAX, unset = stock 256)
+
+On ROCm an append of fewer than N rows is prefilled token by token on the
+warm decode cache instead of a layer sweep. Unset keeps the built-in 256;
+N = 1 always sweeps. Token-major uses the decode kernels, so changing N can
+change outputs (measured per turn against the stock twin).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

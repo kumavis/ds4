@@ -1,0 +1,11 @@
+feat(d17b): partial staging reclaim for union sweeps (DS4_ROCM_STREAM_STAGING_RECLAIM_UNION, off by default)
+
+With the union sweep, the staging stays lent and each layer takes back only
+its routed expert positions in its parity half: entries living there are
+evicted with D13's per-slot helper (cuda_stream_resident_evict_at), the
+slots are held off the free list until the sweep ends, and a violation
+counter (must stay 0) checks that no needed slot is still an entry's buffer
+or allocatable. Refused (full D13 reclaim) when the D5 shelf is active.
+Whole-layer sweeps keep D13's full reclaim; switch off behaves as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

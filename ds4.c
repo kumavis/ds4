@@ -44652,6 +44652,18 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
     minimum = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SMALL_PREFILL") ? 32u : 256u;
 #endif
+#ifdef DS4_ROCM_BUILD
+    {
+        /* D17: measured token-major / sweep crossover (see D17.md). */
+        static int tm = -1;
+        if (tm < 0) {
+            const char *e = getenv("DS4_ROCM_V41_TOKEN_MAJOR_MAX");
+            tm = e && e[0] ? atoi(e) : 0;
+            if (tm < 0) tm = 0;
+        }
+        if (tm > 0 && g->tp_world != 2) minimum = (uint32_t)tm;
+    }
+#endif
     /* Resident appends do not pay for an SSD layer sweep. In particular,
      * the server's 128-token mixed quantum must not become scalar prefill. */
     if (!g->streaming && g->tp_world == 1) minimum = 8u;

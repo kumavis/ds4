@@ -455,6 +455,71 @@ extern "C" void ds4_rocm_perf_counters(uint64_t *sel_slots,
     if (read_jobs) *read_jobs = g_stream_read_profile_jobs;
 }
 
+/* ---- D12: expert-cache access trace (measurement only) -----------------
+ * DS4_D12_CACHE_TRACE=<path> appends, in the order the resident cache sees
+ * them, one short text line per event (fully buffered, 8 MiB, flushed at
+ * exit):
+ *   M <kind> <pos> <rows> <budget> <slots> <resident> <free>   phase mark
+ *       from ds4.c (S = single-token step, V = batched verify round,
+ *       P = layer-sweep prefill); slots = slab slots allocated so far
+ *   A <src> <map> <layer> <n_tokens> <n_sel> <ids...>   one cache call;
+ *       src s = single-token selected load, b = batched selected load,
+ *       d = seed from layer selection, e = seed of a priority list;
+ *       ids = the call's protected set (row-major, at most 384 ids)
+ *   h <layer> <expert>  lookup hit (LRU clock bump)
+ *   m <layer> <expert>  lookup miss (the x lines that follow are the
+ *                       evictions it caused; then it is inserted)
+ *   t <layer> <expert>  LRU clock bump without a lookup
+ *   x <layer> <expert>  eviction
+ *   F                   whole resident cache released
+ * Unset: one cached branch per call site; nothing else changes. */
+static FILE *g_d12_file;
+static int g_d12_state = -1;
+static const void *g_d12_maps[4];
+
+static void cuda_d12_close(void) {
+    if (g_d12_file) fflush(g_d12_file);
+}
+
+static int cuda_d12_on(void) {
+    if (g_d12_state >= 0) return g_d12_state;
+    g_d12_state = 0;
+    const char *path = getenv("DS4_D12_CACHE_TRACE");
+    if (path && path[0] && strcmp(path, "0") != 0) {
+        g_d12_file = fopen(path, "w");
+        if (g_d12_file) {
+            setvbuf(g_d12_file, NULL, _IOFBF, 8u << 20);
+            atexit(cuda_d12_close);
+            g_d12_state = 1;
+        } else {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "D12 trace: cannot open %s\n", path);
+        }
+    }
+    return g_d12_state;
+}
+
+static int cuda_d12_map(const void *model_map) {
+    for (int i = 0; i < 4; i++) {
+        if (g_d12_maps[i] == model_map) return i;
+        if (!g_d12_maps[i]) { g_d12_maps[i] = model_map; return i; }
+    }
+    return 9;
+}
+
+static void cuda_d12_call(char src, const void *model_map, uint32_t layer,
+                          uint32_t n_tokens, uint32_t n_sel, const int32_t *ids,
+                          uint32_t n_ids) {
+    fprintf(g_d12_file, "A %c %d %u %u %u", src, cuda_d12_map(model_map), layer,
+            n_tokens, n_sel);
+    if (n_ids > 384u) n_ids = 384u;
+    for (uint32_t i = 0; ids && i < n_ids; i++) fprintf(g_d12_file, " %d", ids[i]);
+    fputc('\n', g_d12_file);
+}
+
+static void cuda_d12_ev(char kind, uint32_t layer, int32_t expert) {
+    fprintf(g_d12_file, "%c %u %d\n", kind, layer, expert);
+}
+
 static int cuda_stream_cache_layer_stats_on(void) {
     if (g_stream_cache_layer_stats_enabled < 0) {
         g_stream_cache_layer_stats_enabled =
@@ -761,6 +826,7 @@ static void cuda_stream_resident_cache_release(void) {
     /* D5: adoption swaps buffers between the shelf and the slot pool; give
      * the shelf its own buffers back before the slabs go away. */
     cuda_d5_shelf_reset();
+    if (cuda_d12_on()) fputs("F\n", g_d12_file);
     for (cuda_stream_resident_expert &e : g_stream_resident_experts) {
         if (e.base && !e.pooled) (void)cudaFree(e.base);
     }
@@ -1608,6 +1674,7 @@ static int cuda_stream_resident_evict_at(size_t idx) {
     cuda_stream_resident_expert &e = g_stream_resident_experts[idx];
     const cuda_stream_resident_key evicted_key =
         cuda_stream_resident_entry_key(e);
+    if (cuda_d12_on()) cuda_d12_ev('x', e.layer, e.expert);
     if (cuda_stream_cache_stats_on()) {
         g_stream_cache_stats.evictions++;
         g_stream_cache_stats.evict_bytes += e.bytes;
@@ -4245,6 +4312,8 @@ static int cuda_stream_resident_seed_experts(
     uint32_t read_job_count = 0;
     int ok = 1;
     uint32_t loaded = 0;
+    const int d12 = cuda_d12_on();
+    if (d12) cuda_d12_call('e', model_map, layer, 1u, chosen_count, protected_ids, chosen_count);
 
     for (uint32_t ri = 0; ok && ri < chosen_count; ri++) {
         const uint32_t chosen_i = chosen_indices[chosen_count - 1u - ri];
@@ -4257,6 +4326,7 @@ static int cuda_stream_resident_seed_experts(
                                             down_offset,
                                             gate_expert_bytes,
                                             down_expert_bytes);
+        if (d12) cuda_d12_ev(idx >= 0 ? 'h' : 'm', layer, expert_i);
         if (idx >= 0) {
             g_stream_resident_experts[(size_t)idx].last_used =
                 ++g_stream_resident_clock;
@@ -4429,6 +4499,7 @@ static int cuda_stream_selected_compact_mask(
         cuda_stream_resident_expert &entry =
             g_stream_resident_experts[(size_t)idx];
         entry.last_used = ++g_stream_resident_clock;
+        if (cuda_d12_on()) cuda_d12_ev('t', layer, selected_ids[i]);
         err = cudaMemcpyAsync(g_stream_selected_cache.gate +
                                   (uint64_t)i * gate_expert_bytes,
                               entry.gate,
@@ -4506,6 +4577,7 @@ static int cuda_stream_selected_prepare_ptrs(
         cuda_stream_resident_expert &entry =
             g_stream_resident_experts[(size_t)idx];
         entry.last_used = ++g_stream_resident_clock;
+        if (cuda_d12_on()) cuda_d12_ev('t', layer, selected_ids[i]);
         gate_ptrs[i] = entry.gate;
         up_ptrs[i] = entry.up;
         down_ptrs[i] = entry.down;
@@ -4689,6 +4761,8 @@ static int cuda_stream_batch_selected_prepare_from_host(
     int jobs_flushed = 0;
     uint32_t unique_job_local[DS4_ROCM_D2_MAX_PAIRS];
     for (uint32_t u = 0; u < DS4_ROCM_D2_MAX_PAIRS; u++) unique_job_local[u] = UINT32_MAX;
+    const int d12 = ok && cuda_d12_on();
+    if (d12) cuda_d12_call('b', model_map, layer, n_tokens, n_selected, ids, (uint32_t)n_ids64);
 
     for (uint32_t u = 0; ok && u < unique_count; u++) {
         const int32_t expert_i = unique_ids[u];
@@ -4722,6 +4796,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
                                             gate_expert_bytes,
                                             down_expert_bytes);
         const int was_resident = idx >= 0;
+        if (d12) cuda_d12_ev(was_resident ? 'h' : 'm', layer, expert_i);
         if (stats_on) {
             if (was_resident) {
                 g_stream_cache_stats.batch_hits++;
@@ -5422,6 +5497,8 @@ static int cuda_stream_layer_expert_cache_seed_selected(
     if (ok && unique_count != 0 && !cuda_stream_selected_ensure_stream()) {
         ok = 0;
     }
+    const int d12 = ok && cuda_d12_on();
+    if (d12) cuda_d12_call('d', model_map, layer, n_seed_tokens, n_selected, unique, unique_count);
 
     for (uint32_t u = 0; ok && u < unique_count; u++) {
         const int32_t expert_i32 = unique[u];
@@ -5433,6 +5510,7 @@ static int cuda_stream_layer_expert_cache_seed_selected(
                                             down_offset,
                                             gate_expert_bytes,
                                             down_expert_bytes);
+        if (d12) cuda_d12_ev(idx >= 0 ? 'h' : 'm', layer, expert_i32);
         if (idx >= 0) {
             g_stream_resident_experts[(size_t)idx].last_used =
                 ++g_stream_resident_clock;
@@ -5943,6 +6021,14 @@ extern "C" void ds4_gpu_d5_trace_write(const char *line) {
     }
 }
 
+/* D12 phase mark (see the D12 trace comment near the top of this file). */
+extern "C" void ds4_gpu_d12_trace_mark(char kind, uint32_t pos, uint32_t rows) {
+    if (!cuda_d12_on()) return;
+    fprintf(g_d12_file, "M %c %u %u %u %u %zu %zu\n", kind, pos, rows,
+            g_stream_expert_cache_budget, g_stream_expert_slot_count,
+            g_stream_resident_experts.size(), g_stream_expert_free_slots.size());
+}
+
 static void cuda_d5_trace_snapshot(void) {
     std::vector<size_t> order(g_stream_resident_experts.size());
     for (size_t i = 0; i < order.size(); i++) order[i] = i;
@@ -6040,6 +6126,8 @@ static int cuda_stream_selected_load(
         g_d5_trace_snapshot_done = 1;
         cuda_d5_trace_snapshot();
     }
+    const int d12 = cuda_d12_on();
+    if (d12) cuda_d12_call('s', model_map, layer, 1u, n_selected, selected_ids, n_selected);
 
     for (uint32_t i = 0; i < n_selected; i++) {
         if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
@@ -6088,6 +6176,7 @@ static int cuda_stream_selected_load(
                                             down_offset,
                                             gate_expert_bytes,
                                             down_expert_bytes);
+        if (d12) cuda_d12_ev(idx >= 0 ? 'h' : 'm', layer, selected_ids[i]);
         if (stats_on) {
             if (idx >= 0) {
                 g_stream_cache_stats.selected_hits++;

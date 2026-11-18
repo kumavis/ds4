@@ -44228,6 +44228,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     uint32_t ids[2][DS4_ENGRAM_COLS];
+#ifdef DS4_ROCM_BUILD
+    if (g->streaming) ds4_gpu_d12_trace_mark('S', g->pos, 1u);
+#endif
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
     const bool overlap_engram = g->engram_reader && !ds41_image_at(g, g->pos) &&
@@ -44878,6 +44881,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
+#ifdef DS4_ROCM_BUILD
+    if (g->streaming) ds4_gpu_d12_trace_mark('P', g->pos, total_count);
+#endif
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
     const bool stage_profile = getenv("DS4_METAL_V41_STAGE_PROFILE") != NULL;
     const bool batch_moe = !getenv("DS4_METAL_DISABLE_V41_BATCH_MOE");
@@ -45360,6 +45366,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
     if (!g) return false;
     const uint32_t rows = (uint32_t)count;
+#ifdef DS4_ROCM_BUILD
+    if (g->streaming) ds4_gpu_d12_trace_mark('V', g->pos, rows);
+#endif
     const bool prefill_only = prefill_rows == rows && !g->verify_prefix;
 #ifdef DS4_ROCM_BUILD
     static int dspark_profile_left = -1;

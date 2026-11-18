@@ -486,6 +486,12 @@ int ds4_gpu_selected_readback_finish(int32_t *ids, uint32_t n_ids);
  * early-router probe in ds4.c uses it).  Off (unset) costs one branch. */
 int ds4_gpu_d5_trace_on(void);
 void ds4_gpu_d5_trace_write(const char *line);
+/* D12 (measurement only): DS4_D12_CACHE_TRACE=<path> logs every resident
+ * expert-cache lookup, LRU bump and eviction in order (format in
+ * rocm/ds4_rocm_runtime.cuh).  ds4_gpu_d12_trace_mark writes a phase mark:
+ * kind 'S' single-token step, 'V' batched verify round, 'P' layer-sweep
+ * prefill, at position pos with rows rows.  Off (unset): one cached branch. */
+void ds4_gpu_d12_trace_mark(char kind, uint32_t pos, uint32_t rows);
 /* D5 stage 2: speculative next-layer expert prefetch (ROCm SSD streaming,
  * single-token decode).  ds4_gpu_d5_prefetch_mode: 0 = off (default; nothing
  * of D5 runs), 1 = predictor p1 (DS4_ROCM_D5_PREFETCH=1|p1).  _k / _depth:

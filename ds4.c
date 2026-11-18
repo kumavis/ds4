@@ -80442,10 +80442,10 @@ static int ds4_session_sync_body(ds4_session *s, const ds4_tokens *prompt, char 
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
 #if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     const uint32_t pos0 = s && s->checkpoint_valid ? (uint32_t)s->checkpoint.len : 0u;
-    ds4_gpu_d12_trace_mark(Q, pos0, prompt && prompt->len > 0 ? (uint32_t)prompt->len : 0u);
+    ds4_gpu_d12_trace_mark('Q', pos0, prompt && prompt->len > 0 ? (uint32_t)prompt->len : 0u);
     const int rc = ds4_session_sync_body(s, prompt, err, errlen);
     const uint32_t pos1 = s && s->checkpoint_valid ? (uint32_t)s->checkpoint.len : 0u;
-    ds4_gpu_d12_trace_mark(q, pos1, (uint32_t)rc);
+    ds4_gpu_d12_trace_mark('q', pos1, (uint32_t)rc);
     return rc;
 #else
     return ds4_session_sync_body(s, prompt, err, errlen);

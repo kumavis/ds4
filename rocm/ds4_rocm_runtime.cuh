@@ -3922,88 +3922,6 @@ static int cuda_stream_staging_reclaim(void) {
     return 1;
 }
 
-/* D17: partial reclaim for union-loading sweeps (see D17.md).  The staging
- * stays lent; before each union layer load only that layer's routed expert
- * positions in its parity half are taken back.  Runs on the graph thread at
- * the same quiesced points as D13's reclaim (no loader, no pending selected
- * load).  Uses only D13's per-slot eviction helper and the free list. */
-static int g_stream_staging_partial;
-static std::vector<char *> g_stream_staging_held;
-static uint64_t g_stream_staging_partial_evicted, g_stream_staging_partial_held,
-    g_stream_staging_partial_violations, g_stream_staging_partial_lent_resident0;
-
-static int cuda_stream_staging_union_begin(void) {
-    if (!g_stream_staging_lent || g_stream_staging_partial) return 0;
-    if (g_d5_shelf_state == 1) return 0; /* D5 shelf may hold staging buffers: full reclaim */
-    if (g_stream_selected_pending.active || g_stream_batch_selected_pending.active) return 0;
-    if (!cuda_stream_resident_reclaim_wait("D17 partial staging reclaim")) return 0;
-    uint64_t lent_resident = 0;
-    for (size_t i = 0; i < g_stream_resident_experts.size(); i++) {
-        const cuda_stream_resident_expert &e = g_stream_resident_experts[i];
-        if (e.pooled && cuda_stream_staging_contains(e.base)) lent_resident++;
-    }
-    g_stream_staging_held.clear();
-    g_stream_staging_partial_evicted = 0;
-    g_stream_staging_partial_held = 0;
-    g_stream_staging_partial_violations = 0;
-    g_stream_staging_partial_lent_resident0 = lent_resident;
-    g_stream_staging_partial = 1;
-    return 1;
-}
-
-static int cuda_stream_staging_reclaim_slots(uint32_t parity, const uint64_t *mask) {
-    if (!g_stream_staging_partial || parity > 1u || !mask) return 0;
-    const cuda_stream_layer_expert_cache &c = g_stream_layer_expert_cache[parity];
-    const uint64_t slot_bytes = g_stream_expert_slot_bytes;
-    if (!c.base || !slot_bytes || c.n_total_expert != 384u) return 0;
-    auto wanted = [&](const char *p) -> bool {
-        if (p < c.base || p >= c.base + c.capacity) return false;
-        const uint64_t off = (uint64_t)(p - c.base);
-        if (off % slot_bytes) return false;
-        const uint64_t e = off / slot_bytes;
-        return e < 384u && ((mask[e / 64u] >> (e % 64u)) & 1u);
-    };
-    /* Evict entries living in a needed slot (walk down as D13 does). */
-    for (size_t i = g_stream_resident_experts.size(); i-- > 0;) {
-        const cuda_stream_resident_expert &e = g_stream_resident_experts[i];
-        if (!e.pooled || !wanted(e.base)) continue;
-        if (!cuda_stream_resident_evict_at(i)) return 0;
-        g_stream_staging_partial_evicted++;
-    }
-    /* Hold the needed slots back from the free list until the sweep ends. */
-    size_t kept = 0;
-    for (size_t j = 0; j < g_stream_expert_free_slots.size(); j++) {
-        char *slot = g_stream_expert_free_slots[j];
-        if (wanted(slot)) {
-            g_stream_staging_held.push_back(slot);
-            g_stream_staging_partial_held++;
-        } else {
-            g_stream_expert_free_slots[kept++] = slot;
-        }
-    }
-    g_stream_expert_free_slots.resize(kept);
-    /* Check: no needed slot may still be an entry's buffer or allocatable. */
-    for (size_t i = 0; i < g_stream_resident_experts.size(); i++)
-        if (wanted(g_stream_resident_experts[i].base)) g_stream_staging_partial_violations++;
-    for (size_t j = 0; j < g_stream_expert_free_slots.size(); j++)
-        if (wanted(g_stream_expert_free_slots[j])) g_stream_staging_partial_violations++;
-    return g_stream_staging_partial_violations == 0;
-}
-
-static int cuda_stream_staging_union_end(void) {
-    if (!g_stream_staging_partial) return 1;
-    /* Held slots are free again; a slot held for two layers is listed once
-     * per hold, so put each address back only once. */
-    std::sort(g_stream_staging_held.begin(), g_stream_staging_held.end());
-    g_stream_staging_held.erase(std::unique(g_stream_staging_held.begin(), g_stream_staging_held.end()),
-                                g_stream_staging_held.end());
-    for (char *slot : g_stream_staging_held) g_stream_expert_free_slots.push_back(slot);
-    g_stream_staging_held.clear();
-    for (uint32_t i = 0; i < 2u; i++) g_stream_layer_expert_cache[i].active = 0;
-    g_stream_staging_partial = 0;
-    return 1;
-}
-
 /* The engine joins its full-layer loader before entering this boundary. */
 static int cuda_stream_expert_cache_quiesce(void) {
     pthread_mutex_lock(&g_stream_read_mutex);
@@ -4291,7 +4209,7 @@ static int cuda_stream_v41_prepare_layer(const ds4_gpu_stream_expert_table *t,
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
     uint64_t total = 0;
-    if (!g_ssd_streaming_mode || (g_stream_staging_lent && !(want && g_stream_staging_partial)) ||
+    if (!g_ssd_streaming_mode || g_stream_staging_lent ||
         !cuda_stream_layer_table_bytes(t, &total) ||
         t->n_total_expert != 384u || t->layer >= 40u || g_model_fd < 0 ||
         g_model_fd_host_base != t->model_map ||

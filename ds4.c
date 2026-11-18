@@ -43612,26 +43612,10 @@ static struct {
     const ds4_model *m;
     uint64_t sweeps, layers, union_experts, read_experts;
     double load_ms, sync_ms, sel_ms, prep_ms, read_ms;
-    bool partial;   /* D17: staging still lent, union slots reclaimed per layer */
 } g_ds41_union;
-
-static bool ds41_union_partial_reclaim_enabled(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("DS4_ROCM_STREAM_STAGING_RECLAIM_UNION");
-        v = e && e[0] && strcmp(e, "0") != 0;
-    }
-    return v == 1;
-}
 
 static bool ds41_stream_sweep_start_union(void) {
     if (!ds4_gpu_stream_expert_cache_quiesce()) return false;
-    g_ds41_union.partial = false;
-    if (ds41_union_partial_reclaim_enabled() && ds4_gpu_stream_expert_cache_staging_lent() &&
-        ds4_gpu_stream_expert_cache_staging_union_begin()) {
-        g_ds41_union.partial = true;
-        return true;
-    }
     if (ds4_gpu_stream_expert_cache_staging_lent() &&
         !ds4_gpu_stream_expert_cache_staging_reclaim()) {
         fprintf(stderr, "ds4: V4.1 could not take the lent staging back for a layer sweep\n");
@@ -43661,10 +43645,6 @@ static bool ds41_union_after_route(ds41_gpu_graph *g, const ds4_layer_weights *l
     ds4_gpu_stream_expert_table table;
     ds4_gpu_dsv41_stream_layer_plan plan;
     const double t_sel = now_sec();
-    if (g_ds41_union.partial && !ds4_gpu_stream_expert_cache_staging_reclaim_slots(il & 1u, want)) {
-        fprintf(stderr, "ds4: V4.1 union sweep: partial staging reclaim failed at layer %u\n", il);
-        return false;
-    }
     if (!ds41_stream_table(g_ds41_union.m, l, il, &table) ||
         !ds4_gpu_dsv41_stream_prepare_layer_masked(&table, want, &plan)) return false;
     const double t_prep = now_sec();
@@ -45529,15 +45509,6 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #ifdef DS4_ROCM_BUILD
     if (g->streaming && !ds41_stream_sweep_finish(&prepare)) ok = false;
     if (union_sweep) {
-        uint64_t pst[4] = {0, 0, 0, 0};
-        if (g_ds41_union.partial) {
-            if (!ds4_gpu_stream_expert_cache_staging_union_end(pst)) ok = false;
-            fprintf(stderr, "ds4: V4.1 union sweep partial reclaim lent_resident=%llu evicted=%llu "
-                    "held=%llu violations=%llu\n", (unsigned long long)pst[0],
-                    (unsigned long long)pst[1], (unsigned long long)pst[2], (unsigned long long)pst[3]);
-            if (pst[3]) ok = false;
-            g_ds41_union.partial = false;
-        }
         g_ds41_union.active = false;
         g_ds41_union.sweeps++;
         fprintf(stderr, "ds4: V4.1 union sweep rows=%u layers=%llu union_experts=%llu "

@@ -466,6 +466,43 @@ def run_resume(rec, payload, ctx, budget_s, step_label, src_dir, src_label, at, 
     return reason
 
 
+def probe_text(payload, n_tokens, k):
+    """Deterministic synthetic tool output of ~n_tokens (est chars/3.1), cut from
+    payload session 3's file reads (not used by the other steps)."""
+    src = "\n".join(e["text"] for e in payload["sessions"][3]["events"] if "read_file" in e["items"])
+    want = int(n_tokens * 3.1)
+    start = (k * 7919) % max(1, len(src) - want - 1)
+    return (f'<tool_result name="read_file" call_id="probe_{k:03d}">\n' + src[start:start + want]
+            + "\n</tool_result>\nReply with one short sentence.")
+
+
+def run_probe(rec, payload, ctx, budget_s, step_label, src_dir, src_label, sizes, max_tokens, norm=True):
+    """Restore a saved session (its full history, as grow from= does), send one
+    small warm-up message (so the restore is not timed with a probe), then one
+    synthetic append per size, each answered with at most max_tokens tokens.
+    The same sequence under different server settings gives TTFT by append
+    size at the same fill and cache history."""
+    f = nz if norm else (lambda s: s)
+    T = json.load(open(os.path.join(src_dir, f"transcript-{src_label}.json")))
+    messages = [{"role": "system", "content": f(payload["system"])}]
+    for t in T["turns"]:
+        messages += [{"role": "user", "content": f(t["user"])}, {"role": "assistant", "content": f(t["reply"])}]
+    plan = [("warm", 24)] + [("probe", n) for n in sizes]
+    for k, (kind, n) in enumerate(plan):
+        g = guard(rec, ctx, budget_s, None, 0, 0, 1 << 30)
+        if g:
+            say(f"{step_label}: ended ({g})")
+            return g
+        messages.append({"role": "user", "content": probe_text(payload, n, k)})
+        r, row = rec.turn(step_label, 0, k, None, messages, max_tokens,
+                          {"probe_kind": kind, "probe_size_est": n, "norm": norm})
+        if r.error or not r.usage:
+            return "error"
+        messages.append({"role": "assistant", "content": r.text})
+    say(f"{step_label}: ended (done)")
+    return "done"
+
+
 def run_multi(rec, payload, ctx, budget_s, step_label, n, target, stagger_s, max_turns):
     reasons = {}
     # Lock-time policy: with batched sessions on this backend a second session's
@@ -520,6 +557,15 @@ def cmd_run(a):
         cmdline = open(f"/proc/{read_pid(pid_file)}/cmdline", "rb").read().split(b"\0")
     except OSError:
         cmdline = []
+    # D17 part B: the partial staging reclaim (DS4_ROCM_STREAM_STAGING_RECLAIM_UNION)
+    # maps union experts to lent slots wrongly (planar staging against
+    # contiguous slots) and corrupted live cache entries in d17-b5-grow-union-partial;
+    # no run may send requests with it while this flag file exists.
+    if os.path.exists("/data/ds4-bench/d17-skip-reclaim-union") and \
+            os.environ.get("DS4_ROCM_STREAM_STAGING_RECLAIM_UNION", "0") not in ("", "0"):
+        say("all steps skipped by policy: partial staging reclaim is withdrawn (see the flag file)")
+        status["steps"].append({"spec": "all", "label": "all", "end": "skipped-by-policy", "s": 0})
+        a.step = []
     if os.path.exists("/data/ds4-bench/d14-skip-pc8192") and b"--prefill-chunk" in cmdline \
             and cmdline[cmdline.index(b"--prefill-chunk") + 1] == b"8192":
         say("all steps skipped by policy: --prefill-chunk is ignored on V4.1 ROCm (see the flag file)")
@@ -537,6 +583,10 @@ def cmd_run(a):
             elif kind == "resume":
                 why = run_resume(rec, payload, a.ctx, budget, label, kv["from"], kv.get("src_label", "grow"),
                                  kv["at"], int(kv.get("turns", 1)), kv.get("salt") == "1", kv.get("norm", "1") == "1")
+            elif kind == "probe":
+                why = run_probe(rec, payload, a.ctx, budget, label, kv["from"], kv.get("src_label", "grow"),
+                                [int(x) for x in kv["sizes"].split(",")], int(kv.get("max", 16)),
+                                kv.get("norm", "1") == "1")
             elif kind == "multi":
                 why = run_multi(rec, payload, a.ctx, budget, label, int(kv["n"]), int(kv["target"]),
                                 float(kv.get("stagger_s", 0)), int(kv.get("max_turns", 0)))
@@ -927,6 +977,7 @@ def cmd_finalize(a):
             "resume_src_turn": t.get("resume_src_turn"), "resume_src_reply_sha": t.get("resume_src_reply_sha"),
             "resume_match": (t.get("reply_sha") == t.get("resume_src_reply_sha")) if t.get("resume_src_reply_sha") else None,
             "salt": t.get("salt"), "norm": t.get("norm"), "est_tokens": t.get("est_tokens"),
+            "probe_kind": t.get("probe_kind"), "probe_size_est": t.get("probe_size_est"),
             "resume_identical_tokens": res_cmp and res_cmp["identical"], "resume_compared_tokens": res_cmp and res_cmp["compared"],
             "twin_identical_tokens": twin_cmp and twin_cmp["identical"], "twin_compared_tokens": twin_cmp and twin_cmp["compared"],
             "twin_reply_match": twin_cmp and twin_cmp["reply_match"],

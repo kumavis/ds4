@@ -202,6 +202,20 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 }
 
+/* D19: number of experts of this table's layer held in the dynamic cache
+ * (read-only scan; used by the cold-only end-of-sweep refill). */
+extern "C" uint32_t ds4_gpu_stream_expert_cache_layer_resident(
+        const ds4_gpu_stream_expert_table *table) {
+    if (!table) return 0;
+    uint32_t n = 0;
+    for (const cuda_stream_resident_expert &e : g_stream_resident_experts) {
+        if (e.model_map == table->model_map && e.layer == table->layer &&
+            e.gate_offset == table->gate_offset && e.up_offset == table->up_offset &&
+            e.down_offset == table->down_offset) n++;
+    }
+    return n;
+}
+
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
     cuda_stream_resident_cache_release();
 }

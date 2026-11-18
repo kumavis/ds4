@@ -491,6 +491,8 @@ void ds4_gpu_d5_trace_write(const char *line);
  * rocm/ds4_rocm_runtime.cuh).  ds4_gpu_d12_trace_mark writes a phase mark:
  * kind 'S' single-token step, 'V' batched verify round, 'P' layer-sweep
  * prefill, at position pos with rows rows.  Off (unset): one cached branch. */
+/* D19: experts of the table's layer currently in the dynamic expert cache. */
+uint32_t ds4_gpu_stream_expert_cache_layer_resident(const ds4_gpu_stream_expert_table *table);
 void ds4_gpu_d12_trace_mark(char kind, uint32_t pos, uint32_t rows);
 /* D5 stage 2: speculative next-layer expert prefetch (ROCm SSD streaming,
  * single-token decode).  ds4_gpu_d5_prefetch_mode: 0 = off (default; nothing

@@ -44499,6 +44499,25 @@ static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
     if (target > DS4_N_EXPERT) target = DS4_N_EXPERT;
     if (!target) return true;
 #ifdef DS4_ROCM_BUILD
+    /* D19: DS4_ROCM_STREAM_SEED_POLICY=always (default, as before) | cold.
+     * With cold, a layer that already holds at least half of its share
+     * (target / 2) of the dynamic cache is not refilled: in an agent session
+     * the refill evicts decode's working set (D18/D19).  A cold cache (first
+     * prompt, after a restart) is refilled exactly as before. */
+    static int seed_policy = -1;
+    if (seed_policy < 0) {
+        const char *e = getenv("DS4_ROCM_STREAM_SEED_POLICY");
+        seed_policy = e && strcmp(e, "cold") == 0 ? 1 : 0;
+        if (e && strcmp(e, "cold") != 0 && strcmp(e, "always") != 0)
+            fprintf(stderr, "ds4: unknown DS4_ROCM_STREAM_SEED_POLICY=%s; using always\n", e);
+        if (seed_policy) fprintf(stderr, "ds4: end-of-sweep refill policy: cold\n");
+    }
+    if (seed_policy == 1) {
+        const ds4_gpu_stream_expert_table t0 = graph_stream_expert_table_make(m, l, il,
+            routed_expert_row_bytes(l->ffn_gate_exps) * DS4_N_FF_EXP,
+            routed_expert_row_bytes(l->ffn_down_exps) * DS4_N_EMBD);
+        if (2u * ds4_gpu_stream_expert_cache_layer_resident(&t0) >= target) return true;
+    }
     int32_t selected_host[2048u * 6u];
     if (!count || count > g->prefill_cap || count > 2048u || DS4_N_EXPERT_USED != 6u ||
         !ds4_gpu_tensor_read(g->batch.selected, 0, selected_host,

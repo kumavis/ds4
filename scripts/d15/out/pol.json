@@ -1,0 +1,4776 @@
+{
+ "d12-tr-dsp-code": {
+  "capacity": 4269,
+  "policies": {
+   "lru": {
+    "phase": {
+     "prompt": 5483,
+     "verify": 13055,
+     "step": 2096
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4098,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 31.282442748091604
+     },
+     "129-512": {
+      "misses": 11028,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 29.097625329815305
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "prompt": 5430,
+     "verify": 12336,
+     "step": 1712
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4115,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 31.412213740458014
+     },
+     "129-512": {
+      "misses": 9900,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 26.12137203166227
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "prompt": 5316,
+     "verify": 6147,
+     "step": 902
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2369,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 18.083969465648856
+     },
+     "129-512": {
+      "misses": 4667,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 12.313984168865435
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "prompt": 5483,
+     "verify": 13225,
+     "step": 2049
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4098,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 31.282442748091604
+     },
+     "129-512": {
+      "misses": 11148,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 29.41424802110818
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "prompt": 5566,
+     "verify": 13960,
+     "step": 1875
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4565,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 34.847328244274806
+     },
+     "129-512": {
+      "misses": 11243,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 29.66490765171504
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "prompt": 6097,
+     "verify": 35728,
+     "step": 5417
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 10603,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 80.93893129770993
+     },
+     "129-512": {
+      "misses": 30424,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 80.27440633245382
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "prompt": 5482,
+     "verify": 13842,
+     "step": 2272
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4189,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 31.977099236641223
+     },
+     "129-512": {
+      "misses": 11890,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 31.37203166226913
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "prompt": 5451,
+     "verify": 13030,
+     "step": 2064
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4274,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 32.62595419847328
+     },
+     "129-512": {
+      "misses": 10792,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 28.474934036939313
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "prompt": 5442,
+     "verify": 12976,
+     "step": 2068
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4245,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 32.404580152671755
+     },
+     "129-512": {
+      "misses": 10770,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 28.41688654353562
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "prompt": 5529,
+     "verify": 11941,
+     "step": 1690
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3678,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 28.076335877862597
+     },
+     "129-512": {
+      "misses": 9933,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 26.20844327176781
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "prompt": 5483,
+     "verify": 13051,
+     "step": 2096
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4097,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 31.27480916030534
+     },
+     "129-512": {
+      "misses": 11025,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 29.08970976253298
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "prompt": 5480,
+     "verify": 12827,
+     "step": 2078
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4032,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 30.778625954198475
+     },
+     "129-512": {
+      "misses": 10848,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 28.622691292875988
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "prompt": 5475,
+     "verify": 12797,
+     "step": 2042
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4012,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 30.625954198473284
+     },
+     "129-512": {
+      "misses": 10802,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 28.50131926121372
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "prompt": 5448,
+     "verify": 12546,
+     "step": 1963
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3900,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 29.770992366412212
+     },
+     "129-512": {
+      "misses": 10584,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 27.926121372031663
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "prompt": 5365,
+     "verify": 11454,
+     "step": 1648
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3558,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 27.16030534351145
+     },
+     "129-512": {
+      "misses": 9521,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 25.12137203166227
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "prompt": 5316,
+     "verify": 9058,
+     "step": 1191
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2829,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 21.595419847328245
+     },
+     "129-512": {
+      "misses": 7402,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 19.53034300791557
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "prompt": 5316,
+     "verify": 7215,
+     "step": 889
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2405,
+      "tokens": 131,
+      "rows": 154,
+      "per_token": 18.358778625954198
+     },
+     "129-512": {
+      "misses": 5686,
+      "tokens": 379,
+      "rows": 410,
+      "per_token": 15.002638522427441
+     }
+    }
+   }
+  }
+ },
+ "d12-tr-dsp-json": {
+  "capacity": 4260,
+  "policies": {
+   "lru": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10338,
+     "step": 1230
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3029,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 22.946969696969695
+     },
+     "129-512": {
+      "misses": 8539,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 22.471052631578946
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "seed": 4240,
+     "verify": 9889,
+     "step": 1378
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3030,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 22.954545454545453
+     },
+     "129-512": {
+      "misses": 8237,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 21.676315789473684
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "seed": 4240,
+     "verify": 5336,
+     "step": 743
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2276,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 17.242424242424242
+     },
+     "129-512": {
+      "misses": 3803,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 10.007894736842106
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10402,
+     "step": 1285
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3029,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 22.946969696969695
+     },
+     "129-512": {
+      "misses": 8658,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 22.78421052631579
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "seed": 4240,
+     "verify": 11177,
+     "step": 1234
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3379,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 25.598484848484848
+     },
+     "129-512": {
+      "misses": 9032,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 23.768421052631577
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "seed": 4240,
+     "verify": 30347,
+     "step": 4413
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 6748,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 51.121212121212125
+     },
+     "129-512": {
+      "misses": 28012,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 73.71578947368421
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10786,
+     "step": 1466
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3027,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 22.931818181818183
+     },
+     "129-512": {
+      "misses": 9225,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 24.276315789473685
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10172,
+     "step": 1258
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3027,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 22.931818181818183
+     },
+     "129-512": {
+      "misses": 8403,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 22.11315789473684
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10144,
+     "step": 1285
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3028,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 22.939393939393938
+     },
+     "129-512": {
+      "misses": 8401,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 22.107894736842105
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "seed": 4240,
+     "verify": 9938,
+     "step": 1159
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4000,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 30.303030303030305
+     },
+     "129-512": {
+      "misses": 7097,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 18.676315789473684
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10342,
+     "step": 1230
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3030,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 22.954545454545453
+     },
+     "129-512": {
+      "misses": 8542,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 22.478947368421053
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10200,
+     "step": 1227
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2982,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 22.59090909090909
+     },
+     "129-512": {
+      "misses": 8445,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 22.223684210526315
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10174,
+     "step": 1215
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2980,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 22.575757575757574
+     },
+     "129-512": {
+      "misses": 8409,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 22.128947368421052
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "seed": 4240,
+     "verify": 9927,
+     "step": 1204
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2904,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 22.0
+     },
+     "129-512": {
+      "misses": 8227,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 21.65
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "seed": 4240,
+     "verify": 9228,
+     "step": 1046
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2728,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 20.666666666666668
+     },
+     "129-512": {
+      "misses": 7546,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 19.857894736842105
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "seed": 4240,
+     "verify": 7602,
+     "step": 889
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2398,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 18.166666666666668
+     },
+     "129-512": {
+      "misses": 6093,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 16.03421052631579
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "seed": 4240,
+     "verify": 6523,
+     "step": 749
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2276,
+      "tokens": 132,
+      "rows": 147,
+      "per_token": 17.242424242424242
+     },
+     "129-512": {
+      "misses": 4996,
+      "tokens": 380,
+      "rows": 447,
+      "per_token": 13.147368421052631
+     }
+    }
+   }
+  }
+ },
+ "d12-tr-dsp-list": {
+  "capacity": 4267,
+  "policies": {
+   "lru": {
+    "phase": {
+     "prompt": 6728,
+     "verify": 4300,
+     "step": 5142
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3716,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 29.03125
+     },
+     "129-512": {
+      "misses": 5726,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 14.911458333333334
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "prompt": 6705,
+     "verify": 3764,
+     "step": 5192
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3309,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 25.8515625
+     },
+     "129-512": {
+      "misses": 5647,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 14.705729166666666
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "prompt": 6269,
+     "verify": 1873,
+     "step": 2215
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1596,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 12.46875
+     },
+     "129-512": {
+      "misses": 2492,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 6.489583333333333
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "prompt": 6728,
+     "verify": 4325,
+     "step": 5241
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3716,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 29.03125
+     },
+     "129-512": {
+      "misses": 5850,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 15.234375
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "prompt": 6944,
+     "verify": 4443,
+     "step": 5363
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3837,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 29.9765625
+     },
+     "129-512": {
+      "misses": 5969,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 15.544270833333334
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "prompt": 10409,
+     "verify": 12684,
+     "step": 21511
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 10678,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 83.421875
+     },
+     "129-512": {
+      "misses": 23517,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 61.2421875
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "prompt": 6733,
+     "verify": 4436,
+     "step": 5548
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3773,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 29.4765625
+     },
+     "129-512": {
+      "misses": 6211,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 16.174479166666668
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "prompt": 6694,
+     "verify": 4383,
+     "step": 5511
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3784,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 29.5625
+     },
+     "129-512": {
+      "misses": 6110,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 15.911458333333334
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "prompt": 6701,
+     "verify": 4358,
+     "step": 5587
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3789,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 29.6015625
+     },
+     "129-512": {
+      "misses": 6156,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 16.03125
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "prompt": 6798,
+     "verify": 3715,
+     "step": 4024
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3074,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 24.015625
+     },
+     "129-512": {
+      "misses": 4665,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 12.1484375
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "prompt": 6728,
+     "verify": 4301,
+     "step": 5143
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3718,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 29.046875
+     },
+     "129-512": {
+      "misses": 5726,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 14.911458333333334
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "prompt": 6721,
+     "verify": 4233,
+     "step": 5108
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3654,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 28.546875
+     },
+     "129-512": {
+      "misses": 5687,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 14.809895833333334
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "prompt": 6705,
+     "verify": 4222,
+     "step": 5052
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3643,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 28.4609375
+     },
+     "129-512": {
+      "misses": 5631,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 14.6640625
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "prompt": 6659,
+     "verify": 4111,
+     "step": 4958
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3532,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 27.59375
+     },
+     "129-512": {
+      "misses": 5537,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 14.419270833333334
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "prompt": 6496,
+     "verify": 3632,
+     "step": 4644
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3058,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 23.890625
+     },
+     "129-512": {
+      "misses": 5218,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 13.588541666666666
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "prompt": 6278,
+     "verify": 2598,
+     "step": 3798
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2190,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 17.109375
+     },
+     "129-512": {
+      "misses": 4206,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 10.953125
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "prompt": 6269,
+     "verify": 2117,
+     "step": 3090
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1751,
+      "tokens": 128,
+      "rows": 137,
+      "per_token": 13.6796875
+     },
+     "129-512": {
+      "misses": 3456,
+      "tokens": 384,
+      "rows": 397,
+      "per_token": 9.0
+     }
+    }
+   }
+  }
+ },
+ "d12-tr-dsp-prose": {
+  "capacity": 4253,
+  "policies": {
+   "lru": {
+    "phase": {
+     "prompt": 5664,
+     "verify": 3402,
+     "step": 7711
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2952,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 23.0625
+     },
+     "129-512": {
+      "misses": 8161,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 21.252604166666668
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "prompt": 5706,
+     "verify": 3825,
+     "step": 7261
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3339,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 26.0859375
+     },
+     "129-512": {
+      "misses": 7747,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 20.174479166666668
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "prompt": 5560,
+     "verify": 2096,
+     "step": 3380
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1860,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 14.53125
+     },
+     "129-512": {
+      "misses": 3616,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 9.416666666666666
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "prompt": 5664,
+     "verify": 3446,
+     "step": 8058
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2952,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 23.0625
+     },
+     "129-512": {
+      "misses": 8552,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 22.270833333333332
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "prompt": 5853,
+     "verify": 3768,
+     "step": 8146
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3269,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 25.5390625
+     },
+     "129-512": {
+      "misses": 8645,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 22.513020833333332
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "prompt": 6702,
+     "verify": 11641,
+     "step": 30003
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 10369,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 81.0078125
+     },
+     "129-512": {
+      "misses": 31275,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 81.4453125
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "prompt": 5669,
+     "verify": 3565,
+     "step": 8056
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2982,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 23.296875
+     },
+     "129-512": {
+      "misses": 8639,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 22.497395833333332
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "prompt": 5699,
+     "verify": 3674,
+     "step": 7777
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3255,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 25.4296875
+     },
+     "129-512": {
+      "misses": 8196,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 21.34375
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "prompt": 5694,
+     "verify": 3807,
+     "step": 7820
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3348,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 26.15625
+     },
+     "129-512": {
+      "misses": 8279,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 21.559895833333332
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "prompt": 5721,
+     "verify": 3224,
+     "step": 6556
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2625,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 20.5078125
+     },
+     "129-512": {
+      "misses": 7155,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 18.6328125
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "prompt": 5664,
+     "verify": 3402,
+     "step": 7710
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2952,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 23.0625
+     },
+     "129-512": {
+      "misses": 8160,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 21.25
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "prompt": 5663,
+     "verify": 3358,
+     "step": 7680
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2917,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 22.7890625
+     },
+     "129-512": {
+      "misses": 8121,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 21.1484375
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "prompt": 5657,
+     "verify": 3347,
+     "step": 7626
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2903,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 22.6796875
+     },
+     "129-512": {
+      "misses": 8070,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 21.015625
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "prompt": 5643,
+     "verify": 3320,
+     "step": 7471
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2860,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 22.34375
+     },
+     "129-512": {
+      "misses": 7931,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 20.653645833333332
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "prompt": 5595,
+     "verify": 3153,
+     "step": 6971
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2717,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 21.2265625
+     },
+     "129-512": {
+      "misses": 7407,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 19.2890625
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "prompt": 5560,
+     "verify": 2541,
+     "step": 5611
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2194,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 17.140625
+     },
+     "129-512": {
+      "misses": 5958,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 15.515625
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "prompt": 5560,
+     "verify": 2294,
+     "step": 4276
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1886,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 14.734375
+     },
+     "129-512": {
+      "misses": 4684,
+      "tokens": 384,
+      "rows": 395,
+      "per_token": 12.197916666666666
+     }
+    }
+   }
+  }
+ },
+ "d12-tr-dsp-translate": {
+  "capacity": 4261,
+  "policies": {
+   "lru": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10801,
+     "step": 294
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3757,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 29.3515625
+     },
+     "129-512": {
+      "misses": 7338,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 19.109375
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10250,
+     "step": 289
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3783,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 29.5546875
+     },
+     "129-512": {
+      "misses": 6756,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 17.59375
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "seed": 4240,
+     "verify": 5531,
+     "step": 161
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2401,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 18.7578125
+     },
+     "129-512": {
+      "misses": 3291,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 8.5703125
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "seed": 4240,
+     "verify": 11169,
+     "step": 335
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3757,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 29.3515625
+     },
+     "129-512": {
+      "misses": 7747,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 20.174479166666668
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "seed": 4240,
+     "verify": 11330,
+     "step": 322
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4001,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 31.2578125
+     },
+     "129-512": {
+      "misses": 7651,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 19.924479166666668
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "seed": 4240,
+     "verify": 27860,
+     "step": 958
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 7769,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 60.6953125
+     },
+     "129-512": {
+      "misses": 21049,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 54.815104166666664
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "seed": 4240,
+     "verify": 11476,
+     "step": 353
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3758,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 29.359375
+     },
+     "129-512": {
+      "misses": 8071,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 21.018229166666668
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10691,
+     "step": 289
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3762,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 29.390625
+     },
+     "129-512": {
+      "misses": 7218,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 18.796875
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10727,
+     "step": 295
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3760,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 29.375
+     },
+     "129-512": {
+      "misses": 7262,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 18.911458333333332
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10112,
+     "step": 204
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4475,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 34.9609375
+     },
+     "129-512": {
+      "misses": 5841,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 15.2109375
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10805,
+     "step": 294
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3761,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 29.3828125
+     },
+     "129-512": {
+      "misses": 7338,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 19.109375
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10655,
+     "step": 294
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3708,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 28.96875
+     },
+     "129-512": {
+      "misses": 7241,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 18.856770833333332
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10642,
+     "step": 293
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3702,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 28.921875
+     },
+     "129-512": {
+      "misses": 7233,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 18.8359375
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "seed": 4240,
+     "verify": 10379,
+     "step": 291
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3596,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 28.09375
+     },
+     "129-512": {
+      "misses": 7074,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 18.421875
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "seed": 4240,
+     "verify": 9661,
+     "step": 281
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3298,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 25.765625
+     },
+     "129-512": {
+      "misses": 6644,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 17.302083333333332
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "seed": 4240,
+     "verify": 7793,
+     "step": 226
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2640,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 20.625
+     },
+     "129-512": {
+      "misses": 5379,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 14.0078125
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "seed": 4240,
+     "verify": 6655,
+     "step": 200
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2401,
+      "tokens": 128,
+      "rows": 150,
+      "per_token": 18.7578125
+     },
+     "129-512": {
+      "misses": 4454,
+      "tokens": 384,
+      "rows": 444,
+      "per_token": 11.598958333333334
+     }
+    }
+   }
+  }
+ },
+ "d12-tr-plain-code-2k": {
+  "capacity": 4739,
+  "policies": {
+   "lru": {
+    "phase": {
+     "prompt": 5383,
+     "step": 44966
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3035,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.7109375
+     },
+     "129-512": {
+      "misses": 9048,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 23.5625
+     },
+     "513-2048": {
+      "misses": 32883,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 22.46106557377049
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "prompt": 5372,
+     "step": 39823
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3200,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 25.0
+     },
+     "129-512": {
+      "misses": 8136,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 21.1875
+     },
+     "513-2048": {
+      "misses": 28487,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 19.458333333333332
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "prompt": 5316,
+     "step": 18898
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2230,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 17.421875
+     },
+     "129-512": {
+      "misses": 3567,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 9.2890625
+     },
+     "513-2048": {
+      "misses": 13101,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 8.948770491803279
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "prompt": 5383,
+     "step": 43599
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3035,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.7109375
+     },
+     "129-512": {
+      "misses": 9208,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 23.979166666666668
+     },
+     "513-2048": {
+      "misses": 31356,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 21.418032786885245
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "prompt": 5394,
+     "step": 44382
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3251,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 25.3984375
+     },
+     "129-512": {
+      "misses": 9274,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 24.151041666666668
+     },
+     "513-2048": {
+      "misses": 31857,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 21.760245901639344
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "prompt": 5520,
+     "step": 120019
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 8391,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 65.5546875
+     },
+     "129-512": {
+      "misses": 26782,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 69.74479166666667
+     },
+     "513-2048": {
+      "misses": 84846,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 57.954918032786885
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "prompt": 5390,
+     "step": 58406
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3045,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.7890625
+     },
+     "129-512": {
+      "misses": 9617,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 25.044270833333332
+     },
+     "513-2048": {
+      "misses": 45744,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 31.24590163934426
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "prompt": 5389,
+     "step": 44910
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3049,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.8203125
+     },
+     "129-512": {
+      "misses": 8990,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 23.411458333333332
+     },
+     "513-2048": {
+      "misses": 32871,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 22.452868852459016
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "prompt": 5377,
+     "step": 44971
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3095,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 24.1796875
+     },
+     "129-512": {
+      "misses": 9018,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 23.484375
+     },
+     "513-2048": {
+      "misses": 32858,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 22.443989071038253
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "prompt": 5383,
+     "step": 42822
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3062,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.921875
+     },
+     "129-512": {
+      "misses": 8792,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 22.895833333333332
+     },
+     "513-2048": {
+      "misses": 30968,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 21.153005464480874
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "prompt": 5382,
+     "step": 44966
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3035,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.7109375
+     },
+     "129-512": {
+      "misses": 9048,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 23.5625
+     },
+     "513-2048": {
+      "misses": 32883,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 22.46106557377049
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "prompt": 5371,
+     "step": 44725
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3029,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.6640625
+     },
+     "129-512": {
+      "misses": 8995,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 23.424479166666668
+     },
+     "513-2048": {
+      "misses": 32701,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 22.336748633879782
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "prompt": 5362,
+     "step": 44284
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3015,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.5546875
+     },
+     "129-512": {
+      "misses": 8893,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 23.158854166666668
+     },
+     "513-2048": {
+      "misses": 32376,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 22.114754098360656
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "prompt": 5343,
+     "step": 43115
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2950,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.046875
+     },
+     "129-512": {
+      "misses": 8637,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 22.4921875
+     },
+     "513-2048": {
+      "misses": 31528,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 21.53551912568306
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "prompt": 5317,
+     "step": 39194
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2777,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 21.6953125
+     },
+     "129-512": {
+      "misses": 7970,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 20.755208333333332
+     },
+     "513-2048": {
+      "misses": 28447,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 19.431010928961747
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "prompt": 5316,
+     "step": 30005
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2394,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 18.703125
+     },
+     "129-512": {
+      "misses": 6320,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 16.458333333333332
+     },
+     "513-2048": {
+      "misses": 21291,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 14.543032786885245
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "prompt": 5316,
+     "step": 24175
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2237,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 17.4765625
+     },
+     "129-512": {
+      "misses": 4971,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 12.9453125
+     },
+     "513-2048": {
+      "misses": 16967,
+      "tokens": 1464,
+      "rows": 1464,
+      "per_token": 11.58948087431694
+     }
+    }
+   }
+  }
+ },
+ "d12-tr-plain-code": {
+  "capacity": 4738,
+  "policies": {
+   "lru": {
+    "phase": {
+     "prompt": 5386,
+     "step": 12053
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3035,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.7109375
+     },
+     "129-512": {
+      "misses": 9018,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 23.54569190600522
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "prompt": 5372,
+     "step": 11309
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3201,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 25.0078125
+     },
+     "129-512": {
+      "misses": 8108,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 21.16971279373368
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "prompt": 5316,
+     "step": 5793
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2230,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 17.421875
+     },
+     "129-512": {
+      "misses": 3563,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 9.302872062663186
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "prompt": 5386,
+     "step": 12214
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3035,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.7109375
+     },
+     "129-512": {
+      "misses": 9179,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 23.966057441253263
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "prompt": 5394,
+     "step": 12491
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3250,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 25.390625
+     },
+     "129-512": {
+      "misses": 9241,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 24.12793733681462
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "prompt": 5520,
+     "step": 35115
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 8391,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 65.5546875
+     },
+     "129-512": {
+      "misses": 26724,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 69.77545691906005
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "prompt": 5390,
+     "step": 12633
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3046,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.796875
+     },
+     "129-512": {
+      "misses": 9587,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 25.031331592689295
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "prompt": 5389,
+     "step": 12013
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3049,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.8203125
+     },
+     "129-512": {
+      "misses": 8964,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 23.404699738903393
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "prompt": 5377,
+     "step": 12085
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3096,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 24.1875
+     },
+     "129-512": {
+      "misses": 8989,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 23.469973890339425
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "prompt": 5411,
+     "step": 10415
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2995,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.3984375
+     },
+     "129-512": {
+      "misses": 7420,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 19.373368146214098
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "prompt": 5386,
+     "step": 12053
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3035,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.7109375
+     },
+     "129-512": {
+      "misses": 9018,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 23.54569190600522
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "prompt": 5371,
+     "step": 12000
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3030,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.671875
+     },
+     "129-512": {
+      "misses": 8970,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 23.42036553524804
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "prompt": 5362,
+     "step": 11880
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3015,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.5546875
+     },
+     "129-512": {
+      "misses": 8865,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 23.14621409921671
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "prompt": 5343,
+     "step": 11559
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2951,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.0546875
+     },
+     "129-512": {
+      "misses": 8608,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 22.475195822454307
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "prompt": 5317,
+     "step": 10718
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2778,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 21.703125
+     },
+     "129-512": {
+      "misses": 7940,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 20.73107049608355
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "prompt": 5316,
+     "step": 8696
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2394,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 18.703125
+     },
+     "129-512": {
+      "misses": 6302,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 16.45430809399478
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "prompt": 5316,
+     "step": 7190
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2237,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 17.4765625
+     },
+     "129-512": {
+      "misses": 4953,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.932114882506527
+     }
+    }
+   }
+  }
+ },
+ "d12-tr-plain-json": {
+  "capacity": 4734,
+  "policies": {
+   "lru": {
+    "phase": {
+     "seed": 4720,
+     "step": 10158
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2872,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.4375
+     },
+     "129-512": {
+      "misses": 7286,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 19.02349869451697
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "seed": 4720,
+     "step": 9955
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2872,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.4375
+     },
+     "129-512": {
+      "misses": 7083,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.4934725848564
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "seed": 4720,
+     "step": 5288
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2157,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 16.8515625
+     },
+     "129-512": {
+      "misses": 3131,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 8.174934725848564
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "seed": 4720,
+     "step": 10306
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2872,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.4375
+     },
+     "129-512": {
+      "misses": 7434,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 19.409921671018278
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "seed": 4720,
+     "step": 10738
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3170,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 24.765625
+     },
+     "129-512": {
+      "misses": 7568,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 19.759791122715406
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "seed": 4720,
+     "step": 31096
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 6239,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 48.7421875
+     },
+     "129-512": {
+      "misses": 24857,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 64.90078328981723
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "seed": 4720,
+     "step": 10362
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2874,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.453125
+     },
+     "129-512": {
+      "misses": 7488,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 19.550913838120106
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "seed": 4720,
+     "step": 9997
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2872,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.4375
+     },
+     "129-512": {
+      "misses": 7125,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.60313315926893
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "seed": 4720,
+     "step": 9963
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2872,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.4375
+     },
+     "129-512": {
+      "misses": 7091,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.514360313315926
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "seed": 4720,
+     "step": 9313
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3730,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 29.140625
+     },
+     "129-512": {
+      "misses": 5583,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 14.577023498694517
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "seed": 4720,
+     "step": 10160
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2874,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.453125
+     },
+     "129-512": {
+      "misses": 7286,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 19.02349869451697
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "seed": 4720,
+     "step": 10107
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2858,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.328125
+     },
+     "129-512": {
+      "misses": 7249,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.926892950391643
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "seed": 4720,
+     "step": 10017
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2838,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.171875
+     },
+     "129-512": {
+      "misses": 7179,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.744125326370757
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "seed": 4720,
+     "step": 9795
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2776,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 21.6875
+     },
+     "129-512": {
+      "misses": 7019,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.326370757180158
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "seed": 4720,
+     "step": 9110
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2603,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 20.3359375
+     },
+     "129-512": {
+      "misses": 6507,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 16.989556135770236
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "seed": 4720,
+     "step": 7734
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2294,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 17.921875
+     },
+     "129-512": {
+      "misses": 5440,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 14.203655352480418
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "seed": 4720,
+     "step": 6717
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2157,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 16.8515625
+     },
+     "129-512": {
+      "misses": 4560,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 11.906005221932116
+     }
+    }
+   }
+  }
+ },
+ "d12-tr-plain-list": {
+  "capacity": 4728,
+  "policies": {
+   "lru": {
+    "phase": {
+     "prompt": 6514,
+     "step": 7663
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2899,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.6484375
+     },
+     "129-512": {
+      "misses": 4764,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.43864229765013
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "prompt": 6500,
+     "step": 7504
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2817,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.0078125
+     },
+     "129-512": {
+      "misses": 4687,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.237597911227153
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "prompt": 6269,
+     "step": 3634
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1578,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 12.328125
+     },
+     "129-512": {
+      "misses": 2056,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 5.368146214099217
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "prompt": 6514,
+     "step": 7737
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2899,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.6484375
+     },
+     "129-512": {
+      "misses": 4838,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.631853785900784
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "prompt": 6654,
+     "step": 7627
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2614,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 20.421875
+     },
+     "129-512": {
+      "misses": 5013,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 13.088772845953002
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "prompt": 8441,
+     "step": 29325
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 9245,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 72.2265625
+     },
+     "129-512": {
+      "misses": 20080,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 52.42819843342036
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "prompt": 6523,
+     "step": 7832
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2925,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.8515625
+     },
+     "129-512": {
+      "misses": 4907,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.81201044386423
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "prompt": 6528,
+     "step": 8015
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3046,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.796875
+     },
+     "129-512": {
+      "misses": 4969,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.973890339425587
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "prompt": 6526,
+     "step": 8089
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3058,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.890625
+     },
+     "129-512": {
+      "misses": 5031,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 13.135770234986945
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "prompt": 6644,
+     "step": 6080
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2677,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 20.9140625
+     },
+     "129-512": {
+      "misses": 3403,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 8.885117493472585
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "prompt": 6514,
+     "step": 7661
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2899,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.6484375
+     },
+     "129-512": {
+      "misses": 4762,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.433420365535248
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "prompt": 6507,
+     "step": 7610
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2860,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 22.34375
+     },
+     "129-512": {
+      "misses": 4750,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.402088772845953
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "prompt": 6497,
+     "step": 7514
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2784,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 21.75
+     },
+     "129-512": {
+      "misses": 4730,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.349869451697128
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "prompt": 6473,
+     "step": 7203
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2536,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.8125
+     },
+     "129-512": {
+      "misses": 4667,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.18537859007833
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "prompt": 6373,
+     "step": 6708
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2258,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 17.640625
+     },
+     "129-512": {
+      "misses": 4450,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 11.618798955613578
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "prompt": 6269,
+     "step": 5609
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1918,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 14.984375
+     },
+     "129-512": {
+      "misses": 3691,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 9.637075718015666
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "prompt": 6269,
+     "step": 4775
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1666,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 13.015625
+     },
+     "129-512": {
+      "misses": 3109,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 8.117493472584856
+     }
+    }
+   }
+  }
+ },
+ "d12-tr-plain-long": {
+  "capacity": 4740,
+  "policies": {
+   "lru": {
+    "phase": {
+     "seed": 4720,
+     "step": 6266
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3775,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 29.4921875
+     },
+     "129-512": {
+      "misses": 2491,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 19.614173228346456
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "seed": 4720,
+     "step": 6079
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3782,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 29.546875
+     },
+     "129-512": {
+      "misses": 2297,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 18.086614173228348
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "seed": 4720,
+     "step": 3330
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2417,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 18.8828125
+     },
+     "129-512": {
+      "misses": 913,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 7.188976377952756
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "seed": 4720,
+     "step": 6266
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3775,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 29.4921875
+     },
+     "129-512": {
+      "misses": 2491,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 19.614173228346456
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "seed": 4720,
+     "step": 6468
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3943,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 30.8046875
+     },
+     "129-512": {
+      "misses": 2525,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 19.881889763779526
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "seed": 4720,
+     "step": 15017
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 7820,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 61.09375
+     },
+     "129-512": {
+      "misses": 7197,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 56.669291338582674
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "seed": 4720,
+     "step": 6355
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3802,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 29.703125
+     },
+     "129-512": {
+      "misses": 2553,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 20.10236220472441
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "seed": 4720,
+     "step": 6251
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3783,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 29.5546875
+     },
+     "129-512": {
+      "misses": 2468,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 19.433070866141733
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "seed": 4720,
+     "step": 6267
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3784,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 29.5625
+     },
+     "129-512": {
+      "misses": 2483,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 19.551181102362204
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "seed": 4720,
+     "step": 5774
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 4443,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 34.7109375
+     },
+     "129-512": {
+      "misses": 1331,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 10.48031496062992
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "seed": 4720,
+     "step": 6263
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3772,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 29.46875
+     },
+     "129-512": {
+      "misses": 2491,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 19.614173228346456
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "seed": 4720,
+     "step": 6225
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3746,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 29.265625
+     },
+     "129-512": {
+      "misses": 2479,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 19.519685039370078
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "seed": 4720,
+     "step": 6162
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3700,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 28.90625
+     },
+     "129-512": {
+      "misses": 2462,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 19.385826771653544
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "seed": 4720,
+     "step": 6009
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3603,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 28.1484375
+     },
+     "129-512": {
+      "misses": 2406,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 18.944881889763778
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "seed": 4720,
+     "step": 5518
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3291,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 25.7109375
+     },
+     "129-512": {
+      "misses": 2227,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 17.53543307086614
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "seed": 4720,
+     "step": 4391
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2693,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 21.0390625
+     },
+     "129-512": {
+      "misses": 1698,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 13.37007874015748
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "seed": 4720,
+     "step": 3780
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2417,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 18.8828125
+     },
+     "129-512": {
+      "misses": 1363,
+      "tokens": 127,
+      "rows": 127,
+      "per_token": 10.73228346456693
+     }
+    }
+   }
+  }
+ },
+ "d12-tr-plain-prose-2k": {
+  "capacity": 4741,
+  "policies": {
+   "lru": {
+    "phase": {
+     "prompt": 5609,
+     "step": 12835
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2488,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.4375
+     },
+     "129-512": {
+      "misses": 7095,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 18.4765625
+     },
+     "513-2048": {
+      "misses": 3252,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 11.213793103448277
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "prompt": 5604,
+     "step": 11861
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2709,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 21.1640625
+     },
+     "129-512": {
+      "misses": 5960,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 15.520833333333334
+     },
+     "513-2048": {
+      "misses": 3192,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 11.006896551724138
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "prompt": 5560,
+     "step": 5750
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1786,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 13.953125
+     },
+     "129-512": {
+      "misses": 2761,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 7.190104166666667
+     },
+     "513-2048": {
+      "misses": 1203,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 4.1482758620689655
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "prompt": 5609,
+     "step": 13105
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2488,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.4375
+     },
+     "129-512": {
+      "misses": 7252,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 18.885416666666668
+     },
+     "513-2048": {
+      "misses": 3365,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 11.60344827586207
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "prompt": 5706,
+     "step": 13343
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2663,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 20.8046875
+     },
+     "129-512": {
+      "misses": 7331,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 19.091145833333332
+     },
+     "513-2048": {
+      "misses": 3349,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 11.548275862068966
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "prompt": 6051,
+     "step": 47226
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 7437,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 58.1015625
+     },
+     "129-512": {
+      "misses": 23080,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 60.104166666666664
+     },
+     "513-2048": {
+      "misses": 16709,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 57.61724137931034
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "prompt": 5609,
+     "step": 13292
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2475,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.3359375
+     },
+     "129-512": {
+      "misses": 7175,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 18.684895833333332
+     },
+     "513-2048": {
+      "misses": 3642,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 12.558620689655172
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "prompt": 5607,
+     "step": 13098
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2506,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.578125
+     },
+     "129-512": {
+      "misses": 7181,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 18.700520833333332
+     },
+     "513-2048": {
+      "misses": 3411,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 11.76206896551724
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "prompt": 5605,
+     "step": 13110
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2509,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.6015625
+     },
+     "129-512": {
+      "misses": 7125,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 18.5546875
+     },
+     "513-2048": {
+      "misses": 3476,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 11.986206896551725
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "prompt": 5624,
+     "step": 10822
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2273,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 17.7578125
+     },
+     "129-512": {
+      "misses": 5800,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 15.104166666666666
+     },
+     "513-2048": {
+      "misses": 2749,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 9.479310344827587
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "prompt": 5609,
+     "step": 12835
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2488,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.4375
+     },
+     "129-512": {
+      "misses": 7095,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 18.4765625
+     },
+     "513-2048": {
+      "misses": 3252,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 11.213793103448277
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "prompt": 5609,
+     "step": 12789
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2483,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.3984375
+     },
+     "129-512": {
+      "misses": 7064,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 18.395833333333332
+     },
+     "513-2048": {
+      "misses": 3242,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 11.179310344827586
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "prompt": 5606,
+     "step": 12702
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2472,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.3125
+     },
+     "129-512": {
+      "misses": 7001,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 18.231770833333332
+     },
+     "513-2048": {
+      "misses": 3229,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 11.13448275862069
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "prompt": 5597,
+     "step": 12476
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2447,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.1171875
+     },
+     "129-512": {
+      "misses": 6843,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 17.8203125
+     },
+     "513-2048": {
+      "misses": 3186,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 10.986206896551725
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "prompt": 5562,
+     "step": 11615
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2293,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 17.9140625
+     },
+     "129-512": {
+      "misses": 6280,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 16.354166666666668
+     },
+     "513-2048": {
+      "misses": 3042,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 10.489655172413793
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "prompt": 5560,
+     "step": 9309
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1959,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 15.3046875
+     },
+     "129-512": {
+      "misses": 4737,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 12.3359375
+     },
+     "513-2048": {
+      "misses": 2613,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 9.010344827586207
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "prompt": 5560,
+     "step": 7659
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1796,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 14.03125
+     },
+     "129-512": {
+      "misses": 3654,
+      "tokens": 384,
+      "rows": 384,
+      "per_token": 9.515625
+     },
+     "513-2048": {
+      "misses": 2209,
+      "tokens": 290,
+      "rows": 290,
+      "per_token": 7.617241379310345
+     }
+    }
+   }
+  }
+ },
+ "d12-tr-plain-prose": {
+  "capacity": 4719,
+  "policies": {
+   "lru": {
+    "phase": {
+     "prompt": 5609,
+     "step": 9610
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2498,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.515625
+     },
+     "129-512": {
+      "misses": 7112,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.569190600522195
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "prompt": 5608,
+     "step": 8704
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2734,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 21.359375
+     },
+     "129-512": {
+      "misses": 5970,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 15.587467362924283
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "prompt": 5560,
+     "step": 4556
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1786,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 13.953125
+     },
+     "129-512": {
+      "misses": 2770,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 7.2323759791122715
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "prompt": 5609,
+     "step": 9756
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2498,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.515625
+     },
+     "129-512": {
+      "misses": 7258,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.950391644908617
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "prompt": 5717,
+     "step": 9978
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2680,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 20.9375
+     },
+     "129-512": {
+      "misses": 7298,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 19.054830287206265
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "prompt": 6089,
+     "step": 30668
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 7511,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 58.6796875
+     },
+     "129-512": {
+      "misses": 23157,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 60.4621409921671
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "prompt": 5612,
+     "step": 9702
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2484,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.40625
+     },
+     "129-512": {
+      "misses": 7218,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.845953002610965
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "prompt": 5610,
+     "step": 9702
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2517,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.6640625
+     },
+     "129-512": {
+      "misses": 7185,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.759791122715406
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "prompt": 5606,
+     "step": 9660
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2518,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.671875
+     },
+     "129-512": {
+      "misses": 7142,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.64751958224543
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "prompt": 5634,
+     "step": 7894
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2423,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 18.9296875
+     },
+     "129-512": {
+      "misses": 5471,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 14.284595300261097
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "prompt": 5609,
+     "step": 9610
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2498,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.515625
+     },
+     "129-512": {
+      "misses": 7112,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.569190600522195
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "prompt": 5609,
+     "step": 9576
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2495,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.4921875
+     },
+     "129-512": {
+      "misses": 7081,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.488250652741513
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "prompt": 5608,
+     "step": 9515
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2488,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.4375
+     },
+     "129-512": {
+      "misses": 7027,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 18.347258485639685
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "prompt": 5603,
+     "step": 9319
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2455,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 19.1796875
+     },
+     "129-512": {
+      "misses": 6864,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 17.92167101827676
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "prompt": 5563,
+     "step": 8608
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2308,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 18.03125
+     },
+     "129-512": {
+      "misses": 6300,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 16.449086161879894
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "prompt": 5560,
+     "step": 6708
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1963,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 15.3359375
+     },
+     "129-512": {
+      "misses": 4745,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.389033942558747
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "prompt": 5560,
+     "step": 5453
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 1797,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 14.0390625
+     },
+     "129-512": {
+      "misses": 3656,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 9.545691906005223
+     }
+    }
+   }
+  }
+ },
+ "d12-tr-plain-translate": {
+  "capacity": 4735,
+  "policies": {
+   "lru": {
+    "phase": {
+     "seed": 4720,
+     "step": 9685
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3053,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.8515625
+     },
+     "129-512": {
+      "misses": 6632,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 17.31592689295039
+     }
+    }
+   },
+   "s3fifo": {
+    "phase": {
+     "seed": 4720,
+     "step": 9242
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3053,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.8515625
+     },
+     "129-512": {
+      "misses": 6189,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 16.159268929503916
+     }
+    }
+   },
+   "belady": {
+    "phase": {
+     "seed": 4720,
+     "step": 4868
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2154,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 16.828125
+     },
+     "129-512": {
+      "misses": 2714,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 7.0861618798955615
+     }
+    }
+   },
+   "hawkeye": {
+    "phase": {
+     "seed": 4720,
+     "step": 9830
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3053,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.8515625
+     },
+     "129-512": {
+      "misses": 6777,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 17.694516971279374
+     }
+    }
+   },
+   "hawkeye-sig": {
+    "phase": {
+     "seed": 4720,
+     "step": 10084
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3293,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 25.7265625
+     },
+     "129-512": {
+      "misses": 6791,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 17.73107049608355
+     }
+    }
+   },
+   "pnu": {
+    "phase": {
+     "seed": 4720,
+     "step": 26274
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 6732,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 52.59375
+     },
+     "129-512": {
+      "misses": 19542,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 51.023498694516974
+     }
+    }
+   },
+   "pnu-od": {
+    "phase": {
+     "seed": 4720,
+     "step": 9823
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3066,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.953125
+     },
+     "129-512": {
+      "misses": 6757,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 17.642297650130548
+     }
+    }
+   },
+   "co-same": {
+    "phase": {
+     "seed": 4720,
+     "step": 9680
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3053,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.8515625
+     },
+     "129-512": {
+      "misses": 6627,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 17.302872062663184
+     }
+    }
+   },
+   "co-next": {
+    "phase": {
+     "seed": 4720,
+     "step": 9647
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3053,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.8515625
+     },
+     "129-512": {
+      "misses": 6594,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 17.216710182767624
+     }
+    }
+   },
+   "renewal": {
+    "phase": {
+     "seed": 4720,
+     "step": 8667
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3945,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 30.8203125
+     },
+     "129-512": {
+      "misses": 4722,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.328981723237598
+     }
+    }
+   },
+   "renewal-g": {
+    "phase": {
+     "seed": 4720,
+     "step": 9698
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3066,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.953125
+     },
+     "129-512": {
+      "misses": 6632,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 17.31592689295039
+     }
+    }
+   },
+   "look:0": {
+    "phase": {
+     "seed": 4720,
+     "step": 9637
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3043,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.7734375
+     },
+     "129-512": {
+      "misses": 6594,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 17.216710182767624
+     }
+    }
+   },
+   "look:1": {
+    "phase": {
+     "seed": 4720,
+     "step": 9570
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 3023,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.6171875
+     },
+     "129-512": {
+      "misses": 6547,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 17.093994778067884
+     }
+    }
+   },
+   "look:4": {
+    "phase": {
+     "seed": 4720,
+     "step": 9400
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2954,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 23.078125
+     },
+     "129-512": {
+      "misses": 6446,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 16.83028720626632
+     }
+    }
+   },
+   "look:16": {
+    "phase": {
+     "seed": 4720,
+     "step": 8888
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2794,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 21.828125
+     },
+     "129-512": {
+      "misses": 6094,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 15.911227154046998
+     }
+    }
+   },
+   "look:64": {
+    "phase": {
+     "seed": 4720,
+     "step": 7296
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2398,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 18.734375
+     },
+     "129-512": {
+      "misses": 4898,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 12.788511749347258
+     }
+    }
+   },
+   "look:128": {
+    "phase": {
+     "seed": 4720,
+     "step": 6273
+    },
+    "buckets": {
+     "1-128": {
+      "misses": 2154,
+      "tokens": 128,
+      "rows": 128,
+      "per_token": 16.828125
+     },
+     "129-512": {
+      "misses": 4119,
+      "tokens": 383,
+      "rows": 383,
+      "per_token": 10.754569190600522
+     }
+    }
+   }
+  }
+ }
+}

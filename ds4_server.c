@@ -11582,9 +11582,6 @@ static int kv_cache_turn_target_step(server *s, server_slot *slot, int live_toke
     return live_tokens;
 }
 
-static int kv_cache_turn_target(server *s, server_slot *slot, int live_tokens) {
-    return kv_cache_turn_target_step(s, slot, live_tokens, kv_cache_turn_step(s));
-}
 
 static void kv_cache_maybe_store_continued_at(server *s, server_slot *slot, int where) {
     if (!s || !slot) return;

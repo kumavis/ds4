@@ -44812,14 +44812,35 @@ static bool ds41_stream_layer_start(ds41_stream_layer_load *job,
     return true;
 }
 
+/* D13: DS4_ROCM_STREAM_STAGING_CACHE=1 lends the two staging layers to the
+ * dynamic expert cache whenever no layer sweep runs (from engine open, and
+ * after each sweep); each sweep takes them back first. Off by default. */
+static bool ds41_staging_cache_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_STAGING_CACHE");
+        enabled = env && !strcmp(env, "1");
+    }
+    return enabled != 0;
+}
+
 static bool ds41_stream_sweep_start(ds41_stream_layer_load *job,
                                     const ds4_model *m, const ds4_weights *w) {
-    return ds4_gpu_stream_expert_cache_quiesce() && ds41_stream_layer_start(job, m, w, 0);
+    if (!ds4_gpu_stream_expert_cache_quiesce()) return false;
+    if (ds4_gpu_stream_expert_cache_staging_lent() &&
+        !ds4_gpu_stream_expert_cache_staging_reclaim()) {
+        fprintf(stderr, "ds4: V4.1 could not take the lent staging back for a layer sweep\n");
+        return false;
+    }
+    return ds41_stream_layer_start(job, m, w, 0);
 }
 
 static bool ds41_stream_sweep_finish(ds41_stream_layer_load *job) {
     bool ok = ds41_stream_layer_join(job);
     if (!ds4_gpu_stream_expert_cache_quiesce()) ok = false;
+    /* A failed lend leaves the staging reserved, exactly as without D13. */
+    if (ok && ds41_staging_cache_enabled())
+        (void)ds4_gpu_stream_expert_cache_staging_lend();
     return ok;
 }
 
@@ -76582,6 +76603,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     return 1;
                 }
                 e->ds41_stream_slots_ready = true;
+                /* D13: the staging is idle until the first layer sweep. */
+                if (ds41_staging_cache_enabled() &&
+                    !ds4_gpu_stream_expert_cache_staging_lend())
+                    fprintf(stderr, "ds4: V4.1 D13 staging cache requested but the staging "
+                                    "could not be lent; keeping it reserved\n");
                 fprintf(stderr, "ds4: V4.1 SSD prepared %.2f GiB static weights and %.2f GiB expert staging; "
                                 "%.2f GiB dynamic cache, %.2f GiB graph, 2.00 GiB runtime/I/O allowance\n",
                         ds4_bytes_to_gib(e->startup_model_span_bytes),

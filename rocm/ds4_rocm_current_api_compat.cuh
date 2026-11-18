@@ -140,7 +140,40 @@ extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    g_stream_expert_cache_budget = experts;
+    /* D13: slots lent from the staging stay counted on top of the budget. */
+    g_stream_expert_cache_budget = experts +
+        (g_stream_staging_lent ? g_stream_staging_lent_slots : 0u);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_staging_lend(void) {
+    const uint64_t before = g_stream_staging_stats_lends;
+    const int ok = cuda_stream_staging_lend();
+    if (ok && g_stream_staging_stats_lends != before && cuda_stream_cache_stats_on()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D13 staging lent to the expert cache: +%u slots "
+                        "(budget %u, slots %u, resident %zu, free %zu)\n",
+                g_stream_staging_lent_slots, g_stream_expert_cache_budget,
+                g_stream_expert_slot_count, g_stream_resident_experts.size(),
+                g_stream_expert_free_slots.size());
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_staging_reclaim(void) {
+    const uint64_t before = g_stream_staging_stats_reclaims;
+    const uint64_t evicted = g_stream_staging_stats_evicted;
+    const int ok = cuda_stream_staging_reclaim();
+    if (ok && g_stream_staging_stats_reclaims != before && cuda_stream_cache_stats_on()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D13 staging reclaimed for a layer sweep: "
+                        "evicted %llu entries (budget %u, slots %u, resident %zu)\n",
+                (unsigned long long)(g_stream_staging_stats_evicted - evicted),
+                g_stream_expert_cache_budget, g_stream_expert_slot_count,
+                g_stream_resident_experts.size());
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_staging_lent(void) {
+    return g_stream_staging_lent;
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {

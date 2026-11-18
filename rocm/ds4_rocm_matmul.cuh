@@ -800,9 +800,63 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 launch");
 }
 
+/* D20: measurement-only timing of multi-row dense Q8_0 matmuls (the shared
+ * expert's projections and the other Q8_0 prefill GEMMs), under the same
+ * switch as the routed-MoE profiler (DS4_ROCM_D20_PROF=1, off by default).
+ * Each call with n_tok >= 2 is bracketed by two hipEvents on the null stream
+ * and synchronized after; GPU time is accumulated per (in_dim, out_dim) shape
+ * and row bucket and printed at exit.  Off: one cached flag test. */
+enum { D20Q_SHAPES = 48, D20Q_BUCKETS = 6 };
+static int g_d20q_on = -1;
+static cudaEvent_t g_d20q_ev[2];
+static uint64_t g_d20q_in[D20Q_SHAPES], g_d20q_out[D20Q_SHAPES];
+static double g_d20q_ms[D20Q_BUCKETS][D20Q_SHAPES], g_d20q_rows[D20Q_BUCKETS][D20Q_SHAPES];
+static uint64_t g_d20q_n[D20Q_BUCKETS][D20Q_SHAPES];
+static const char *g_d20q_bname[D20Q_BUCKETS] = {"2-6", "7-255", "256-511", "512-1023", "1024-2047", "2048+"};
+static void d20q_report(void) {
+    for (int b = 0; b < D20Q_BUCKETS; b++)
+        for (int k = 0; k < D20Q_SHAPES && g_d20q_in[k]; k++) {
+            if (!g_d20q_n[b][k]) continue;
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "D20 q8_0 matmul rows %s: in=%llu out=%llu calls=%llu mean_rows=%.0f gpu=%.2f ms/call total=%.1f ms\n",
+                    g_d20q_bname[b], (unsigned long long)g_d20q_in[k], (unsigned long long)g_d20q_out[k],
+                    (unsigned long long)g_d20q_n[b][k], g_d20q_rows[b][k] / g_d20q_n[b][k],
+                    g_d20q_ms[b][k] / g_d20q_n[b][k], g_d20q_ms[b][k]);
+        }
+}
+static int d20q_enabled(void) {
+    if (g_d20q_on < 0) {
+        const char *e = getenv("DS4_ROCM_D20_PROF");
+        g_d20q_on = e && e[0] && strcmp(e, "0") &&
+            cudaEventCreate(&g_d20q_ev[0]) == cudaSuccess &&
+            cudaEventCreate(&g_d20q_ev[1]) == cudaSuccess ? 1 : 0;
+        if (g_d20q_on) atexit(d20q_report);
+    }
+    return g_d20q_on;
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
-    return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
-                                           in_dim, out_dim, x, n_tok, "q8_0");
+    const bool timed = n_tok >= 2u && d20q_enabled();
+    if (timed) (void)cudaEventRecord(g_d20q_ev[0], 0);
+    const int ok = cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
+                                                   in_dim, out_dim, x, n_tok, "q8_0");
+    if (timed) {
+        (void)cudaEventRecord(g_d20q_ev[1], 0);
+        (void)cudaEventSynchronize(g_d20q_ev[1]);
+        float ms = 0.0f;
+        (void)cudaEventElapsedTime(&ms, g_d20q_ev[0], g_d20q_ev[1]);
+        const int b = n_tok <= 6u ? 0 : n_tok < 256u ? 1 : n_tok < 512u ? 2 : n_tok < 1024u ? 3 : n_tok < 2048u ? 4 : 5;
+        int k = 0;
+        for (; k < D20Q_SHAPES && g_d20q_in[k]; k++)
+            if (g_d20q_in[k] == in_dim && g_d20q_out[k] == out_dim) break;
+        if (k < D20Q_SHAPES) {
+            g_d20q_in[k] = in_dim;
+            g_d20q_out[k] = out_dim;
+            g_d20q_ms[b][k] += ms;
+            g_d20q_rows[b][k] += (double)n_tok;
+            g_d20q_n[b][k]++;
+        }
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(

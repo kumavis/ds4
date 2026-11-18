@@ -1,0 +1,892 @@
+{
+"version": 3,
+"kv": {
+"general.architecture": "deepseek41-dspark",
+"general.name": "DeepSeek V4.1 Flash DSpark",
+"general.source.url": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash",
+"general.source.revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+"general.alignment": 16384,
+"dspark.target_architecture": "deepseek41",
+"dspark.source_config": "{\"architectures\":[\"DeepseekV41ForCausalLM\"],\"bos_token_id\":0,\"dtype\":\"bfloat16\",\"eos_token_id\":1,\"image_token_id\":129264,\"model_type\":\"deepseek_v41\",\"pad_token_id\":2,\"quantization_config\":{\"activation_scheme\":\"dynamic\",\"expert_dtype\":\"fp4\",\"quant_method\":\"fp8\",\"scale_fmt\":\"ue8m0\",\"weight_block_size\":[32,32]},\"text_config\":{\"attention_bias\":false,\"attention_dropout\":0.0,\"candidate_block_size\":8,\"candidate_source_layer_id\":20,\"candidate_topk_blocks\":2048,\"compress_ratios\":[0,0,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0],\"compress_rope_theta\":160000,\"dspark_block_size\":5,\"dspark_markov_rank\":256,\"dspark_n_routed_experts\":128,\"dspark_noise_token_id\":128799,\"dspark_num_experts_per_tok\":3,\"dspark_target_layer_ids\":[37,38,39],\"engram_compressed_vocab_size\":99092,\"engram_head_dim\":256,\"engram_layer_ids\":[1,14],\"engram_max_ngram_size\":4,\"engram_n_heads\":8,\"engram_num_embeddings\":[384006168,384016682],\"engram_pad_token_id\":2,\"engram_vocab_size\":16000000,\"hc_eps\":1e-06,\"hc_mult\":4,\"hc_sinkhorn_iters\":20,\"head_dim\":512,\"hidden_act\":\"silu\",\"hidden_size\":5120,\"index_head_dim\":128,\"index_n_heads\":32,\"index_source_layer_ids\":[2,8,14,20,24,28,32,36],\"index_topk\":512,\"initializer_range\":0.02,\"kv_source_layer_ids\":[2,8,14,20],\"max_position_embeddings\":1048576,\"model_type\":\"deepseek_v41_text\",\"moe_intermediate_size\":2304,\"n_routed_experts\":384,\"n_shared_experts\":1,\"norm_topk_prob\":true,\"num_attention_heads\":64,\"num_experts_per_tok\":6,\"num_hidden_layers\":40,\"num_key_value_heads\":1,\"num_nextn_predict_layers\":3,\"o_groups\":8,\"o_lora_rank\":1024,\"q_lora_rank\":1280,\"qk_rope_head_dim\":64,\"rms_norm_eps\":1e-20,\"rope_scaling\":{\"beta_fast\":32,\"beta_slow\":1,\"factor\":16,\"original_max_position_embeddings\":65536,\"rope_type\":\"yarn\"},\"rope_theta\":10000,\"routed_scaling_factor\":1.5,\"scoring_func\":\"sqrtsoftplus\",\"sliding_window\":128,\"swiglu_limit\":10.0,\"tie_word_embeddings\":false,\"topk_method\":\"noaux_tc\",\"use_cache\":true,\"vocab_size\":129280},\"transformers_version\":\"5.6.0\",\"vision_config\":{\"downsample_ratio\":3,\"hidden_size\":1024,\"intermediate_size\":2816,\"max_image_tokens\":1024,\"max_wh_ratio\":null,\"min_pixels\":295936,\"model_type\":\"deepseek_v41_vision\",\"num_attention_heads\":16,\"num_hidden_layers\":32,\"patch_size\":14,\"rope_theta\":10000}}",
+"dspark.weight_encoding": "native MXFP4; lossless F16/F32 expansion",
+"dspark.target_layer_ids": [
+37,
+38,
+39
+],
+"dspark.block_size": 5,
+"dspark.markov_rank": 256,
+"dspark.noise_token_id": 128799,
+"dspark.n_routed_experts": 128,
+"dspark.num_experts_per_tok": 3
+},
+"tensors": [
+{
+"name": "mtp.0.hc_attn_fn.weight",
+"dims": [
+20480,
+24
+],
+"type": "F32",
+"off": 0,
+"bytes": 1966080,
+"abs_off": 16384
+},
+{
+"name": "mtp.0.hc_attn_base.weight",
+"dims": [
+24
+],
+"type": "F32",
+"off": 1966080,
+"bytes": 16384,
+"abs_off": 1982464
+},
+{
+"name": "mtp.0.hc_attn_scale.weight",
+"dims": [
+3
+],
+"type": "F32",
+"off": 1982464,
+"bytes": 16384,
+"abs_off": 1998848
+},
+{
+"name": "mtp.0.attn_norm.weight",
+"dims": [
+5120
+],
+"type": "F32",
+"off": 1998848,
+"bytes": 32768,
+"abs_off": 2015232
+},
+{
+"name": "mtp.0.hc_ffn_fn.weight",
+"dims": [
+20480,
+24
+],
+"type": "F32",
+"off": 2031616,
+"bytes": 1966080,
+"abs_off": 2048000
+},
+{
+"name": "mtp.0.hc_ffn_base.weight",
+"dims": [
+24
+],
+"type": "F32",
+"off": 3997696,
+"bytes": 16384,
+"abs_off": 4014080
+},
+{
+"name": "mtp.0.hc_ffn_scale.weight",
+"dims": [
+3
+],
+"type": "F32",
+"off": 4014080,
+"bytes": 16384,
+"abs_off": 4030464
+},
+{
+"name": "mtp.0.ffn_norm.weight",
+"dims": [
+5120
+],
+"type": "F32",
+"off": 4030464,
+"bytes": 32768,
+"abs_off": 4046848
+},
+{
+"name": "mtp.0.attn_sinks.weight",
+"dims": [
+64
+],
+"type": "F32",
+"off": 4063232,
+"bytes": 16384,
+"abs_off": 4079616
+},
+{
+"name": "mtp.0.attn_q_a.weight",
+"dims": [
+5120,
+1280
+],
+"type": "F16",
+"off": 4079616,
+"bytes": 13107200,
+"abs_off": 4096000
+},
+{
+"name": "mtp.0.attn_q_b.weight",
+"dims": [
+1280,
+32768
+],
+"type": "F16",
+"off": 17186816,
+"bytes": 83886080,
+"abs_off": 17203200
+},
+{
+"name": "mtp.0.attn_q_a_norm.weight",
+"dims": [
+1280
+],
+"type": "F32",
+"off": 101072896,
+"bytes": 16384,
+"abs_off": 101089280
+},
+{
+"name": "mtp.0.attn_kv.weight",
+"dims": [
+5120,
+512
+],
+"type": "F16",
+"off": 101089280,
+"bytes": 5242880,
+"abs_off": 101105664
+},
+{
+"name": "mtp.0.attn_kv_a_norm.weight",
+"dims": [
+512
+],
+"type": "F32",
+"off": 106332160,
+"bytes": 16384,
+"abs_off": 106348544
+},
+{
+"name": "mtp.0.attn_output_a.weight",
+"dims": [
+4096,
+8192
+],
+"type": "F16",
+"off": 106348544,
+"bytes": 67108864,
+"abs_off": 106364928
+},
+{
+"name": "mtp.0.attn_output_b.weight",
+"dims": [
+8192,
+5120
+],
+"type": "F16",
+"off": 173457408,
+"bytes": 83886080,
+"abs_off": 173473792
+},
+{
+"name": "mtp.0.ffn_gate_inp.weight",
+"dims": [
+5120,
+128
+],
+"type": "F32",
+"off": 257343488,
+"bytes": 2621440,
+"abs_off": 257359872
+},
+{
+"name": "mtp.0.exp_probs_b.bias",
+"dims": [
+128
+],
+"type": "F32",
+"off": 259964928,
+"bytes": 16384,
+"abs_off": 259981312
+},
+{
+"name": "mtp.0.exp_probs_b_vl.bias",
+"dims": [
+128
+],
+"type": "F32",
+"off": 259981312,
+"bytes": 16384,
+"abs_off": 259997696
+},
+{
+"name": "mtp.0.ffn_gate_shexp.weight",
+"dims": [
+5120,
+2304
+],
+"type": "F16",
+"off": 259997696,
+"bytes": 23592960,
+"abs_off": 260014080
+},
+{
+"name": "mtp.0.ffn_gate_exps.weight",
+"dims": [
+5120,
+2304,
+128
+],
+"type": "MXFP4",
+"off": 283590656,
+"bytes": 802160640,
+"abs_off": 283607040
+},
+{
+"name": "mtp.0.ffn_up_shexp.weight",
+"dims": [
+5120,
+2304
+],
+"type": "F16",
+"off": 1085751296,
+"bytes": 23592960,
+"abs_off": 1085767680
+},
+{
+"name": "mtp.0.ffn_up_exps.weight",
+"dims": [
+5120,
+2304,
+128
+],
+"type": "MXFP4",
+"off": 1109344256,
+"bytes": 802160640,
+"abs_off": 1109360640
+},
+{
+"name": "mtp.0.ffn_down_shexp.weight",
+"dims": [
+2304,
+5120
+],
+"type": "F16",
+"off": 1911504896,
+"bytes": 23592960,
+"abs_off": 1911521280
+},
+{
+"name": "mtp.0.ffn_down_exps.weight",
+"dims": [
+2304,
+5120,
+128
+],
+"type": "MXFP4",
+"off": 1935097856,
+"bytes": 802160640,
+"abs_off": 1935114240
+},
+{
+"name": "mtp.0.main_proj.weight",
+"dims": [
+15360,
+5120
+],
+"type": "F16",
+"off": 2737258496,
+"bytes": 157286400,
+"abs_off": 2737274880
+},
+{
+"name": "mtp.0.main_norm.weight",
+"dims": [
+5120
+],
+"type": "F32",
+"off": 2894544896,
+"bytes": 32768,
+"abs_off": 2894561280
+},
+{
+"name": "mtp.1.hc_attn_fn.weight",
+"dims": [
+20480,
+24
+],
+"type": "F32",
+"off": 2894577664,
+"bytes": 1966080,
+"abs_off": 2894594048
+},
+{
+"name": "mtp.1.hc_attn_base.weight",
+"dims": [
+24
+],
+"type": "F32",
+"off": 2896543744,
+"bytes": 16384,
+"abs_off": 2896560128
+},
+{
+"name": "mtp.1.hc_attn_scale.weight",
+"dims": [
+3
+],
+"type": "F32",
+"off": 2896560128,
+"bytes": 16384,
+"abs_off": 2896576512
+},
+{
+"name": "mtp.1.attn_norm.weight",
+"dims": [
+5120
+],
+"type": "F32",
+"off": 2896576512,
+"bytes": 32768,
+"abs_off": 2896592896
+},
+{
+"name": "mtp.1.hc_ffn_fn.weight",
+"dims": [
+20480,
+24
+],
+"type": "F32",
+"off": 2896609280,
+"bytes": 1966080,
+"abs_off": 2896625664
+},
+{
+"name": "mtp.1.hc_ffn_base.weight",
+"dims": [
+24
+],
+"type": "F32",
+"off": 2898575360,
+"bytes": 16384,
+"abs_off": 2898591744
+},
+{
+"name": "mtp.1.hc_ffn_scale.weight",
+"dims": [
+3
+],
+"type": "F32",
+"off": 2898591744,
+"bytes": 16384,
+"abs_off": 2898608128
+},
+{
+"name": "mtp.1.ffn_norm.weight",
+"dims": [
+5120
+],
+"type": "F32",
+"off": 2898608128,
+"bytes": 32768,
+"abs_off": 2898624512
+},
+{
+"name": "mtp.1.attn_sinks.weight",
+"dims": [
+64
+],
+"type": "F32",
+"off": 2898640896,
+"bytes": 16384,
+"abs_off": 2898657280
+},
+{
+"name": "mtp.1.attn_q_a.weight",
+"dims": [
+5120,
+1280
+],
+"type": "F16",
+"off": 2898657280,
+"bytes": 13107200,
+"abs_off": 2898673664
+},
+{
+"name": "mtp.1.attn_q_b.weight",
+"dims": [
+1280,
+32768
+],
+"type": "F16",
+"off": 2911764480,
+"bytes": 83886080,
+"abs_off": 2911780864
+},
+{
+"name": "mtp.1.attn_q_a_norm.weight",
+"dims": [
+1280
+],
+"type": "F32",
+"off": 2995650560,
+"bytes": 16384,
+"abs_off": 2995666944
+},
+{
+"name": "mtp.1.attn_kv.weight",
+"dims": [
+5120,
+512
+],
+"type": "F16",
+"off": 2995666944,
+"bytes": 5242880,
+"abs_off": 2995683328
+},
+{
+"name": "mtp.1.attn_kv_a_norm.weight",
+"dims": [
+512
+],
+"type": "F32",
+"off": 3000909824,
+"bytes": 16384,
+"abs_off": 3000926208
+},
+{
+"name": "mtp.1.attn_output_a.weight",
+"dims": [
+4096,
+8192
+],
+"type": "F16",
+"off": 3000926208,
+"bytes": 67108864,
+"abs_off": 3000942592
+},
+{
+"name": "mtp.1.attn_output_b.weight",
+"dims": [
+8192,
+5120
+],
+"type": "F16",
+"off": 3068035072,
+"bytes": 83886080,
+"abs_off": 3068051456
+},
+{
+"name": "mtp.1.ffn_gate_inp.weight",
+"dims": [
+5120,
+128
+],
+"type": "F32",
+"off": 3151921152,
+"bytes": 2621440,
+"abs_off": 3151937536
+},
+{
+"name": "mtp.1.exp_probs_b.bias",
+"dims": [
+128
+],
+"type": "F32",
+"off": 3154542592,
+"bytes": 16384,
+"abs_off": 3154558976
+},
+{
+"name": "mtp.1.exp_probs_b_vl.bias",
+"dims": [
+128
+],
+"type": "F32",
+"off": 3154558976,
+"bytes": 16384,
+"abs_off": 3154575360
+},
+{
+"name": "mtp.1.ffn_gate_shexp.weight",
+"dims": [
+5120,
+2304
+],
+"type": "F16",
+"off": 3154575360,
+"bytes": 23592960,
+"abs_off": 3154591744
+},
+{
+"name": "mtp.1.ffn_gate_exps.weight",
+"dims": [
+5120,
+2304,
+128
+],
+"type": "MXFP4",
+"off": 3178168320,
+"bytes": 802160640,
+"abs_off": 3178184704
+},
+{
+"name": "mtp.1.ffn_up_shexp.weight",
+"dims": [
+5120,
+2304
+],
+"type": "F16",
+"off": 3980328960,
+"bytes": 23592960,
+"abs_off": 3980345344
+},
+{
+"name": "mtp.1.ffn_up_exps.weight",
+"dims": [
+5120,
+2304,
+128
+],
+"type": "MXFP4",
+"off": 4003921920,
+"bytes": 802160640,
+"abs_off": 4003938304
+},
+{
+"name": "mtp.1.ffn_down_shexp.weight",
+"dims": [
+2304,
+5120
+],
+"type": "F16",
+"off": 4806082560,
+"bytes": 23592960,
+"abs_off": 4806098944
+},
+{
+"name": "mtp.1.ffn_down_exps.weight",
+"dims": [
+2304,
+5120,
+128
+],
+"type": "MXFP4",
+"off": 4829675520,
+"bytes": 802160640,
+"abs_off": 4829691904
+},
+{
+"name": "mtp.2.hc_attn_fn.weight",
+"dims": [
+20480,
+24
+],
+"type": "F32",
+"off": 5631836160,
+"bytes": 1966080,
+"abs_off": 5631852544
+},
+{
+"name": "mtp.2.hc_attn_base.weight",
+"dims": [
+24
+],
+"type": "F32",
+"off": 5633802240,
+"bytes": 16384,
+"abs_off": 5633818624
+},
+{
+"name": "mtp.2.hc_attn_scale.weight",
+"dims": [
+3
+],
+"type": "F32",
+"off": 5633818624,
+"bytes": 16384,
+"abs_off": 5633835008
+},
+{
+"name": "mtp.2.attn_norm.weight",
+"dims": [
+5120
+],
+"type": "F32",
+"off": 5633835008,
+"bytes": 32768,
+"abs_off": 5633851392
+},
+{
+"name": "mtp.2.hc_ffn_fn.weight",
+"dims": [
+20480,
+24
+],
+"type": "F32",
+"off": 5633867776,
+"bytes": 1966080,
+"abs_off": 5633884160
+},
+{
+"name": "mtp.2.hc_ffn_base.weight",
+"dims": [
+24
+],
+"type": "F32",
+"off": 5635833856,
+"bytes": 16384,
+"abs_off": 5635850240
+},
+{
+"name": "mtp.2.hc_ffn_scale.weight",
+"dims": [
+3
+],
+"type": "F32",
+"off": 5635850240,
+"bytes": 16384,
+"abs_off": 5635866624
+},
+{
+"name": "mtp.2.ffn_norm.weight",
+"dims": [
+5120
+],
+"type": "F32",
+"off": 5635866624,
+"bytes": 32768,
+"abs_off": 5635883008
+},
+{
+"name": "mtp.2.attn_sinks.weight",
+"dims": [
+64
+],
+"type": "F32",
+"off": 5635899392,
+"bytes": 16384,
+"abs_off": 5635915776
+},
+{
+"name": "mtp.2.attn_q_a.weight",
+"dims": [
+5120,
+1280
+],
+"type": "F16",
+"off": 5635915776,
+"bytes": 13107200,
+"abs_off": 5635932160
+},
+{
+"name": "mtp.2.attn_q_b.weight",
+"dims": [
+1280,
+32768
+],
+"type": "F16",
+"off": 5649022976,
+"bytes": 83886080,
+"abs_off": 5649039360
+},
+{
+"name": "mtp.2.attn_q_a_norm.weight",
+"dims": [
+1280
+],
+"type": "F32",
+"off": 5732909056,
+"bytes": 16384,
+"abs_off": 5732925440
+},
+{
+"name": "mtp.2.attn_kv.weight",
+"dims": [
+5120,
+512
+],
+"type": "F16",
+"off": 5732925440,
+"bytes": 5242880,
+"abs_off": 5732941824
+},
+{
+"name": "mtp.2.attn_kv_a_norm.weight",
+"dims": [
+512
+],
+"type": "F32",
+"off": 5738168320,
+"bytes": 16384,
+"abs_off": 5738184704
+},
+{
+"name": "mtp.2.attn_output_a.weight",
+"dims": [
+4096,
+8192
+],
+"type": "F16",
+"off": 5738184704,
+"bytes": 67108864,
+"abs_off": 5738201088
+},
+{
+"name": "mtp.2.attn_output_b.weight",
+"dims": [
+8192,
+5120
+],
+"type": "F16",
+"off": 5805293568,
+"bytes": 83886080,
+"abs_off": 5805309952
+},
+{
+"name": "mtp.2.ffn_gate_inp.weight",
+"dims": [
+5120,
+128
+],
+"type": "F32",
+"off": 5889179648,
+"bytes": 2621440,
+"abs_off": 5889196032
+},
+{
+"name": "mtp.2.exp_probs_b.bias",
+"dims": [
+128
+],
+"type": "F32",
+"off": 5891801088,
+"bytes": 16384,
+"abs_off": 5891817472
+},
+{
+"name": "mtp.2.exp_probs_b_vl.bias",
+"dims": [
+128
+],
+"type": "F32",
+"off": 5891817472,
+"bytes": 16384,
+"abs_off": 5891833856
+},
+{
+"name": "mtp.2.ffn_gate_shexp.weight",
+"dims": [
+5120,
+2304
+],
+"type": "F16",
+"off": 5891833856,
+"bytes": 23592960,
+"abs_off": 5891850240
+},
+{
+"name": "mtp.2.ffn_gate_exps.weight",
+"dims": [
+5120,
+2304,
+128
+],
+"type": "MXFP4",
+"off": 5915426816,
+"bytes": 802160640,
+"abs_off": 5915443200
+},
+{
+"name": "mtp.2.ffn_up_shexp.weight",
+"dims": [
+5120,
+2304
+],
+"type": "F16",
+"off": 6717587456,
+"bytes": 23592960,
+"abs_off": 6717603840
+},
+{
+"name": "mtp.2.ffn_up_exps.weight",
+"dims": [
+5120,
+2304,
+128
+],
+"type": "MXFP4",
+"off": 6741180416,
+"bytes": 802160640,
+"abs_off": 6741196800
+},
+{
+"name": "mtp.2.ffn_down_shexp.weight",
+"dims": [
+2304,
+5120
+],
+"type": "F16",
+"off": 7543341056,
+"bytes": 23592960,
+"abs_off": 7543357440
+},
+{
+"name": "mtp.2.ffn_down_exps.weight",
+"dims": [
+2304,
+5120,
+128
+],
+"type": "MXFP4",
+"off": 7566934016,
+"bytes": 802160640,
+"abs_off": 7566950400
+},
+{
+"name": "mtp.2.norm.weight",
+"dims": [
+5120
+],
+"type": "F32",
+"off": 8369094656,
+"bytes": 32768,
+"abs_off": 8369111040
+},
+{
+"name": "mtp.2.markov_head.markov_w1.weight",
+"dims": [
+256,
+129280
+],
+"type": "F32",
+"off": 8369127424,
+"bytes": 132382720,
+"abs_off": 8369143808
+},
+{
+"name": "mtp.2.markov_head.markov_w2.weight",
+"dims": [
+256,
+129280
+],
+"type": "F32",
+"off": 8501510144,
+"bytes": 132382720,
+"abs_off": 8501526528
+},
+{
+"name": "mtp.2.confidence_head.proj.weight",
+"dims": [
+5376,
+1
+],
+"type": "F32",
+"off": 8633892864,
+"bytes": 32768,
+"abs_off": 8633909248
+}
+],
+"header_bytes": 8048,
+"file_bytes": 8633942016
+}

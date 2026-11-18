@@ -41255,6 +41255,15 @@ typedef struct {
     uint64_t warm_plain, warm_draft, switches, momentum, last_plain_round;
     uint64_t width_hist[DS41_SCHED_MAXW + 2u]; /* [0] no draft, [1] drafted k=0, [k+1] */
     bool mode_draft;
+    /* D9 cost-model scheduler (DS4_DSPARK_SCHED=model): fixed constants, so
+     * every decision is a function of the token stream only. */
+    bool m_init, m_probe;
+    double m_bias[DS41_SCHED_MAXW];
+    double m_adv_v, m_adv_w;
+    uint32_t m_plain_left, m_fails;
+    uint64_t m_rounds, m_plain, m_drafted, m_trips, m_probes;
+    uint64_t m_width_hist[DS41_SCHED_MAXW + 1u];
+    double m_pred_tokens, m_real_tokens;
 } ds41_sched;
 typedef struct {
     const ds4_dspark_weights *w;
@@ -89989,7 +89998,7 @@ static uint32_t ds41_draft_scheduled_prefix_len(
  * The model state is printed at session end next to the DSpark stats.
  * ========================================================================= */
 typedef struct {
-    bool online, trace, momentum;
+    bool online, model, trace, momentum;
     int force;                 /* 0 none, 1 plain, 2 draft */
     double halflife, decay, explore, margin;
     uint32_t max_width, warm, print_every;
@@ -90013,6 +90022,9 @@ static const ds41_sched_params *ds41_sched_params_get(void) {
      * over code/prose/json/translate/list and repeatable); online stays
      * selectable with DS4_DSPARK_SCHED=online. */
     const char *mode = getenv("DS4_DSPARK_SCHED");
+    /* D11 merge: D4 default (old) kept; online and the D9 model scheduler
+     * on request. */
+    p.model = mode && strcmp(mode, "model") == 0;
     p.online = mode && strcmp(mode, "online") == 0;
     const char *trace = getenv("DS4_DSPARK_SCHED_TRACE");
     p.trace = trace && trace[0] && strcmp(trace, "0") != 0;
@@ -90312,10 +90324,13 @@ static void ds41_sched_print(const ds41_sched *m, const char *what) {
         acc, hist[0] ? hist : "none");
 }
 
+static void ds41_model_print(const ds41_sched *m);
+
 static void ds41_sched_print_session(const ds4_session *s) {
     if (!s || !ds4_session_is_ds41(s) || !s->ds41_graph.draft) return;
     const ds41_sched *m = &s->ds41_graph.draft->sched;
     if (m->rounds) ds41_sched_print(m, "final");
+    ds41_model_print(m);
 }
 
 static void ds41_sched_finish_round(ds41_sched *m, const ds41_sched_params *sp,
@@ -90436,6 +90451,247 @@ static void ds41_draft_trace_cycle(const ds4_session *s,
     funlockfile(stderr);
 }
 
+/* =========================================================================
+ * D9: cost-model DSpark scheduler (DS4_DSPARK_SCHED=model) and per-round
+ * attribution (DS4_D9_ROUND_TRACE=1, DS4_D9_PROBE=1).
+ *
+ * Fixed costs (ms), fitted offline from per-round traces (scripts/d9):
+ *   P      one plain target step inside a DSpark session
+ *   D      one drafter proposal
+ *   V(r)   verify + commit of r = k + 1 rows = VA + VB * r
+ * Acceptance of draft i (given drafts < i accepted):
+ *   p_i = sigmoid(CAL_SCALE * confidence_i + bias_i), bias_i from CAL_BIAS,
+ *   optionally nudged by ETA * (accepted - p_i) at each labelled position
+ *   (labels are token matches, so this stays a function of the tokens).
+ * Width (after the drafter ran, its cost is sunk): the k in 0..MAX_WIDTH
+ *   maximising E(k) - rho * C(k), E(k) = 1 + sum_{i<=k} prod_{j<=i} p_j,
+ *   C(0) = P, C(k) = V(k + 1), rho = KAPPA / P.
+ * Draft or plain step (before the drafter): an EWMA (HALFLIFE rounds) of the
+ *   per-round advantage over plain decoding in tokens,
+ *     adv = (tokens - 1) - (D + C(k) - P) / P,
+ *   with tokens E(k) (SIGNAL=predicted, default) or the committed count
+ *   (SIGNAL=realized).  When it falls below GATE the next SKIP rounds are
+ *   plain steps; then one probe proposal restarts the EWMA from that round
+ *   alone; a failed probe doubles SKIP up to SKIP_MAX.
+ * Nothing reads a clock, so a run repeats exactly.  Defaults depend on the
+ * routed expert type (MXFP4 or other, i.e. Q2); every constant is settable:
+ *   DS4_DSPARK_MODEL_{P,D,VA,VB,KAPPA,CAL_SCALE,CAL_BIAS,ETA,HALFLIFE,GATE,
+ *                     SKIP,SKIP_MAX,MAX_WIDTH,SIGNAL}
+ * ========================================================================= */
+typedef struct {
+    double P, D, VA, VB, kappa, cal_scale, eta, decay, gate;
+    double bias[DS41_SCHED_MAXW];
+    uint32_t skip, skip_max, max_width;
+    bool predicted;
+} ds41_model_params;
+
+static const ds41_model_params *ds41_model_params_get(const ds4_weights *w) {
+    static ds41_model_params p;
+    static bool ready = false;
+    if (ready) return &p;
+    bool mxfp4 = false;
+    for (uint32_t il = 0; w && il < DS4_N_LAYER; il++) {
+        if (!w->layer[il].ffn_gate_exps) continue;
+        mxfp4 = w->layer[il].ffn_gate_exps->type == DS4_TENSOR_MXFP4;
+        break;
+    }
+    /* Defaults: D9 fit (D9.md, "Cost model"). */
+    /* MXFP4: pooled over code/prose/json/translate/list; other expert
+     * types (IQ2_XXS/Q2_K): Q2 code.  verify ms = VA + VB * rows folds the
+     * fitted 1.37-1.64 ms per expert miss at the mean misses per row. */
+    const double defP = mxfp4 ? 118.0 : 87.0;
+    const double defVA = mxfp4 ? 77.0 : 66.0;
+    const double defVB = mxfp4 ? 49.0 : 41.0;
+    p.P = ds41_sched_env_double("DS4_DSPARK_MODEL_P", defP, 1.0, 10000.0);
+    p.D = ds41_sched_env_double("DS4_DSPARK_MODEL_D", 20.0, 0.0, 10000.0);
+    p.VA = ds41_sched_env_double("DS4_DSPARK_MODEL_VA", defVA, 0.0, 10000.0);
+    p.VB = ds41_sched_env_double("DS4_DSPARK_MODEL_VB", defVB, 0.0, 10000.0);
+    p.kappa = ds41_sched_env_double("DS4_DSPARK_MODEL_KAPPA", 1.1, 0.1, 10.0);
+    p.cal_scale = ds41_sched_env_double("DS4_DSPARK_MODEL_CAL_SCALE", 1.0, 0.0, 10.0);
+    p.eta = ds41_sched_env_double("DS4_DSPARK_MODEL_ETA", 0.0, 0.0, 1.0);
+    const double hl = ds41_sched_env_double("DS4_DSPARK_MODEL_HALFLIFE", 1.0, 0.5, 1024.0);
+    p.decay = pow(0.5, 1.0 / hl);
+    p.gate = ds41_sched_env_double("DS4_DSPARK_MODEL_GATE", -0.1, -10.0, 10.0);
+    p.skip = (uint32_t)ds41_sched_env_double("DS4_DSPARK_MODEL_SKIP", 8.0, 0.0, 4096.0);
+    p.skip_max = (uint32_t)ds41_sched_env_double("DS4_DSPARK_MODEL_SKIP_MAX", 64.0, 0.0, 65536.0);
+    if (p.skip_max < p.skip) p.skip_max = p.skip;
+    p.max_width = (uint32_t)ds41_sched_env_double("DS4_DSPARK_MODEL_MAX_WIDTH",
+                                                  5.0, 1.0, (double)DS41_SCHED_MAXW);
+    for (uint32_t i = 0; i < DS41_SCHED_MAXW; i++) p.bias[i] = 0.0;
+    const char *bias = getenv("DS4_DSPARK_MODEL_CAL_BIAS");
+    for (uint32_t i = 0; bias && *bias && i < DS41_SCHED_MAXW; i++) {
+        char *end = NULL;
+        const double v = strtod(bias, &end);
+        if (end == bias || !isfinite(v)) break;
+        p.bias[i] = v;
+        bias = *end == ',' ? end + 1 : end;
+    }
+    const char *sig = getenv("DS4_DSPARK_MODEL_SIGNAL");
+    p.predicted = !(sig && strcmp(sig, "realized") == 0);
+    fprintf(stderr, "ds4: DSpark model scheduler (%s defaults) P=%.1f D=%.1f "
+            "V=%.1f+%.1f*rows kappa=%.3f cal=%.3f bias=%.3f,%.3f,%.3f,%.3f,%.3f "
+            "eta=%.3f halflife=%.2f gate=%.3f skip=%u..%u max_width=%u signal=%s\n",
+            mxfp4 ? "MXFP4" : "non-MXFP4", p.P, p.D, p.VA, p.VB, p.kappa,
+            p.cal_scale, p.bias[0], p.bias[1], p.bias[2], p.bias[3], p.bias[4],
+            p.eta, hl, p.gate, p.skip, p.skip_max, p.max_width,
+            p.predicted ? "predicted" : "realized");
+    ready = true;
+    return &p;
+}
+
+static double ds41_model_accept_p(const ds41_sched *m, const ds41_model_params *mp,
+                                  uint32_t i, float logit) {
+    if (!isfinite(logit) || i >= DS41_SCHED_MAXW) return 0.0;
+    const double z = mp->cal_scale * (double)logit + m->m_bias[i];
+    double p = 1.0 / (1.0 + exp(-z));
+    if (p < 0.001) p = 0.001;
+    if (p > 0.999) p = 0.999;
+    return p;
+}
+
+static double ds41_model_cost(const ds41_model_params *mp, uint32_t k) {
+    return k ? mp->VA + mp->VB * (double)(k + 1u) : mp->P;
+}
+
+/* Draft (true) or plain step (false) before the drafter runs. */
+static bool ds41_model_decide(ds41_sched *m, const ds41_model_params *mp,
+                              const char **why) {
+    if (!m->m_init) {
+        m->m_init = true;
+        for (uint32_t i = 0; i < DS41_SCHED_MAXW; i++) m->m_bias[i] = mp->bias[i];
+    }
+    m->m_rounds++;
+    if (m->m_plain_left) {
+        m->m_plain_left--;
+        if (!m->m_plain_left) m->m_probe = true;
+        m->m_plain++;
+        *why = "model_plain";
+        return false;
+    }
+    *why = m->m_probe ? "model_probe" : "model_draft";
+    return true;
+}
+
+static uint32_t ds41_model_choose(const ds41_sched *m, const ds41_model_params *mp,
+                                  const float *conf, uint32_t count, bool causal,
+                                  double *e_out) {
+    const double rho = mp->kappa / mp->P;
+    double survive = 1.0, expected = 1.0;
+    double best_gain = 1.0 - rho * mp->P, best_e = 1.0;
+    uint32_t best = 0;
+    if (count > mp->max_width) count = mp->max_width;
+    if (count > DS41_SCHED_MAXW) count = DS41_SCHED_MAXW;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!isfinite(conf[i])) break;
+        survive *= ds41_model_accept_p(m, mp, i, conf[i]);
+        expected += survive;
+        const double gain = expected - rho * ds41_model_cost(mp, i + 1u);
+        if (gain > best_gain) {
+            best = i + 1u;
+            best_gain = gain;
+            best_e = expected;
+        } else if (causal) {
+            break;
+        }
+    }
+    if (e_out) *e_out = best_e;
+    return best;
+}
+
+static void ds41_model_note(ds41_sched *m, const ds41_model_params *mp,
+                            bool proposed, uint32_t k, uint32_t matched,
+                            uint32_t kept, double expected, const float *conf) {
+    if (!proposed) return;
+    m->m_drafted++;
+    m->m_width_hist[k < DS41_SCHED_MAXW ? k : DS41_SCHED_MAXW]++;
+    if (k) {
+        m->m_pred_tokens += expected;
+        m->m_real_tokens += 1.0 + matched;
+    }
+    /* Labels exist for draft i <= matched (i < k): accepted iff i < matched. */
+    for (uint32_t i = 0; mp->eta > 0.0 && i < k && i <= matched &&
+         i < DS41_SCHED_MAXW; i++) {
+        if (!isfinite(conf[i])) break;
+        const double a = i < matched ? 1.0 : 0.0;
+        const double p = ds41_model_accept_p(m, mp, i, conf[i]);
+        double b = m->m_bias[i] + mp->eta * (a - p);
+        m->m_bias[i] = b < -4.0 ? -4.0 : b > 4.0 ? 4.0 : b;
+    }
+    const double tokens = mp->predicted ? expected : (double)kept;
+    const double adv = (tokens - 1.0) -
+        (mp->D + ds41_model_cost(mp, k) - mp->P) / mp->P;
+    if (m->m_probe) {
+        m->m_probe = false;
+        m->m_adv_v = m->m_adv_w = 0.0;
+        m->m_probes++;
+    }
+    m->m_adv_v = m->m_adv_v * mp->decay + adv;
+    m->m_adv_w = m->m_adv_w * mp->decay + 1.0;
+    if (m->m_adv_v / m->m_adv_w < mp->gate) {
+        /* First trip uses SKIP; every further consecutive trip doubles it. */
+        uint64_t s = mp->skip;
+        for (uint32_t i = 0; i < m->m_fails && s < mp->skip_max; i++) s *= 2u;
+        if (s > mp->skip_max) s = mp->skip_max;
+        m->m_plain_left = (uint32_t)s;
+        m->m_fails++;
+        m->m_trips++;
+        if (!s) m->m_probe = true;
+    } else {
+        m->m_fails = 0;
+    }
+}
+
+static void ds41_model_print(const ds41_sched *m) {
+    if (!m->m_rounds) return;
+    fprintf(stderr, "ds4: DSpark model sched final rounds=%llu plain=%llu "
+            "drafted=%llu trips=%llu probes=%llu pred_tokens=%.1f "
+            "real_tokens=%.0f bias=%.3f,%.3f,%.3f,%.3f,%.3f widths=",
+            (unsigned long long)m->m_rounds, (unsigned long long)m->m_plain,
+            (unsigned long long)m->m_drafted, (unsigned long long)m->m_trips,
+            (unsigned long long)m->m_probes, m->m_pred_tokens, m->m_real_tokens,
+            m->m_bias[0], m->m_bias[1], m->m_bias[2], m->m_bias[3], m->m_bias[4]);
+    for (uint32_t i = 0; i <= DS41_SCHED_MAXW; i++)
+        if (m->m_width_hist[i])
+            fprintf(stderr, "%u:%llu,", i, (unsigned long long)m->m_width_hist[i]);
+    fputc('\n', stderr);
+}
+
+static int ds41_d9_flag(const char *name) {
+    const char *env = getenv(name);
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+/* Opt-in attribution only (DS4_D9_ROUND_TRACE=1): one line per round with
+ * the drafted tokens, their confidence logits, the phase times and the
+ * stream-cache counters the round moved.  No decision reads it. */
+static void ds41_d9_trace_round(const ds4_session *s, uint32_t pos,
+        const char *mode, const char *why, bool draftable, bool proposed,
+        uint32_t block, uint32_t k, uint32_t matched, uint32_t kept, int seed,
+        const int *drafts, const float *conf, double prop_ms, double verify_ms,
+        double commit_ms, double plain_ms, double total_ms,
+        const uint64_t c0[4], const uint64_t c1[4]) {
+    (void)s;
+    flockfile(stderr);
+    fprintf(stderr, "D9_ROUND v=1 pos=%u mode=%s why=%s draftable=%d proposed=%d "
+        "block=%u k=%u matched=%u kept=%u seed=%d prop_ms=%.3f verify_ms=%.3f "
+        "commit_ms=%.3f plain_ms=%.3f total_ms=%.3f slots=%llu misses=%llu "
+        "wait_ms=%.3f jobs=%llu drafts=",
+        pos, mode, why, (int)draftable, (int)proposed, block, k, matched, kept,
+        seed, prop_ms, verify_ms, commit_ms, plain_ms, total_ms,
+        (unsigned long long)(c1[0] - c0[0]), (unsigned long long)(c1[1] - c0[1]),
+        (double)(c1[2] - c0[2]) / 1000.0, (unsigned long long)(c1[3] - c0[3]));
+    if (proposed) {
+        for (uint32_t i = 0; i < block; ++i) fprintf(stderr, "%s%d", i ? "," : "", drafts[i]);
+        fputs(" conf=", stderr);
+        for (uint32_t i = 0; i < block; ++i)
+            fprintf(stderr, "%s%a", i ? "," : "", (double)conf[i]);
+    } else {
+        fputs("- conf=-", stderr);
+    }
+    fputc('\n', stderr);
+    funlockfile(stderr);
+}
+
 /* Draft from the last committed target features, verify the seed and draft
  * suffix together, then retain only the target-accepted prefix. */
 static int ds41_session_spec(ds4_session *s, int first_token,
@@ -90486,6 +90742,19 @@ static int ds41_session_spec(ds4_session *s, int first_token,
     const ds41_sched_params *sp = ds41_sched_params_get();
     const bool online = cost_scheduled && g->streaming && !tp_verify &&
         sp->online;
+    /* D9: cost-model scheduler, probe mode and round trace. */
+    const bool model = cost_scheduled && g->streaming && !tp_verify &&
+        sp->model;
+    const ds41_model_params *mp = model ? ds41_model_params_get(&e->weights) : NULL;
+    static int d9_trace = -1, d9_probe = -1;
+    if (d9_trace < 0) d9_trace = ds41_d9_flag("DS4_D9_ROUND_TRACE");
+    if (d9_probe < 0) d9_probe = ds41_d9_flag("DS4_D9_PROBE");
+    uint64_t d9_c0[4] = {0}, d9_c1[4] = {0};
+    if (d9_trace && ds4_rocm_perf_counters)
+        ds4_rocm_perf_counters(&d9_c0[0], &d9_c0[1], &d9_c0[2], &d9_c0[3]);
+    const char *d9_mode = d9_probe ? "probe" : model ? "model" :
+        online ? "online" : "old";
+    double model_expected = 1.0;
     ds41_sched *sm = &d->sched;
     const char *sched_why = "-";
     uint64_t pc_w0 = 0, pc_j0 = 0;
@@ -90493,7 +90762,19 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         ds4_rocm_perf_counters(NULL, NULL, &pc_w0, &pc_j0);
     double sched_pred = 1.0;
     bool proposed;
-    if (online) {
+    if (d9_probe) {
+        /* D9 probe: draft at every draftable position, log it, then take a
+         * plain step (k = 0 below): the plain greedy trajectory with the
+         * drafter's full proposal at every position. */
+        proposed = draftable && !d8_no_propose;
+        sched_why = draftable ? "probe" : "undraftable";
+    } else if (model) {
+        proposed = draftable && !d8_no_propose && ds41_model_decide(sm, mp, &sched_why);
+        if (!draftable) sched_why = "undraftable";
+        else if (d8_no_propose) sched_why = "d8_no_propose";
+        if (draftable && !proposed && !d8_no_propose && stats)
+            s->dspark_stats.scheduler_skips++;
+    } else if (online) {
         proposed = draftable && !d8_no_propose &&
             ds41_sched_decide(sm, sp, B < DS41_SCHED_MAXW ? B : DS41_SCHED_MAXW,
                               exact, &sched_why);
@@ -90543,6 +90824,8 @@ static int ds41_session_spec(ds4_session *s, int first_token,
                 }
                 if (warm_k > k) k = warm_k;
             }
+        } else if (model) {
+            k = ds41_model_choose(sm, mp, confidence, B, exact, &model_expected);
         } else {
             k = cost_scheduled ?
                 ds41_draft_scheduled_prefix_len(confidence, B, tp_verify) :
@@ -90566,6 +90849,16 @@ static int ds41_session_spec(ds4_session *s, int first_token,
                     e, drafts[i], think_mode)) { k = i; break; }
         }
         if (online) sched_pred = ds41_sched_expected(sm, confidence, k);
+        if (model) {
+            /* Expected tokens of the width actually verified (caps may cut). */
+            double survive = 1.0;
+            model_expected = 1.0;
+            for (uint32_t i = 0; i < k && i < DS41_SCHED_MAXW; i++) {
+                survive *= ds41_model_accept_p(sm, mp, i, confidence[i]);
+                model_expected += survive;
+            }
+        }
+        if (d9_probe) k = 0;
     }
     if (stats) {
         s->dspark_stats.cycles++;
@@ -90598,12 +90891,24 @@ static int ds41_session_spec(ds4_session *s, int first_token,
                 1u, sched_pred, propose_seconds * 1000.0,
                 (done - target_started) * 1000.0, (done - t0) * 1000.0,
                 (double)(pc_j1 - pc_j0) / 3.0, (double)(pc_w1 - pc_w0) / 1000.0);
+        } else if (model) {
+            ds41_model_note(sm, mp, proposed, 0, 0, 1u, 1.0, confidence);
         } else {
             ds41_draft_adapt(d, proposed, 0, 0, tp_verify);
         }
         if (stats) {
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
             s->dspark_stats.total_ms += (now_sec() - t0) * 1000.0;
+        }
+        if (d9_trace) {
+            const double done = now_sec();
+            if (ds4_rocm_perf_counters)
+                ds4_rocm_perf_counters(&d9_c1[0], &d9_c1[1], &d9_c1[2], &d9_c1[3]);
+            ds41_d9_trace_round(s, pos, d9_mode, sched_why, draftable, proposed,
+                B, 0, 0, 1u, first_token, drafts, confidence,
+                propose_seconds * 1000.0, 0.0, 0.0,
+                (done - target_started) * 1000.0, (done - t0) * 1000.0,
+                d9_c0, d9_c1);
         }
         if (cost_trace) {
             const double done = now_sec();
@@ -90630,8 +90935,10 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         return -1;
     }
     const double tv = (stats || cost_trace || online) ? now_sec() : 0.0;
+    const double d9_tv = d9_trace ? now_sec() : 0.0;
     bool ok = ds41_draft_verify(g, &e->model, &e->weights,
                                 tokens, n, rows);
+    const double d9_verified_at = d9_trace ? now_sec() : 0.0;
     if (tp_verify && e->tp.vocab_split) {
         const uint32_t half = vocab / 2u;
         const size_t half_bytes = (size_t)half * sizeof(float);
@@ -90707,6 +91014,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         return -1;
     }
     const double committed_at = (cost_trace || online) ? now_sec() : 0.0;
+    const double d9_committed_at = d9_trace ? now_sec() : 0.0;
     if (replacement >= 0) {
         if (ds4_session_eval(s, replacement, err, errlen) != 0) return -1;
         accepted[matched + 1u] = replacement;
@@ -90737,8 +91045,21 @@ static int ds41_session_spec(ds4_session *s, int first_token,
             kept, sched_pred, propose_seconds * 1000.0,
             (committed_at - tv) * 1000.0, (done - t0) * 1000.0,
             misses, wait_ms);
+    } else if (model) {
+        ds41_model_note(sm, mp, true, k, matched, kept, model_expected, confidence);
     } else {
         ds41_draft_adapt(d, true, k, matched, tp_verify);
+    }
+    if (d9_trace) {
+        const double done = now_sec();
+        if (ds4_rocm_perf_counters)
+            ds4_rocm_perf_counters(&d9_c1[0], &d9_c1[1], &d9_c1[2], &d9_c1[3]);
+        ds41_d9_trace_round(s, pos, d9_mode, sched_why, draftable, proposed,
+            B, k, matched, kept, first_token, drafts, confidence,
+            propose_seconds * 1000.0, (d9_verified_at - d9_tv) * 1000.0,
+            (d9_committed_at - d9_verified_at) * 1000.0,
+            (done - d9_committed_at) * 1000.0, (done - t0) * 1000.0,
+            d9_c0, d9_c1);
     }
     if (cost_trace) {
         const double done = now_sec();

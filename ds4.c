@@ -58,6 +58,7 @@
 #endif
 #if defined(DS4_ROCM_BUILD) || (!defined(__APPLE__) && !defined(DS4_NO_GPU))
 #include "ds4_linux_memory.h"
+#include "ds4_admit.h"
 #endif
 
 #ifdef DS4_TEST_HOOKS
@@ -44927,8 +44928,185 @@ static bool ds41_staging_cache_enabled(void) {
     return enabled != 0;
 }
 
+/* =========================================================================
+ * D22: session memory.  DS4_ROCM_STREAM_MEM_GUARD=0 restores kumanix-int4
+ * exactly (no DSpark runtime charge in the memory plan, no guard).
+ *
+ * Guard: a sampler thread reads MemAvailable (/proc/meminfo) every
+ * DS4_ROCM_STREAM_MEM_GUARD_INTERVAL_MS (500) and only counts consecutive
+ * samples below floor + margin (DS4_ROCM_STREAM_MEM_FLOOR_MB 12288,
+ * DS4_ROCM_STREAM_MEM_GUARD_MARGIN_MB 768).  Samples taken while a layer
+ * sweep runs are ignored (sweeps cause 100-250 MiB host dips that recover).
+ * The cache changes only at a quiesced point on the graph thread: the entry
+ * of ds4_session_sync / _sync_multimodal (before any prefill sweep),
+ * ds4_session_eval (between decode tokens) and the speculative entry points
+ * (between DSpark rounds).  There, if the last
+ * DS4_ROCM_STREAM_MEM_GUARD_SAMPLES (6, i.e. 3 s) samples were all below the
+ * line, a fresh reading is still below it, and the last shed is at least
+ * DS4_ROCM_STREAM_MEM_GUARD_GAP_S (10) seconds old, one ~1 GiB slab of the
+ * dynamic cache is shed (never below DS4_ROCM_STREAM_MEM_GUARD_MIN_SLOTS,
+ * default half the startup dynamic budget).  One log line per shed.
+ * DS4_ROCM_STREAM_MEM_GUARD_FAKE=i,j,... (test only) forces a shed at the
+ * i-th, j-th, ... boundary poll, bypassing the sampler, the fresh reading and
+ * the gap (not the minimum).
+ * ========================================================================= */
+static uint64_t ds41_d22_env_u64(const char *name, uint64_t def, uint64_t lo, uint64_t hi) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return def;
+    char *end = NULL;
+    const unsigned long long v = strtoull(env, &end, 10);
+    if (end == env || *end || v < lo || v > hi) {
+        fprintf(stderr, "ds4: ignoring %s=%s (want %llu..%llu)\n", name, env,
+                (unsigned long long)lo, (unsigned long long)hi);
+        return def;
+    }
+    return (uint64_t)v;
+}
+
+static bool ds41_mem_guard_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_MEM_GUARD");
+        enabled = !(env && !strcmp(env, "0"));
+    }
+    return enabled != 0;
+}
+
+static uint64_t ds41_meminfo_available_mb(void) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return 0;
+    char line[256];
+    unsigned long long kib = 0;
+    bool ok = false;
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) { ok = true; break; }
+    }
+    fclose(fp);
+    return ok ? (uint64_t)(kib / 1024u) : 0;
+}
+
+static struct {
+    bool started;
+    uint64_t line_mb, floor_mb, margin_mb;
+    uint32_t samples, interval_ms, gap_s, min_dyn;
+    volatile int sweep_active;     /* graph thread writes, sampler reads */
+    volatile uint32_t below;       /* sampler writes, graph thread resets */
+    volatile uint64_t last_mb, min_mb, n_samples, n_skipped;
+    double last_shed;
+    uint64_t polls, sheds, shed_slots, pressure_seen;
+    uint64_t fake[16];
+    uint32_t n_fake;
+} g_d22;
+
+static void *ds41_mem_guard_sampler(void *arg) {
+    (void)arg;
+    for (;;) {
+        const uint64_t mb = ds41_meminfo_available_mb();
+        if (mb) {
+            __atomic_store_n(&g_d22.last_mb, mb, __ATOMIC_RELAXED);
+            if (!g_d22.min_mb || mb < g_d22.min_mb) __atomic_store_n(&g_d22.min_mb, mb, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&g_d22.n_samples, 1, __ATOMIC_RELAXED);
+            if (__atomic_load_n(&g_d22.sweep_active, __ATOMIC_ACQUIRE)) {
+                __atomic_add_fetch(&g_d22.n_skipped, 1, __ATOMIC_RELAXED);
+            } else if (mb < g_d22.line_mb) {
+                __atomic_add_fetch(&g_d22.below, 1, __ATOMIC_RELAXED);
+            } else {
+                __atomic_store_n(&g_d22.below, 0, __ATOMIC_RELAXED);
+            }
+        }
+        usleep((useconds_t)g_d22.interval_ms * 1000u);
+    }
+    return NULL;
+}
+
+/* Engine open, after the staging reserve: start the sampler. */
+static void ds41_mem_guard_start(void) {
+    if (g_d22.started || !ds41_mem_guard_enabled()) return;
+    g_d22.floor_mb = ds41_d22_env_u64("DS4_ROCM_STREAM_MEM_FLOOR_MB", 12288, 1024, 1u << 20);
+    g_d22.margin_mb = ds41_d22_env_u64("DS4_ROCM_STREAM_MEM_GUARD_MARGIN_MB", 768, 0, 1u << 20);
+    g_d22.line_mb = g_d22.floor_mb + g_d22.margin_mb;
+    g_d22.samples = (uint32_t)ds41_d22_env_u64("DS4_ROCM_STREAM_MEM_GUARD_SAMPLES", 6, 1, 10000);
+    g_d22.interval_ms = (uint32_t)ds41_d22_env_u64("DS4_ROCM_STREAM_MEM_GUARD_INTERVAL_MS", 500, 50, 60000);
+    g_d22.gap_s = (uint32_t)ds41_d22_env_u64("DS4_ROCM_STREAM_MEM_GUARD_GAP_S", 10, 0, 86400);
+    const uint32_t dyn = ds4_gpu_stream_expert_cache_dynamic_budget();
+    g_d22.min_dyn = (uint32_t)ds41_d22_env_u64("DS4_ROCM_STREAM_MEM_GUARD_MIN_SLOTS", dyn / 2u, 0, 1u << 20);
+    const char *fake = getenv("DS4_ROCM_STREAM_MEM_GUARD_FAKE");
+    for (const char *f = fake; f && *f && g_d22.n_fake < 16;) {
+        char *end = NULL;
+        const unsigned long long v = strtoull(f, &end, 10);
+        if (end == f) break;
+        g_d22.fake[g_d22.n_fake++] = v;
+        f = *end == ',' ? end + 1 : end;
+    }
+    pthread_t th;
+    if (pthread_create(&th, NULL, ds41_mem_guard_sampler, NULL) != 0) {
+        fprintf(stderr, "ds4: V4.1 memory guard sampler did not start; guard off\n");
+        return;
+    }
+    pthread_detach(th);
+    g_d22.started = true;
+    fprintf(stderr, "ds4: V4.1 memory guard: shed below %llu MiB MemAvailable (floor %llu + margin %llu) "
+                    "sustained %u x %u ms outside sweeps, >= %u s apart, min %u dynamic slots%s\n",
+            (unsigned long long)g_d22.line_mb, (unsigned long long)g_d22.floor_mb,
+            (unsigned long long)g_d22.margin_mb, g_d22.samples, g_d22.interval_ms, g_d22.gap_s,
+            g_d22.min_dyn, g_d22.n_fake ? " (test: forced sheds set)" : "");
+}
+
+static void ds41_mem_guard_sweep(bool active) {
+    if (g_d22.started) __atomic_store_n(&g_d22.sweep_active, active ? 1 : 0, __ATOMIC_RELEASE);
+}
+
+/* Quiesced boundary on the graph thread (see above). */
+static void ds41_mem_guard_poll(const char *where) {
+    if (!g_d22.started) return;
+    const uint64_t poll = ++g_d22.polls;
+    bool forced = false;
+    for (uint32_t i = 0; i < g_d22.n_fake; i++) if (g_d22.fake[i] == poll) forced = true;
+    const uint32_t below = __atomic_load_n(&g_d22.below, __ATOMIC_RELAXED);
+    if (!forced && below < g_d22.samples) return;
+    const double now = now_sec();
+    if (!forced && g_d22.last_shed > 0.0 && now - g_d22.last_shed < (double)g_d22.gap_s) return;
+    const uint64_t before = ds41_meminfo_available_mb();
+    if (!forced) {
+        g_d22.pressure_seen++;
+        if (before >= g_d22.line_mb) {           /* recovered: a transient */
+            __atomic_store_n(&g_d22.below, 0, __ATOMIC_RELAXED);
+            return;
+        }
+    }
+    ds4_gpu_stream_shed_info info;
+    const int shed = ds4_gpu_stream_expert_cache_shed(g_d22.min_dyn, &info);
+    const uint64_t after = ds41_meminfo_available_mb();
+    __atomic_store_n(&g_d22.below, 0, __ATOMIC_RELAXED);
+    g_d22.last_shed = now_sec();
+    if (shed) {
+        g_d22.sheds++;
+        g_d22.shed_slots += info.dynamic_before - info.dynamic_after;
+    }
+    fprintf(stderr, "ds4: memory guard %s at %s poll %llu: MemAvailable %llu MiB (%u samples below %llu) "
+                    "-> %llu MiB after; dynamic slots %u -> %u (%s, %u entries evicted)%s\n",
+            shed ? "shed" : "could not shed", where, (unsigned long long)poll,
+            (unsigned long long)before, below, (unsigned long long)g_d22.line_mb,
+            (unsigned long long)after, info.dynamic_before, info.dynamic_after,
+            !shed ? "at minimum or not quiesced" : info.freed_slab ? "slab freed" : "budget lowered, cache not yet grown",
+            info.evicted, forced ? " [forced by DS4_ROCM_STREAM_MEM_GUARD_FAKE]" : "");
+}
+
+static void ds41_mem_guard_report(void) {
+    if (!g_d22.started) return;
+    fprintf(stderr, "ds4: memory guard summary: sheds %llu (%llu slots), pressure checks %llu, polls %llu, "
+                    "samples %llu (%llu during sweeps), lowest MemAvailable sampled %llu MiB, line %llu MiB\n",
+            (unsigned long long)g_d22.sheds, (unsigned long long)g_d22.shed_slots,
+            (unsigned long long)g_d22.pressure_seen, (unsigned long long)g_d22.polls,
+            (unsigned long long)g_d22.n_samples, (unsigned long long)g_d22.n_skipped,
+            (unsigned long long)g_d22.min_mb, (unsigned long long)g_d22.line_mb);
+}
+
+static void ds41_mem_guard_poll_session(ds4_session *s, const char *where);
+
 static bool ds41_stream_sweep_start(ds41_stream_layer_load *job,
                                     const ds4_model *m, const ds4_weights *w) {
+    ds41_mem_guard_sweep(true);
     if (!ds4_gpu_stream_expert_cache_quiesce()) return false;
     if (ds4_gpu_stream_expert_cache_staging_lent() &&
         !ds4_gpu_stream_expert_cache_staging_reclaim()) {
@@ -44941,6 +45119,7 @@ static bool ds41_stream_sweep_start(ds41_stream_layer_load *job,
 static bool ds41_stream_sweep_finish(ds41_stream_layer_load *job) {
     bool ok = ds41_stream_layer_join(job);
     if (!ds4_gpu_stream_expert_cache_quiesce()) ok = false;
+    ds41_mem_guard_sweep(false);
     /* A failed lend leaves the staging reserved, exactly as without D13. */
     if (ok && ds41_staging_cache_enabled())
         (void)ds4_gpu_stream_expert_cache_staging_lend();
@@ -65290,6 +65469,16 @@ static bool ds4_session_is_ds41(const ds4_session *s) {
     return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
 }
 
+#ifdef DS4_ROCM_BUILD
+/* D22: memory-guard boundary for V4.1 sessions (see ds41_mem_guard_poll). */
+static void ds41_mem_guard_poll_session(ds4_session *s, const char *where) {
+    if (s && ds4_session_is_ds41(s)) ds41_mem_guard_poll(where);
+}
+#define DS41_MEM_GUARD_POLL(s, where) ds41_mem_guard_poll_session((s), (where))
+#else
+#define DS41_MEM_GUARD_POLL(s, where) ((void)0)
+#endif
+
 static void ds4_session_dspark_capture_invalidate(ds4_session *s) {
 #ifndef DS4_NO_GPU
     if (!s) return;
@@ -72312,6 +72501,7 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
  * ========================================================================= */
 typedef struct {
     uint64_t baseline, fixed, reserve, graph, staging, support, gtt_cap, mem_cap, d5_shelf;
+    uint64_t dspark_runtime; /* D22: drafter runtime state beyond its image */
     uint32_t ctx, sessions, dynamic_slots, total_slots, legacy_dynamic;
 } ds41_mem_cache_plan;
 
@@ -72386,6 +72576,12 @@ static DS4_MAYBE_UNUSED bool ds41_mem_cache_plan_compute(ds4_engine *e, int ctx_
         if (lw->ffn_gate_exps && lw->ffn_gate_exps->type == DS4_TENSOR_MXFP4) break;
     }
     if (p->d5_shelf) p->fixed = ds4_add_sat_u64(p->fixed, p->d5_shelf);
+    /* D22: with a drafter loaded, about 0.5 GiB more than its 8.04 GiB image is
+     * in use at run time (D22.md: ~170 MiB GTT + ~330 MiB host on every
+     * DSpark run, plain or session).  Off with DS4_ROCM_STREAM_MEM_GUARD=0. */
+    if (p->support && ds41_mem_guard_enabled())
+        p->dspark_runtime = ds41_d22_env_u64("DS4_ROCM_STREAM_DSPARK_RUNTIME_MB", 512, 0, 65536) << 20;
+    if (p->dspark_runtime) p->fixed = ds4_add_sat_u64(p->fixed, p->dspark_runtime);
     const uint64_t mem_need = ds4_add_sat_u64(p->fixed, p->reserve);
     p->mem_cap = p->baseline > mem_need ? p->baseline - mem_need : 0;
     const uint64_t alloc_reserve = ds41_rocm_stream_reserve_bytes(p->baseline);
@@ -72428,6 +72624,9 @@ static DS4_MAYBE_UNUSED bool ds41_mem_cache_plan_compute(ds4_engine *e, int ctx_
     if (p->d5_shelf)
         fprintf(stderr, "ds4:   fixed includes the D5 prefetch shelf %.2f GiB (%.1f MiB)\n",
                 ds4_bytes_to_gib(p->d5_shelf), (double)p->d5_shelf / 1048576.0);
+    if (p->dspark_runtime)
+        fprintf(stderr, "ds4:   fixed includes the DSpark runtime charge %.2f GiB (%.0f MiB; D22)\n",
+                ds4_bytes_to_gib(p->dspark_runtime), (double)p->dspark_runtime / 1048576.0);
     fprintf(stderr,
             "ds4:   dynamic slots %u (%.2f GiB; legacy sizing would give %u), "
             "%u total with the %u-slot staging; limited by %s\n",
@@ -75057,10 +75256,9 @@ static uint64_t ds41_rocm_host_reserve_bytes(uint64_t host) {
     /* Match the ROCm resident GLM policy: usable host RAM already excludes CMA.
      * The one-eighth reserve rejects viable resident vision sessions and
      * limits SSD cache capacity despite usable host memory. Keep an
-     * explicit OS reserve and the separate two-GiB runtime allowance. */
-    const uint64_t minimum = UINT64_C(8) << 30;
-    const uint64_t reserve = host / 16u;
-    return reserve > minimum ? reserve : minimum;
+     * explicit OS reserve and the separate two-GiB runtime allowance.
+     * D22: the arithmetic lives in ds4_admit.h (shared with its unit test). */
+    return ds4_admit_host_reserve(host);
 }
 
 static uint64_t ds41_rocm_stream_reserve_bytes(uint64_t host) {
@@ -75104,7 +75302,8 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
 #ifdef DS4_ROCM_BUILD
     uint32_t minimum_experts = 1;
     if (e->ssd_streaming) minimum_experts = DS4_N_EXPERT_USED;
-    if (fixed >= budget || (expert && (budget - fixed) / expert < minimum_experts)) {
+    /* D22: same arithmetic as before, via ds4_admit.h (unit-tested). */
+    if (!ds4_admit_dynamic_limit(host, recommended, fixed, expert, minimum_experts, NULL, NULL)) {
 #else
     if (fixed >= budget || (expert && budget - fixed < expert)) {
 #endif
@@ -76734,6 +76933,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     !ds4_gpu_stream_expert_cache_staging_lend())
                     fprintf(stderr, "ds4: V4.1 D13 staging cache requested but the staging "
                                     "could not be lent; keeping it reserved\n");
+                /* D22: memory guard (off with DS4_ROCM_STREAM_MEM_GUARD=0). */
+                ds41_mem_guard_start();
                 fprintf(stderr, "ds4: V4.1 SSD prepared %.2f GiB static weights and %.2f GiB expert staging; "
                                 "%.2f GiB dynamic cache, %.2f GiB graph, 2.00 GiB runtime/I/O allowance\n",
                         ds4_bytes_to_gib(e->startup_model_span_bytes),
@@ -77803,6 +78004,7 @@ void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if defined(DS4_ROCM_BUILD) && defined(DS4_HAS_DEEPSEEK41_GPU)
     if (e->metal_ready && e->ssd_streaming && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        ds41_mem_guard_report();
         (void)ds4_gpu_stream_expert_cache_quiesce();
         (void)ds4_gpu_stream_expert_cache_release_layer_cache();
     }
@@ -80434,6 +80636,7 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    DS41_MEM_GUARD_POLL(s, "sync");
 #ifndef DS4_NO_GPU
     if (s) s->dspark_rewind_end = 0;
 #endif
@@ -80531,6 +80734,7 @@ int ds4_session_sync_multimodal(
         size_t image_count,
         char *err,
         size_t errlen) {
+    DS41_MEM_GUARD_POLL(s, "sync");
     if (!s || !prompt || (image_count != 0 && !images)) {
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;
@@ -83068,6 +83272,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 void ds4_rocm_perf_counters(uint64_t *, uint64_t *, uint64_t *, uint64_t *) __attribute__((weak));
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+    DS41_MEM_GUARD_POLL(s, "decode");
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
@@ -91435,6 +91640,7 @@ static int ds4_session_eval_speculative_argmax_impl(
         bool ignore_eos, ds4_think_mode think_mode,
         int *accepted, int accepted_cap,
         char *err, size_t errlen) {
+    DS41_MEM_GUARD_POLL(s, "dspark round");
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     if (!s->checkpoint_valid) {
         payload_set_err(err, errlen, "speculative decode requires a synchronized checkpoint");
@@ -92319,6 +92525,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
+    if (temperature > 0.0f) DS41_MEM_GUARD_POLL(s, "dspark round");
     if (temperature <= 0.0f) {
         return ds4_session_eval_speculative_argmax(
             s, first_token, max_tokens, eos_token,

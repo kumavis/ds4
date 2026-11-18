@@ -172,6 +172,29 @@ extern "C" int ds4_gpu_stream_expert_cache_staging_reclaim(void) {
     return ok;
 }
 
+/* D22: shed one dynamic-cache slab at a token boundary (quiesces the stream
+ * cache first, as a layer sweep does).  See cuda_stream_shed_slab. */
+extern "C" int ds4_gpu_stream_expert_cache_shed(uint32_t min_dynamic_slots,
+                                                ds4_gpu_stream_shed_info *out) {
+    ds4_gpu_stream_shed_info info = {};
+    int ok = 0;
+    if (cuda_stream_expert_cache_quiesce()) {
+        int freed = 0;
+        ok = cuda_stream_shed_slab(min_dynamic_slots, &info.dynamic_before,
+                                   &info.dynamic_after, &info.evicted, &freed);
+        info.freed_slab = freed;
+    }
+    info.total_sheds = g_stream_shed_count;
+    info.total_slots = g_stream_shed_slots;
+    if (out) *out = info;
+    return ok;
+}
+
+extern "C" uint32_t ds4_gpu_stream_expert_cache_dynamic_budget(void) {
+    const uint32_t lent = g_stream_staging_lent ? g_stream_staging_lent_slots : 0u;
+    return g_stream_expert_cache_budget > lent ? g_stream_expert_cache_budget - lent : 0u;
+}
+
 extern "C" int ds4_gpu_stream_expert_cache_staging_lent(void) {
     return g_stream_staging_lent;
 }

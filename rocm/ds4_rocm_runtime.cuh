@@ -3842,14 +3842,30 @@ static int cuda_stream_staging_lend(void) {
     return 1;
 }
 
-static int cuda_stream_staging_reclaim(void) {
-    if (!g_stream_staging_lent) return 1;
+/* Withdraw every pool buffer inside the given address ranges (D13 reclaim,
+ * D22 shed): evict the cached entries stored there (the existing per-slot
+ * eviction, cuda_stream_resident_evict_at / _evict_one), give each D5 shelf
+ * entry holding such a buffer after an adoption swap a buffer from outside
+ * the ranges, and remove the buffers from the free list.  Speculative D5
+ * work is dropped first (as cuda_d5_shelf_reset does).  Callers: quiesced
+ * boundaries on the graph thread only.  Returns 0 if a precondition fails
+ * before anything changed; *removed is the number of free-list buffers
+ * withdrawn. */
+struct cuda_stream_buf_range { const char *lo, *hi; };
+static int cuda_stream_ranges_contain(const cuda_stream_buf_range *r, uint32_t n,
+                                      const char *p) {
+    for (uint32_t i = 0; i < n; i++) if (p >= r[i].lo && p < r[i].hi) return 1;
+    return 0;
+}
+
+static int cuda_stream_pool_withdraw(const cuda_stream_buf_range *r, uint32_t nr,
+                                     const char *what, uint32_t *removed_out,
+                                     uint32_t *evicted_out, uint32_t *shelf_out) {
+    *removed_out = *evicted_out = *shelf_out = 0;
     if (g_stream_selected_pending.active || g_stream_batch_selected_pending.active) return 0;
-    if (!cuda_stream_resident_reclaim_wait("D13 staging reclaim")) return 0;
-    /* D5 shelf: drop all speculative work (as cuda_d5_shelf_reset does) and
-     * note which shelf entries hold a staging buffer after an adoption swap. */
-    uint32_t shelf_staging[DS4_D5_MAX_SHELF];
-    uint32_t n_shelf_staging = 0;
+    if (!cuda_stream_resident_reclaim_wait(what)) return 0;
+    uint32_t shelf_hits[DS4_D5_MAX_SHELF];
+    uint32_t n_shelf = 0;
     if (g_d5_shelf_state == 1) {
         pthread_mutex_lock(&g_stream_read_mutex);
         g_d5_task_n = 0;
@@ -3862,24 +3878,23 @@ static int cuda_stream_staging_reclaim(void) {
             char *buf = e->buf;
             memset(e, 0, sizeof(*e));
             e->buf = buf;
-            if (cuda_stream_staging_contains(buf)) shelf_staging[n_shelf_staging++] = i;
+            if (cuda_stream_ranges_contain(r, nr, buf)) shelf_hits[n_shelf++] = i;
         }
         pthread_mutex_unlock(&g_stream_read_mutex);
     }
-    /* Evict every cached entry stored in staging memory. evict_at moves the
-     * last entry into the hole; walking down visits each entry once. */
+    /* evict_at moves the last entry into the hole; walking down visits each
+     * entry once. */
     for (size_t i = g_stream_resident_experts.size(); i-- > 0;) {
         const cuda_stream_resident_expert &e = g_stream_resident_experts[i];
-        if (!e.pooled || !cuda_stream_staging_contains(e.base)) continue;
+        if (!e.pooled || !cuda_stream_ranges_contain(r, nr, e.base)) continue;
         if (!cuda_stream_resident_evict_at(i)) return 0;
-        g_stream_staging_stats_evicted++;
+        (*evicted_out)++;
     }
-    /* Give each such shelf entry a non-staging free buffer instead. */
-    for (uint32_t k = 0; k < n_shelf_staging; k++) {
+    for (uint32_t k = 0; k < n_shelf; k++) {
         size_t pick = (size_t)-1;
         for (;;) {
             for (size_t j = 0; j < g_stream_expert_free_slots.size(); j++) {
-                if (!cuda_stream_staging_contains(g_stream_expert_free_slots[j])) {
+                if (!cuda_stream_ranges_contain(r, nr, g_stream_expert_free_slots[j])) {
                     pick = j;
                     break;
                 }
@@ -3887,25 +3902,42 @@ static int cuda_stream_staging_reclaim(void) {
             if (pick != (size_t)-1) break;
             if (!cuda_stream_resident_evict_one(UINT32_MAX, NULL, 0)) return 0;
         }
-        d5_shelf_entry *e = &g_d5_shelf[shelf_staging[k]];
-        char *staging_buf = e->buf;
+        d5_shelf_entry *e = &g_d5_shelf[shelf_hits[k]];
+        char *in_range = e->buf;
         e->buf = g_stream_expert_free_slots[pick];
-        g_stream_expert_free_slots[pick] = staging_buf;
-        g_stream_staging_stats_shelf_swaps++;
+        g_stream_expert_free_slots[pick] = in_range;
     }
-    if (n_shelf_staging) {
-        /* Gate evidence (int4): the D5 shelf held lent staging memory. */
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "D13 staging reclaim: %u D5 shelf buffer(s) were "
-                        "staging memory; swapped for non-staging free slots\n", n_shelf_staging);
-    }
+    *shelf_out = n_shelf;
     size_t kept = 0;
     uint32_t removed = 0;
     for (size_t j = 0; j < g_stream_expert_free_slots.size(); j++) {
         char *slot = g_stream_expert_free_slots[j];
-        if (cuda_stream_staging_contains(slot)) removed++;
+        if (cuda_stream_ranges_contain(r, nr, slot)) removed++;
         else g_stream_expert_free_slots[kept++] = slot;
     }
     g_stream_expert_free_slots.resize(kept);
+    *removed_out = removed;
+    return 1;
+}
+
+static int cuda_stream_staging_reclaim(void) {
+    if (!g_stream_staging_lent) return 1;
+    cuda_stream_buf_range r[2];
+    uint32_t nr = 0;
+    for (uint32_t i = 0; i < 2u; i++) {
+        const cuda_stream_layer_expert_cache &c = g_stream_layer_expert_cache[i];
+        if (c.base) r[nr++] = {c.base, c.base + c.capacity};
+    }
+    uint32_t removed = 0, evicted = 0, shelf = 0;
+    if (!cuda_stream_pool_withdraw(r, nr, "D13 staging reclaim", &removed, &evicted, &shelf))
+        return 0;
+    g_stream_staging_stats_evicted += evicted;
+    g_stream_staging_stats_shelf_swaps += shelf;
+    if (shelf) {
+        /* Gate evidence (int4): the D5 shelf held lent staging memory. */
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D13 staging reclaim: %u D5 shelf buffer(s) were "
+                        "staging memory; swapped for non-staging free slots\n", shelf);
+    }
     if (removed != g_stream_staging_lent_slots ||
         g_stream_expert_slot_count < removed ||
         g_stream_expert_cache_budget < removed) {
@@ -3919,6 +3951,75 @@ static int cuda_stream_staging_reclaim(void) {
     g_stream_staging_lent = 0;
     g_stream_staging_lent_slots = 0;
     g_stream_staging_stats_reclaims++;
+    return 1;
+}
+
+/* D22: memory-guard shed.  Gives up one dynamic-cache slab (about 1 GiB) at
+ * a quiesced boundary.  If the cache has not yet grown to its budget, only
+ * the budget is lowered by one slab's slots (nothing to free).  Otherwise the
+ * slab holding the fewest cached entries is withdrawn (its entries evicted,
+ * its free buffers removed) and freed.  Lent staging slots are not touched;
+ * min_dynamic is a floor on the dynamic (non-lent) slot budget.  Output is
+ * unaffected: only residency changes.  Returns 1 if something was shed. */
+static uint64_t g_stream_shed_count, g_stream_shed_slots, g_stream_shed_evicted;
+static int cuda_stream_shed_slab(uint32_t min_dynamic, uint32_t *dyn_before,
+                                 uint32_t *dyn_after, uint32_t *evicted_out,
+                                 int *freed_out) {
+    *evicted_out = 0;
+    *freed_out = 0;
+    const uint32_t lent = g_stream_staging_lent ? g_stream_staging_lent_slots : 0u;
+    if (!g_ssd_streaming_mode || g_stream_expert_cache_budget <= lent) return 0;
+    const uint32_t dyn_budget = g_stream_expert_cache_budget - lent;
+    const uint32_t dyn_slots = g_stream_expert_slot_count >= lent ?
+        g_stream_expert_slot_count - lent : 0u;
+    *dyn_before = *dyn_after = dyn_budget;
+    if (!g_stream_expert_slot_bytes) return 0;
+    const uint64_t slab_target = UINT64_C(1) << 30;
+    uint32_t slab_slots = g_stream_expert_slot_bytes >= slab_target ? 1u :
+        (uint32_t)(slab_target / g_stream_expert_slot_bytes);
+    if (dyn_budget < min_dynamic + slab_slots) return 0;
+    if (dyn_slots + slab_slots <= dyn_budget) {
+        /* Not grown yet: stop growth one slab earlier, nothing to free. */
+        g_stream_expert_cache_budget -= slab_slots;
+        *dyn_after = dyn_budget - slab_slots;
+        g_stream_shed_count++;
+        g_stream_shed_slots += slab_slots;
+        return 1;
+    }
+    /* Pick the slab with the fewest cached entries. */
+    size_t best = (size_t)-1;
+    uint64_t best_n = UINT64_MAX;
+    for (size_t si = 0; si < g_stream_expert_slabs.size(); si++) {
+        const cuda_stream_expert_slab &sl = g_stream_expert_slabs[si];
+        if (!sl.base) continue;
+        uint64_t n = 0;
+        for (const cuda_stream_resident_expert &e : g_stream_resident_experts)
+            if (e.pooled && e.base >= sl.base && e.base < sl.base + sl.bytes) n++;
+        if (n < best_n) { best_n = n; best = si; }
+    }
+    if (best == (size_t)-1) return 0;
+    const cuda_stream_expert_slab sl = g_stream_expert_slabs[best];
+    const uint32_t sl_slots = (uint32_t)(sl.bytes / g_stream_expert_slot_bytes);
+    if (dyn_budget < min_dynamic + sl_slots) return 0;
+    cuda_stream_buf_range r[1] = {{sl.base, sl.base + sl.bytes}};
+    uint32_t removed = 0, evicted = 0, shelf = 0;
+    if (!cuda_stream_pool_withdraw(r, 1, "D22 memory-guard shed", &removed, &evicted, &shelf))
+        return 0;
+    if (removed != sl_slots) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D22 shed found %u of %u slab slots; "
+                        "refusing to free the slab\n", removed, sl_slots);
+        abort(); /* A slab buffer is still referenced somewhere. */
+    }
+    if (!cuda_ok(cudaFree(sl.base), "D22 memory-guard slab free")) abort();
+    g_stream_expert_slabs.erase(g_stream_expert_slabs.begin() + (long)best);
+    g_stream_expert_slot_count -= sl_slots;
+    g_stream_expert_cache_budget -= sl_slots;
+    *dyn_after = dyn_budget - sl_slots;
+    *evicted_out = evicted;
+    *freed_out = 1;
+    g_stream_shed_count++;
+    g_stream_shed_slots += sl_slots;
+    g_stream_shed_evicted += evicted;
     return 1;
 }
 

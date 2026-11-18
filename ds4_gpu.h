@@ -569,6 +569,18 @@ int ds4_gpu_stream_expert_cache_release_layer_cache(void);
 int ds4_gpu_stream_expert_cache_staging_lend(void);
 int ds4_gpu_stream_expert_cache_staging_reclaim(void);
 int ds4_gpu_stream_expert_cache_staging_lent(void);
+/* D22 memory guard: shed one ~1 GiB dynamic-cache slab (or, before the cache
+ * has grown, lower its budget by one slab) at a token boundary, never below
+ * min_dynamic_slots.  Returns 1 if something was shed.  Changes residency
+ * only. dynamic_budget: the current dynamic (non-lent) slot budget. */
+typedef struct ds4_gpu_stream_shed_info {
+    uint32_t dynamic_before, dynamic_after, evicted;
+    int freed_slab;
+    uint64_t total_sheds, total_slots;
+} ds4_gpu_stream_shed_info;
+int ds4_gpu_stream_expert_cache_shed(uint32_t min_dynamic_slots,
+                                     ds4_gpu_stream_shed_info *out);
+uint32_t ds4_gpu_stream_expert_cache_dynamic_budget(void);
 #endif
 int ds4_gpu_stream_expert_cache_seed_experts(
         const ds4_gpu_stream_expert_table *table,

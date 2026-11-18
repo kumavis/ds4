@@ -556,6 +556,13 @@ int ds4_gpu_stream_expert_cache_seed_from_layer_selected(
         uint32_t                          n_selected);
 int ds4_gpu_stream_expert_cache_finish_pending_batch(void);
 int ds4_gpu_stream_expert_cache_release_layer_cache(void);
+/* D13 (V4.1, DS4_ROCM_STREAM_STAGING_CACHE=1): lend the idle two-layer
+ * staging to the dynamic cache as ordinary slots, and take it back (evicting
+ * the entries in it) before a layer sweep. Call both at quiesced boundaries
+ * only. lend/reclaim return 1 when the staging is lent/reserved afterwards. */
+int ds4_gpu_stream_expert_cache_staging_lend(void);
+int ds4_gpu_stream_expert_cache_staging_reclaim(void);
+int ds4_gpu_stream_expert_cache_staging_lent(void);
 #endif
 int ds4_gpu_stream_expert_cache_seed_experts(
         const ds4_gpu_stream_expert_table *table,

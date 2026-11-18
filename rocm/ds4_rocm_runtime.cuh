@@ -345,6 +345,15 @@ static uint32_t g_stream_expert_cache_budget;
 static cuda_stream_selected_cache g_stream_selected_cache;
 static cuda_stream_batch_selected_cache g_stream_batch_selected_cache;
 static cuda_stream_layer_expert_cache g_stream_layer_expert_cache[2];
+/* D13 (DS4_ROCM_STREAM_STAGING_CACHE=1): while no layer sweep runs, the two
+ * V4.1 staging layers are lent to the dynamic cache as ordinary slots.  While
+ * lent, both staging layers are inactive and their memory is only reachable
+ * through the slot pool; the budget and slot count include the lent slots. */
+static int g_stream_staging_lent;
+static uint32_t g_stream_staging_lent_slots;
+static uint64_t g_stream_staging_stats_lends, g_stream_staging_stats_reclaims,
+                g_stream_staging_stats_evicted;
+static int cuda_stream_staging_reclaim(void);
 static uint64_t g_stream_v41_plan_generation;
 static cuda_stream_v41_reuse_stats g_stream_v41_reuse_stats;
 static std::vector<cuda_stream_resident_expert> g_stream_resident_experts;
@@ -782,6 +791,13 @@ static void cuda_stream_resident_cache_release(void) {
     g_stream_expert_free_slots.clear();
     g_stream_expert_slot_bytes = 0;
     g_stream_expert_slot_count = 0;
+    /* D13: lent staging slots left the pool with it; the staging memory
+     * itself stays owned by g_stream_layer_expert_cache. */
+    if (g_stream_staging_lent) {
+        g_stream_expert_cache_budget -= g_stream_staging_lent_slots;
+        g_stream_staging_lent = 0;
+        g_stream_staging_lent_slots = 0;
+    }
 }
 
 /* Only the owning parity loader waits here; the opposite slot can compute. */
@@ -794,6 +810,8 @@ static int cuda_stream_layer_expert_cache_wait(cuda_stream_layer_expert_cache &s
 }
 
 static int cuda_stream_layer_expert_cache_release(void) {
+    /* D13: take lent slots back (evicting their entries) before freeing. */
+    if (g_stream_staging_lent && !cuda_stream_staging_reclaim()) return 0;
     if (!g_deepseek41_model) {
         bool any_active = false;
         for (uint32_t i = 0; i < 2u; i++) {
@@ -3619,7 +3637,7 @@ static int cuda_stream_layer_expert_cache_reserve(
         const ds4_gpu_stream_expert_table *even,
         const ds4_gpu_stream_expert_table *odd) {
     uint64_t bytes[2] = {0, 0};
-    if (!g_ssd_streaming_mode ||
+    if (!g_ssd_streaming_mode || g_stream_staging_lent ||
         !cuda_stream_layer_table_bytes(even, &bytes[0]) ||
         !cuda_stream_layer_table_bytes(odd, &bytes[1]) ||
         (even->layer & 1u) != 0 || (odd->layer & 1u) != 1 ||
@@ -3692,6 +3710,142 @@ static int cuda_stream_layer_expert_cache_note_consumed(
     if (!cuda_ok(cudaEventRecord(c.consumed_event, 0),
                  "streaming full-layer consumer record")) return 0;
     c.consumed_pending = 1;
+    return 1;
+}
+
+/* D13: staging memory lent to the dynamic cache.
+ *
+ * Each V4.1 staging layer holds 384 experts as three planes (gate, up, down);
+ * its capacity is exactly 384 dynamic slots of 2*gate + down bytes.  Lending
+ * reinterprets that memory as 384 slot-shaped buffers and pushes them onto
+ * the free-slot list, raising the budget and slot count by the same amount.
+ * Whatever the staging held is not kept: no entry is created, slots are
+ * filled only by ordinary miss reads.  Reclaiming evicts every entry living
+ * in staging memory (and gives the D5 shelf a non-staging buffer for any
+ * staging buffer an adoption swap moved there), removes the staging buffers
+ * from the free list and restores budget and slot count.  Both run only at
+ * quiesced boundaries (no loader, no pending selected load, consumer events
+ * drained), on the graph thread. */
+static int cuda_stream_staging_contains(const char *p) {
+    for (uint32_t i = 0; i < 2u; i++) {
+        const cuda_stream_layer_expert_cache &c = g_stream_layer_expert_cache[i];
+        if (c.base && p >= c.base && p < c.base + c.capacity) return 1;
+    }
+    return 0;
+}
+
+static int cuda_stream_staging_lend(void) {
+    if (g_stream_staging_lent) return 1;
+    if (!g_ssd_streaming_mode || !g_deepseek41_model ||
+        g_stream_expert_cache_budget == 0 ||
+        g_stream_selected_pending.active || g_stream_batch_selected_pending.active) return 0;
+    pthread_mutex_lock(&g_stream_read_mutex);
+    const bool reading = g_stream_read_active_jobs != NULL;
+    pthread_mutex_unlock(&g_stream_read_mutex);
+    if (reading) return 0;
+    uint64_t slot_bytes = 0;
+    uint32_t per_layer = 0;
+    for (uint32_t i = 0; i < 2u; i++) {
+        const cuda_stream_layer_expert_cache &c = g_stream_layer_expert_cache[i];
+        if (!c.reserved || !c.base || !c.n_total_expert || c.reuse_plan.generation) return 0;
+        const uint64_t bytes = 2u * c.gate_expert_bytes + c.down_expert_bytes;
+        if (!bytes || c.capacity != (uint64_t)c.n_total_expert * bytes) return 0;
+        if (i && (bytes != slot_bytes || c.n_total_expert != per_layer)) return 0;
+        slot_bytes = bytes;
+        per_layer = c.n_total_expert;
+    }
+    if (g_stream_expert_slot_bytes && g_stream_expert_slot_bytes != slot_bytes) return 0;
+    for (uint32_t i = 0; i < 2u; i++) {
+        if (!cuda_stream_layer_expert_cache_wait(g_stream_layer_expert_cache[i])) return 0;
+    }
+    if (g_stream_expert_slot_bytes == 0) g_stream_expert_slot_bytes = slot_bytes;
+    g_stream_expert_free_slots.reserve(g_stream_expert_free_slots.size() + 2u * per_layer);
+    for (uint32_t i = 0; i < 2u; i++) {
+        cuda_stream_layer_expert_cache &c = g_stream_layer_expert_cache[i];
+        c.active = 0;
+        for (uint32_t e = 0; e < per_layer; e++) {
+            g_stream_expert_free_slots.push_back(c.base + (uint64_t)e * slot_bytes);
+        }
+    }
+    g_stream_staging_lent_slots = 2u * per_layer;
+    g_stream_expert_slot_count += g_stream_staging_lent_slots;
+    g_stream_expert_cache_budget += g_stream_staging_lent_slots;
+    g_stream_staging_lent = 1;
+    g_stream_staging_stats_lends++;
+    return 1;
+}
+
+static int cuda_stream_staging_reclaim(void) {
+    if (!g_stream_staging_lent) return 1;
+    if (g_stream_selected_pending.active || g_stream_batch_selected_pending.active) return 0;
+    if (!cuda_stream_resident_reclaim_wait("D13 staging reclaim")) return 0;
+    /* D5 shelf: drop all speculative work (as cuda_d5_shelf_reset does) and
+     * note which shelf entries hold a staging buffer after an adoption swap. */
+    uint32_t shelf_staging[DS4_D5_MAX_SHELF];
+    uint32_t n_shelf_staging = 0;
+    if (g_d5_shelf_state == 1) {
+        pthread_mutex_lock(&g_stream_read_mutex);
+        g_d5_task_n = 0;
+        g_d5_urgent_tasks = 0;
+        while (g_d5_spec_inflight) {
+            pthread_cond_wait(&g_stream_read_done_cond, &g_stream_read_mutex);
+        }
+        for (uint32_t i = 0; i < g_d5_shelf_n; i++) {
+            d5_shelf_entry *e = &g_d5_shelf[i];
+            char *buf = e->buf;
+            memset(e, 0, sizeof(*e));
+            e->buf = buf;
+            if (cuda_stream_staging_contains(buf)) shelf_staging[n_shelf_staging++] = i;
+        }
+        pthread_mutex_unlock(&g_stream_read_mutex);
+    }
+    /* Evict every cached entry stored in staging memory. evict_at moves the
+     * last entry into the hole; walking down visits each entry once. */
+    for (size_t i = g_stream_resident_experts.size(); i-- > 0;) {
+        const cuda_stream_resident_expert &e = g_stream_resident_experts[i];
+        if (!e.pooled || !cuda_stream_staging_contains(e.base)) continue;
+        if (!cuda_stream_resident_evict_at(i)) return 0;
+        g_stream_staging_stats_evicted++;
+    }
+    /* Give each such shelf entry a non-staging free buffer instead. */
+    for (uint32_t k = 0; k < n_shelf_staging; k++) {
+        size_t pick = (size_t)-1;
+        for (;;) {
+            for (size_t j = 0; j < g_stream_expert_free_slots.size(); j++) {
+                if (!cuda_stream_staging_contains(g_stream_expert_free_slots[j])) {
+                    pick = j;
+                    break;
+                }
+            }
+            if (pick != (size_t)-1) break;
+            if (!cuda_stream_resident_evict_one(UINT32_MAX, NULL, 0)) return 0;
+        }
+        d5_shelf_entry *e = &g_d5_shelf[shelf_staging[k]];
+        char *staging_buf = e->buf;
+        e->buf = g_stream_expert_free_slots[pick];
+        g_stream_expert_free_slots[pick] = staging_buf;
+    }
+    size_t kept = 0;
+    uint32_t removed = 0;
+    for (size_t j = 0; j < g_stream_expert_free_slots.size(); j++) {
+        char *slot = g_stream_expert_free_slots[j];
+        if (cuda_stream_staging_contains(slot)) removed++;
+        else g_stream_expert_free_slots[kept++] = slot;
+    }
+    g_stream_expert_free_slots.resize(kept);
+    if (removed != g_stream_staging_lent_slots ||
+        g_stream_expert_slot_count < removed ||
+        g_stream_expert_cache_budget < removed) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D13 staging reclaim found %u of %u lent slots; "
+                        "refusing to reuse staging memory\n",
+                removed, g_stream_staging_lent_slots);
+        abort(); /* A staging buffer is still referenced somewhere. */
+    }
+    g_stream_expert_slot_count -= removed;
+    g_stream_expert_cache_budget -= removed;
+    g_stream_staging_lent = 0;
+    g_stream_staging_lent_slots = 0;
+    g_stream_staging_stats_reclaims++;
     return 1;
 }
 
@@ -3876,6 +4030,7 @@ static int cuda_stream_layer_expert_cache_load(
 
     cuda_stream_layer_expert_cache &slot =
         g_stream_layer_expert_cache[layer & 1u];
+    if (g_stream_staging_lent) return 0; /* D13: reclaim before any layer load. */
     if (g_deepseek41_model && slot.reserved &&
         (slot.model_map != model_map || slot.model_size != model_size ||
          slot.n_total_expert != n_total_expert ||
@@ -3980,7 +4135,8 @@ static int cuda_stream_v41_prepare_layer(const ds4_gpu_stream_expert_table *t,
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
     uint64_t total = 0;
-    if (!g_ssd_streaming_mode || !cuda_stream_layer_table_bytes(t, &total) ||
+    if (!g_ssd_streaming_mode || g_stream_staging_lent ||
+        !cuda_stream_layer_table_bytes(t, &total) ||
         t->n_total_expert != 384u || t->layer >= 40u || g_model_fd < 0 ||
         g_model_fd_host_base != t->model_map ||
         g_stream_selected_pending.active || g_stream_batch_selected_pending.active ||

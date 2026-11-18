@@ -1,0 +1,4 @@
+two-drive anchors: plain 9.150 tok/s, misses/token 23.66; DSpark 11.895 tok/s, verify misses/token 25.57, plain-step misses/token 4.12
+PREDICTED one drive (high: reader 94 % of 6.89, scale 2.007): plain 6.96 tok/s, DSpark old 7.97 tok/s
+PREDICTED one drive (low: reader 89 %, scale 2.120): plain 6.78 tok/s, DSpark old 7.68 tok/s
+2026-11-17T15:27:34-10:00

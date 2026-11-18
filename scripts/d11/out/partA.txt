@@ -1,0 +1,8 @@
+two-drive anchors: plain 9.150 tok/s, misses/token 23.66; DSpark 11.895 tok/s, verify misses/token 25.57, plain-step misses/token 4.12
+PREDICTED one drive (high: reader 94 % of 6.89, scale 2.007): plain 6.96 tok/s, DSpark old 7.97 tok/s
+PREDICTED one drive (low: reader 89 %, scale 2.120): plain 6.78 tok/s, DSpark old 7.68 tok/s
+MEASURED one drive: plain 6.815 (6.81, 6.82), DSpark 8.105 (8.08, 8.13)
+  high: reader 94 % of 6.89: plain pred/meas +2.1%, DSpark -1.7%
+  low: reader 89 %: plain pred/meas -0.5%, DSpark -5.2%
+implied per-miss cost at two drives (bandwidth part, reader 94 %): plain 1.571 ms, DSpark 1.315 ms (transfer 1.446; fitted plain 1.442, verify 1.369)
+implied extra ms per miss going 2 -> 1 drive: plain 1.583, DSpark 1.324 (pure transfer at 94 %: 1.457)

@@ -1,0 +1,8 @@
+| run | baseline | LRU 24/stage | LRU 32/stage | LRU 48/stage | LRU 64/stage |
+|---|---:|---:|---:|---:|---:|
+| code | 11.97 | 12.14 (+1.4 %; 558 misses, 5.46 GiB) | 12.22 (+2.0 %; 413 misses, 5.04 GiB) | 12.24 (+2.3 %; 265 misses, 4.20 GiB) | 12.19 (+1.9 %; 211 misses, 3.36 GiB) |
+| prose | 9.74 | 10.25 (+5.2 %; 247 misses, 5.46 GiB) | 10.23 (+5.0 %; 192 misses, 5.04 GiB) | 10.17 (+4.4 %; 134 misses, 4.20 GiB) | 10.07 (+3.4 %; 121 misses, 3.36 GiB) |
+| json | 11.96 | 12.18 (+1.8 %; 505 misses, 5.46 GiB) | 12.25 (+2.5 %; 355 misses, 5.04 GiB) | 12.26 (+2.5 %; 232 misses, 4.20 GiB) | 12.21 (+2.1 %; 181 misses, 3.36 GiB) |
+| translate | 12.53 | 12.71 (+1.5 %; 497 misses, 5.46 GiB) | 12.82 (+2.3 %; 332 misses, 5.04 GiB) | 12.86 (+2.6 %; 185 misses, 4.20 GiB) | 12.79 (+2.1 %; 152 misses, 3.36 GiB) |
+| list | 10.59 | 11.08 (+4.7 %; 228 misses, 5.46 GiB) | 11.07 (+4.5 %; 183 misses, 5.04 GiB) | 11.00 (+3.8 %; 140 misses, 4.20 GiB) | 10.91 (+3.0 %; 124 misses, 3.36 GiB) |
+| q2-code | 14.56 | 14.50 (-0.4 %; 571 misses, 5.46 GiB) | 14.63 (+0.5 %; 423 misses, 5.04 GiB) | 14.73 (+1.1 %; 269 misses, 4.20 GiB) | 14.71 (+1.0 %; 201 misses, 3.36 GiB) |

@@ -500,14 +500,30 @@ extern "C" int ds4_gpu_route_prior_apply(ds4_gpu_tensor *selected, ds4_gpu_tenso
     if (!(lambda > 0.0f)) return 1;
     if (!g_rp_mask_dev || n_expert != DS4_ROCM_N_EXPERT || n_expert_used > DS4_ROCM_N_EXPERT_USED ||
         layer >= n_layer || n_layer > g_rp_layers || n_rows == 0 ||
-        row_offset + n_rows > DS4_RP_MAX_ROWS || !selected || !weights || !probs ||
-        !cuda_tensor_has_elems2(probs, n_rows, n_expert, sizeof(float)) ||
+        row_offset + n_rows > DS4_RP_MAX_ROWS || !selected || !weights || !probs) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D16 apply: bad arguments (mask=%p expert=%u used=%u layer=%u/%u rows=%u+%u)\n",
+                (void *)g_rp_mask_dev, n_expert, n_expert_used, layer, n_layer, row_offset, n_rows);
+        return 0;
+    }
+    if (!cuda_tensor_has_elems2(probs, n_rows, n_expert, sizeof(float)) ||
         !cuda_tensor_has_elems2(selected, n_rows, n_expert_used, sizeof(int32_t)) ||
-        !cuda_tensor_has_elems2(weights, n_rows, n_expert_used, sizeof(float))) return 0;
-    if (!cuda_model_range_fits(model_size, bias_offset, n_expert * sizeof(float))) return 0;
+        !cuda_tensor_has_elems2(weights, n_rows, n_expert_used, sizeof(float))) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D16 apply: tensor sizes (probs %d sel %d w %d)\n",
+                cuda_tensor_has_elems2(probs, n_rows, n_expert, sizeof(float)),
+                cuda_tensor_has_elems2(selected, n_rows, n_expert_used, sizeof(int32_t)),
+                cuda_tensor_has_elems2(weights, n_rows, n_expert_used, sizeof(float)));
+        return 0;
+    }
+    if (!cuda_model_range_fits(model_size, bias_offset, n_expert * sizeof(float))) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D16 apply: bias range\n");
+        return 0;
+    }
     const float *bias = (const float *)cuda_model_range_ptr(model_map, bias_offset,
                                                             n_expert * sizeof(float), "router_bias");
-    if (!bias) return 0;
+    if (!bias) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "D16 apply: bias pointer\n");
+        return 0;
+    }
     dim3 block(32, 4, 1);
     route_prior_kernel<DS4_ROCM_N_EXPERT><<<(n_rows + 3u) / 4u, block>>>(
         (int32_t *)selected->ptr, (float *)weights->ptr, (const float *)probs->ptr, bias,

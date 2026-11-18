@@ -44428,7 +44428,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     const float initial_pre[] = {1, 0, 0, 0};
 #ifdef DS4_ROCM_BUILD
     /* D16: a decode step outside a verify round is its own transaction. */
-    const bool rp_step = ds41_rp_on(g) && !(g->draft && g->draft->verify_rows);
+    /* Prefill rows stepped one at a time pass no logits buffer: unbiased. */
+    const bool rp_step = logits && ds41_rp_on(g) && !(g->draft && g->draft->verify_rows);
     if (rp_step && (!ds41_rp_open(g, m, false))) return false;
 #endif
     bool ok = ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) &&

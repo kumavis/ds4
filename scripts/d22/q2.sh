@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Pause guard (added by the PM 2026-11-19): do not start while /data/ds4-bench/PAUSED exists.
+[ -e /data/ds4-bench/PAUSED ] && { echo "$(date -Is) QUEUE 2 not started: /data/ds4-bench/PAUSED exists (project paused)" >> /data/ds4-bench/d22-queue.log; exit 0; }
 # D22 queue 2 (agent sessions, MXFP4 two drives, payload v2, harness from
 # D14/D17 with D22's procmem sampler and hold/release steps):
 #  1. 32k plain session, no shed vs forced sheds (per-turn reply_tok_sha twin)

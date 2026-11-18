@@ -30,5 +30,6 @@ erun $ON  d13-q2-code-plain-on  512 $(args code)
 erun $OFF $DSPE d13-q2-code-dsp-off 512 $(args code) $DSPF
 erun $ON  $DSPE d13-q2-code-dsp-on  512 $(args code) $DSPF
 plain_round 2
-dsp_round 2
+# D13: DSpark repeat 2 cut on the project manager's decision (2026-11-17 22:3x); edited in place while queue B ran.
+echo "$(date -Is) dsp_round 2 skipped (PM decision: DSpark repeat 2 cut)" >> $LOG
 echo "$(date -Is) QUEUE B DONE" >> $LOG

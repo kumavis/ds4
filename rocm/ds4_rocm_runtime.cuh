@@ -162,6 +162,9 @@ struct cuda_stream_resident_expert {
     uint64_t bytes;
     uint64_t last_used;
     int pooled;
+    uint64_t s3_seq;   /* D19 S3-FIFO: queue position (key of its queue map) */
+    uint8_t s3_main;   /* D19 S3-FIFO: 0 small queue, 1 main queue */
+    uint8_t s3_freq;   /* D19 S3-FIFO: hits since insertion/promotion, 0..3 */
 };
 
 /*
@@ -848,6 +851,7 @@ static void cuda_stream_resident_cache_release(void) {
     }
     g_stream_resident_experts.clear();
     g_stream_resident_index.clear();
+    cuda_stream_s3_clear();
     g_stream_resident_bytes = 0;
     g_stream_resident_clock = 0;
     for (cuda_stream_expert_slab &slab : g_stream_expert_slabs) {
@@ -1690,6 +1694,93 @@ static int cuda_stream_resident_find(
     return -1;
 }
 
+/* ---- D19: S3-FIFO eviction (DS4_ROCM_STREAM_EVICT_POLICY=s3fifo) ---------
+ * Small FIFO (10 % of the budget), main FIFO with a 2-bit hit count, ghost
+ * FIFO of keys evicted from the small queue (bounded at budget - small).
+ * Lookup hits raise the count (cuda_stream_s3_hit); a miss enters the main
+ * queue if its key is in the ghost, else the small queue
+ * (cuda_stream_s3_insert).  Eviction (cuda_stream_s3_evict_one), as
+ * scripts/d19 refill.S3D13 simulates it:
+ *   small queue at or over its size: scan it from the head once; an entry
+ *     of the current call is rotated to the tail, an entry with hits is
+ *     promoted to the main tail (count 0), the first other entry is
+ *     evicted to the ghost;
+ *   otherwise, or if that found nothing, the main queue from the head: an
+ *     entry of the current call is rotated, an entry with hits is rotated
+ *     with its count lowered by one, the first other entry is evicted;
+ *   last resort, the small-queue scan.
+ * Entries removed any other way (D13 reclaim, release) just leave their
+ * queue.  Deterministic: no clocks.  Unset or lru: never touched. */
+#include <map>
+static int g_stream_s3_mode = -1;
+static std::map<uint64_t, cuda_stream_resident_key> g_stream_s3_small, g_stream_s3_mainq;
+static std::map<uint64_t, cuda_stream_resident_key> g_stream_s3_ghost_fifo;
+static std::unordered_map<cuda_stream_resident_key, uint64_t, cuda_stream_resident_key_hash> g_stream_s3_ghost;
+static uint64_t g_stream_s3_seq, g_stream_s3_ghost_seq;
+
+static int cuda_stream_s3_on(void) {
+    if (g_stream_s3_mode < 0) {
+        const char *e = getenv("DS4_ROCM_STREAM_EVICT_POLICY");
+        g_stream_s3_mode = e && strcmp(e, "s3fifo") == 0 ? 1 : 0;
+        if (e && strcmp(e, "s3fifo") != 0 && strcmp(e, "lru") != 0)
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "unknown DS4_ROCM_STREAM_EVICT_POLICY=%s; using lru\n", e);
+        if (g_stream_s3_mode)
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "expert cache eviction: S3-FIFO\n");
+    }
+    return g_stream_s3_mode;
+}
+
+static uint64_t cuda_stream_s3_small_target(void) {
+    const uint64_t t = (uint64_t)g_stream_expert_cache_budget / 10u;
+    return t ? t : 1u;
+}
+
+static void cuda_stream_s3_ghost_add(const cuda_stream_resident_key &k) {
+    if (g_stream_s3_ghost.find(k) == g_stream_s3_ghost.end()) {
+        g_stream_s3_ghost[k] = ++g_stream_s3_ghost_seq;
+        g_stream_s3_ghost_fifo[g_stream_s3_ghost_seq] = k;
+    }
+    const uint64_t budget = g_stream_expert_cache_budget;
+    const uint64_t small = cuda_stream_s3_small_target();
+    const uint64_t cap = budget > small ? budget - small : 0u;
+    while (g_stream_s3_ghost_fifo.size() > cap) {
+        g_stream_s3_ghost.erase(g_stream_s3_ghost_fifo.begin()->second);
+        g_stream_s3_ghost_fifo.erase(g_stream_s3_ghost_fifo.begin());
+    }
+}
+
+static void cuda_stream_s3_insert(cuda_stream_resident_expert &e) {
+    const cuda_stream_resident_key k = cuda_stream_resident_entry_key(e);
+    const auto g = g_stream_s3_ghost.find(k);
+    e.s3_freq = 0;
+    e.s3_seq = ++g_stream_s3_seq;
+    if (g != g_stream_s3_ghost.end()) {
+        g_stream_s3_ghost_fifo.erase(g->second);
+        g_stream_s3_ghost.erase(g);
+        e.s3_main = 1;
+        g_stream_s3_mainq[e.s3_seq] = k;
+    } else {
+        e.s3_main = 0;
+        g_stream_s3_small[e.s3_seq] = k;
+    }
+}
+
+static void cuda_stream_s3_hit(cuda_stream_resident_expert &e) {
+    if (e.s3_freq < 3u) e.s3_freq++;
+}
+
+static void cuda_stream_s3_remove(const cuda_stream_resident_expert &e) {
+    if (e.s3_main) g_stream_s3_mainq.erase(e.s3_seq);
+    else g_stream_s3_small.erase(e.s3_seq);
+}
+
+static void cuda_stream_s3_clear(void) {
+    g_stream_s3_small.clear();
+    g_stream_s3_mainq.clear();
+    g_stream_s3_ghost.clear();
+    g_stream_s3_ghost_fifo.clear();
+}
+
 static int cuda_stream_resident_evict_at(size_t idx) {
     if (idx >= g_stream_resident_experts.size()) return 0;
     if (!cuda_stream_resident_reclaim_wait(
@@ -1699,6 +1790,7 @@ static int cuda_stream_resident_evict_at(size_t idx) {
     cuda_stream_resident_expert &e = g_stream_resident_experts[idx];
     const cuda_stream_resident_key evicted_key =
         cuda_stream_resident_entry_key(e);
+    if (g_stream_s3_mode == 1) cuda_stream_s3_remove(e);
     if (cuda_d12_on()) cuda_d12_ev('x', e.layer, e.expert);
     if (cuda_stream_cache_stats_on()) {
         g_stream_cache_stats.evictions++;
@@ -1724,10 +1816,78 @@ static int cuda_stream_resident_evict_at(size_t idx) {
     return 1;
 }
 
+static int cuda_stream_s3_index(const cuda_stream_resident_key &k) {
+    const auto it = g_stream_resident_index.find(k);
+    if (it == g_stream_resident_index.end() || it->second >= g_stream_resident_experts.size()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "S3-FIFO queue holds a key missing from the cache\n");
+        abort();
+    }
+    return (int)it->second;
+}
+
+/* One pass over the small queue: returns 1 after evicting one entry. */
+static int cuda_stream_s3_evict_small(uint32_t layer, const int32_t *ids, uint32_t n) {
+    size_t left = g_stream_s3_small.size();
+    while (left-- && !g_stream_s3_small.empty()) {
+        const auto head = g_stream_s3_small.begin();
+        const cuda_stream_resident_key k = head->second;
+        g_stream_s3_small.erase(head);
+        cuda_stream_resident_expert &e = g_stream_resident_experts[(size_t)cuda_stream_s3_index(k)];
+        if (cuda_stream_selected_is_current(e, layer, ids, n)) {
+            e.s3_seq = ++g_stream_s3_seq;
+            g_stream_s3_small[e.s3_seq] = k;
+            continue;
+        }
+        if (e.s3_freq > 0u) {
+            e.s3_freq = 0;
+            e.s3_main = 1;
+            e.s3_seq = ++g_stream_s3_seq;
+            g_stream_s3_mainq[e.s3_seq] = k;
+            continue;
+        }
+        /* evict_at must not find it in a queue again */
+        e.s3_main = 0;
+        e.s3_seq = 0;
+        g_stream_s3_small[0] = k;
+        cuda_stream_s3_ghost_add(k);
+        return cuda_stream_resident_evict_at((size_t)cuda_stream_s3_index(k));
+    }
+    return 0;
+}
+
+static int cuda_stream_s3_evict_main(uint32_t layer, const int32_t *ids, uint32_t n) {
+    size_t left = 4u * g_stream_s3_mainq.size() + 4u;
+    while (left-- && !g_stream_s3_mainq.empty()) {
+        const auto head = g_stream_s3_mainq.begin();
+        const cuda_stream_resident_key k = head->second;
+        g_stream_s3_mainq.erase(head);
+        cuda_stream_resident_expert &e = g_stream_resident_experts[(size_t)cuda_stream_s3_index(k)];
+        const int prot = cuda_stream_selected_is_current(e, layer, ids, n);
+        if (prot || e.s3_freq > 0u) {
+            if (!prot) e.s3_freq--;
+            e.s3_seq = ++g_stream_s3_seq;
+            g_stream_s3_mainq[e.s3_seq] = k;
+            continue;
+        }
+        e.s3_seq = 0;
+        g_stream_s3_mainq[0] = k;
+        return cuda_stream_resident_evict_at((size_t)cuda_stream_s3_index(k));
+    }
+    return 0;
+}
+
+static int cuda_stream_s3_evict_one(uint32_t layer, const int32_t *ids, uint32_t n) {
+    if (g_stream_s3_small.size() >= cuda_stream_s3_small_target() &&
+        cuda_stream_s3_evict_small(layer, ids, n)) return 1;
+    if (cuda_stream_s3_evict_main(layer, ids, n)) return 1;
+    return cuda_stream_s3_evict_small(layer, ids, n);
+}
+
 static int cuda_stream_resident_evict_one(
         uint32_t layer,
         const int32_t *selected_ids,
         uint32_t n_selected) {
+    if (cuda_stream_s3_on()) return cuda_stream_s3_evict_one(layer, selected_ids, n_selected);
     size_t victim = (size_t)-1;
     uint64_t oldest = UINT64_MAX;
     if (cuda_stream_evict_past_layers_first()) {
@@ -1984,6 +2144,7 @@ static int cuda_stream_resident_alloc(
     e.bytes = bytes;
     e.last_used = ++g_stream_resident_clock;
     e.pooled = pooled;
+    if (cuda_stream_s3_on()) cuda_stream_s3_insert(e);
     g_stream_resident_experts.push_back(e);
     g_stream_resident_index[cuda_stream_resident_entry_key(e)] =
         g_stream_resident_experts.size() - 1u;
@@ -4535,6 +4696,7 @@ static int cuda_stream_resident_seed_experts(
         if (idx >= 0) {
             g_stream_resident_experts[(size_t)idx].last_used =
                 ++g_stream_resident_clock;
+            if (g_stream_s3_mode == 1) cuda_stream_s3_hit(g_stream_resident_experts[(size_t)idx]);
             loaded++;
             continue;
         }
@@ -5106,6 +5268,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
             cuda_stream_resident_expert &entry =
                 g_stream_resident_experts[(size_t)idx];
             entry.last_used = ++g_stream_resident_clock;
+            if (was_resident && g_stream_s3_mode == 1) cuda_stream_s3_hit(entry);
             gate_host[u] = entry.gate;
             up_host[u] = entry.up;
             down_host[u] = entry.down;
@@ -5739,6 +5902,7 @@ static int cuda_stream_layer_expert_cache_seed_selected(
         if (idx >= 0) {
             g_stream_resident_experts[(size_t)idx].last_used =
                 ++g_stream_resident_clock;
+            if (g_stream_s3_mode == 1) cuda_stream_s3_hit(g_stream_resident_experts[(size_t)idx]);
             continue;
         }
 
@@ -6661,6 +6825,7 @@ static int cuda_stream_selected_load(
         if (idx >= 0) {
             g_stream_resident_experts[(size_t)idx].last_used =
                 ++g_stream_resident_clock;
+            if (g_stream_s3_mode == 1) cuda_stream_s3_hit(g_stream_resident_experts[(size_t)idx]);
             resident_mask |= 1u << i;
             continue;
         }

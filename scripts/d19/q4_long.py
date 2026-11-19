@@ -106,14 +106,13 @@ def validate_trace(name, policy):
 def warm_comparison(records):
     metrics = {}
     for policy in ("lru", "s3fifo"):
-        turns = [row for row in records if row.get("tag") == tag(policy, "b") and row.get("kind") == "turn"]
+        _, turns = session_qc.read(records, tag(policy, "b"), ROOT / "runs")
         warm = [turn for turn in turns[1:] if turn["prompt_tokens"] >= 100000]
         require(warm, "no warm reply with 100000 input tokens")
         tokens = sum(turn["reply_tokens"] for turn in warm)
-        seconds = sum(turn["decode_s"] for turn in warm)
         metrics[policy] = {
             "turn_ids": [turn["turn"] for turn in warm], "reply_tokens": tokens,
-            "decode_s": seconds, "decode_tps": tokens / seconds,
+            **session_qc.pooled_decode(warm),
             "ttft_sum_s": sum(turn["ttft_s"] for turn in warm), "restored_first_turn_ttft_s": turns[0]["ttft_s"],
         }
     require(metrics["lru"]["turn_ids"] == metrics["s3fifo"]["turn_ids"], "different 100k turn sets")

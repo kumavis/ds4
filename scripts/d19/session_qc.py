@@ -84,6 +84,9 @@ def read(records, tag, runs):
     previous_end = 0
     with server_log.open("rb") as log:
         for record, raw in zip(turns, raw_turns):
+            duration = raw["t_end"] - raw["t_first"]
+            require(duration >= 0 and record["decode_s"] == (round(duration, 3) if duration else None), f"{tag}: raw decode duration")
+            record["raw_decode_s"] = duration
             previous_end, record["raw_d8"] = validate_turn(record, raw, transcript_turns[record["turn"]], log, previous_end, log_size,
                                          summary["dspark"])
     hashes = [turn["reply_sha"] for turn in turns]
@@ -94,17 +97,29 @@ def read(records, tag, runs):
     return summary, turns
 
 
+def pooled_decode(turns):
+    # The interval starts at first-token arrival, after one token per reply.
+    tokens = sum(turn["reply_tokens"] for turn in turns)
+    post_first = tokens - len(turns)
+    seconds = sum(turn["raw_decode_s"] for turn in turns)
+    return {
+        "post_first_tokens": post_first,
+        "decode_s": round(seconds, 3),
+        "decode_tps": post_first / seconds if post_first and seconds else None,
+        "all_reply_tokens_per_decode_s": tokens / seconds if seconds else None,
+    }
+
+
 def arm_metrics(summary, turns, count):
     matched = turns[:count]
     tokens = sum(turn["reply_tokens"] for turn in matched)
     steps = sum(turn["d8_steps"] for turn in matched)
-    seconds = sum(turn["decode_s"] for turn in matched)
     return {
         "turns": len(turns), "end": summary["steps"][0]["end"], "max_context": summary["max_context"],
         "dynamic_cache_slots": summary["cache_slots"], "kv_disk_dir": summary["kv_disk_dir"],
         "first_turn": matched[0]["turn"], "last_turn": matched[-1]["turn"], "matched_reply_tokens": tokens,
         "matched_d8_steps": steps, "token_id_coverage": "complete" if steps == tokens else "partial",
-        "decode_s": round(seconds, 3), "decode_tps": tokens / seconds,
+        **pooled_decode(matched),
         "ttft_sum_s": round(sum(turn["ttft_s"] for turn in matched), 3),
         "memory_min_mib": summary["avail_min_mb"], "nvme_max_c": summary["nvme_max_c"],
         "first_kv_hit_tokens": turns[0]["kv_hit_tokens"],
@@ -129,7 +144,8 @@ def compare(records, runs, left, right, overlap):
         "matched_turns": count, "dspark": left_summary["dspark"],
         left: arm_metrics(left_summary, left_turns, count), right: arm_metrics(right_summary, right_turns, count),
     }
-    output["decode_gain_pct"] = 100 * (output[right]["decode_tps"] / output[left]["decode_tps"] - 1)
+    left_rate, right_rate = output[left]["decode_tps"], output[right]["decode_tps"]
+    output["decode_gain_pct"] = 100 * (right_rate / left_rate - 1) if left_rate and right_rate is not None else None
     print(json.dumps(output, indent=2))
 
 

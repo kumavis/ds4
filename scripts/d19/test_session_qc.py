@@ -6,6 +6,17 @@ import unittest
 import session_qc as qc
 
 
+class PooledDecodeTests(unittest.TestCase):
+    def test_exclude_first_token_of_every_reply(self):
+        only = {"reply_tokens": 1, "raw_decode_s": 0.25}
+        self.assertIsNone(qc.pooled_decode([only])["decode_tps"])
+        self.assertIsNone(qc.pooled_decode([dict(only, raw_decode_s=0)])["decode_tps"])
+        metrics = qc.pooled_decode([only, {"reply_tokens": 4, "raw_decode_s": 1.75}])
+        self.assertEqual(metrics["post_first_tokens"], 3)
+        self.assertEqual(metrics["decode_tps"], 1.5)
+        self.assertEqual(metrics["all_reply_tokens_per_decode_s"], 2.5)
+
+
 class RawTurnTests(unittest.TestCase):
     def setUp(self):
         self.log = b"D8_STEP pos=10 tok=23\nD8_STEP pos=11 tok=45\n"
